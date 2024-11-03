@@ -1,0 +1,994 @@
+package org.zzvsjs.jflac
+
+import org.zzvsjs.jflac.internal.NativeBindings
+import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.io.path.name
+import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+
+private const val FLAC_METADATA_LAST_BLOCK_FLAG = 0x80
+private const val FLAC_METADATA_TYPE_STREAMINFO = 0
+private const val FLAC_METADATA_TYPE_PADDING = 1
+private const val FLAC_METADATA_TYPE_APPLICATION = 2
+private const val FLAC_METADATA_TYPE_VORBIS_COMMENT = 4
+private const val FLAC_METADATA_TYPE_UNKNOWN_FIXTURE = 42
+private const val FLAC_STREAMINFO_LENGTH = 34
+private const val FLAC_METADATA_MAX_PAYLOAD_LENGTH = 0xFF_FFFF
+
+/**
+ * End-to-end tests for the file-based wrapper.
+ *
+ * The goal is to cover the public API behaviour, not libFLAC internals. The
+ * sample file in the repository is treated as the integration fixture.
+ */
+class FlacIntegrationTest {
+    private val sampleFile: Path = Path.of("music.flac").toAbsolutePath()
+
+    @Test
+    fun metadataReaderReturnsExpectedStructure() {
+        // A real file should produce a populated metadata object with the core
+        // STREAMINFO fields filled in by libFLAC.
+        val metadata = FlacMetadataReader().read(sampleFile)
+
+        assertTrue(metadata.streamInfo.sampleRate > 0)
+        assertTrue(metadata.streamInfo.channels > 0)
+        assertTrue(metadata.streamInfo.bitsPerSample > 0)
+        assertTrue(metadata.streamInfo.totalSamples > 0)
+        assertEquals(16, metadata.streamInfo.md5Signature.size)
+        assertNotNull(metadata.pictures)
+    }
+
+    @Test
+    fun metadataReaderPreservesPhysicalOrderFromFixtureBytes() {
+        val fixture = Files.createTempFile("jflac-ordered-read-fixture", ".flac")
+        try {
+            Files.write(fixture, metadataOnlyFlacFixture())
+
+            val blocks = FlacMetadataReader().read(fixture).blocks
+
+            assertEquals(4, blocks.size)
+            assertIs<FlacMetadataBlock.Padding>(blocks[0])
+            assertEquals(3, (blocks[0] as FlacMetadataBlock.Padding).padding.length)
+
+            assertIs<FlacMetadataBlock.Application>(blocks[1])
+            val application = (blocks[1] as FlacMetadataBlock.Application).application
+            assertContentEquals(
+                byteArrayOf('T'.code.toByte(), 'S'.code.toByte(), 'T'.code.toByte(), '1'.code.toByte()),
+                application.id
+            )
+            assertContentEquals(byteArrayOf(0x10, 0x20), application.data)
+
+            assertIs<FlacMetadataBlock.Unknown>(blocks[2])
+            val unknown = (blocks[2] as FlacMetadataBlock.Unknown).unknown
+            assertEquals(FLAC_METADATA_TYPE_UNKNOWN_FIXTURE, unknown.type)
+            assertContentEquals(byteArrayOf(0x01, 0x02, 0x03), unknown.data)
+
+            assertIs<FlacMetadataBlock.VorbisComment>(blocks[3])
+            val comment = (blocks[3] as FlacMetadataBlock.VorbisComment).comment
+            assertEquals("fixture", comment.vendor)
+            assertEquals(listOf("Fixture"), comment.comments["TITLE"])
+        } finally {
+            Files.deleteIfExists(fixture)
+        }
+    }
+
+    @Test
+    fun decoderProducesConsistentInterleavedFrames() {
+        val consumer = CollectingConsumer()
+        FlacDecoder().decode(sampleFile, consumer)
+
+        // The decoder reports total sample frames, while the callback receives
+        // chunks. The accumulator checks that chunk shapes stay consistent.
+        assertNotNull(consumer.streamInfo)
+        assertTrue(consumer.completed)
+        assertTrue(consumer.totalFrames > 0)
+        assertEquals(0L, consumer.invalidChunkCount)
+        assertEquals(consumer.streamInfo!!.totalSamples, consumer.totalFrames)
+    }
+
+    @Test
+    fun fullDecodeMatchesStreamingDecodeSummary() {
+        val decoder = FlacDecoder()
+        val decoded = decoder.decode(sampleFile)
+        val streamedChunks = ArrayList<FlacInterleavedPcmChunk>()
+
+        val summary = decoder.decodeInterleaved(
+            path = sampleFile,
+            onChunk = FlacInterleavedPcmHandler { chunk -> streamedChunks.add(chunk) }
+        )
+
+        assertEquals(decoded.streamInfo, summary.streamInfo)
+        assertEquals(decoded.totalFrames, summary.totalFrames)
+        assertEquals(decoded.interleavedSamples.size.toLong(), summary.totalSamples)
+        assertTrue(streamedChunks.isNotEmpty())
+        assertEquals(0L, streamedChunks.first().firstFrameIndex)
+        assertEquals(decoded.totalFrames, streamedChunks.sumOf { it.frames.toLong() })
+    }
+
+    @Test
+    fun channelDecodeSplitsInterleavedChunksWithoutChangingFramePositions() {
+        val decoder = FlacDecoder()
+        val interleavedChunks = ArrayList<FlacInterleavedPcmChunk>()
+        val channelChunks = ArrayList<FlacChannelPcmChunk>()
+
+        val interleavedSummary = decoder.decodeInterleaved(
+            path = sampleFile,
+            onChunk = FlacInterleavedPcmHandler { chunk -> interleavedChunks.add(chunk) }
+        )
+        val channelSummary = decoder.decodeChannels(
+            path = sampleFile,
+            onChunk = FlacChannelPcmHandler { chunk -> channelChunks.add(chunk) }
+        )
+
+        assertEquals(interleavedSummary, channelSummary)
+        assertEquals(interleavedChunks.size, channelChunks.size)
+
+        interleavedChunks.zip(channelChunks).forEach { (interleaved, channels) ->
+            assertEquals(interleaved.frames, channels.frames)
+            assertEquals(interleaved.firstFrameIndex, channels.firstFrameIndex)
+            assertEquals(interleaved.splitByChannel().map(IntArray::toList), channels.channelSamples.map(IntArray::toList))
+        }
+    }
+
+    @Test
+    fun decodeListenerReceivesLifecycleCallbacksInOrder() {
+        val events = ArrayList<String>()
+
+        val summary = FlacDecoder().decode(
+            sampleFile,
+            object : FlacDecodeAdapter() {
+                override fun onStreamInfo(info: FlacStreamInfo) {
+                    events.add("stream-info")
+                }
+
+                override fun onInterleavedPcm(chunk: FlacInterleavedPcmChunk) {
+                    if (events.lastOrNull() != "pcm") {
+                        events.add("pcm")
+                    }
+                }
+
+                override fun onComplete(summary: FlacDecodeSummary) {
+                    events.add("complete")
+                }
+            }
+        )
+
+        assertEquals(listOf("stream-info", "pcm", "complete"), events)
+        assertTrue(summary.totalFrames > 0)
+    }
+
+    @Test
+    fun seekedInterleavedDecodeReportsAbsoluteFramePositions() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val firstSample = streamInfo.totalSamples / 2
+        val chunks = ArrayList<FlacInterleavedPcmChunk>()
+
+        val summary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = firstSample,
+            onChunk = FlacInterleavedPcmHandler { chunk -> chunks.add(chunk) }
+        )
+
+        assertTrue(chunks.isNotEmpty())
+        assertEquals(firstSample, chunks.first().firstFrameIndex)
+        assertEquals(streamInfo.totalSamples - firstSample, summary.totalFrames)
+
+        var expectedFirstFrame = firstSample
+        chunks.forEach { chunk ->
+            assertEquals(expectedFirstFrame, chunk.firstFrameIndex)
+            expectedFirstFrame += chunk.frames.toLong()
+        }
+        assertEquals(streamInfo.totalSamples, expectedFirstFrame)
+    }
+
+    @Test
+    fun seekedChannelDecodeUsesSameSummaryAsSeekedInterleavedDecode() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val firstSample = streamInfo.totalSamples / 3
+        val interleavedChunks = ArrayList<FlacInterleavedPcmChunk>()
+        val channelChunks = ArrayList<FlacChannelPcmChunk>()
+
+        val interleavedSummary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = firstSample,
+            onChunk = FlacInterleavedPcmHandler { chunk -> interleavedChunks.add(chunk) }
+        )
+        val channelSummary = FlacDecoder().decodeChannels(
+            path = sampleFile,
+            firstSample = firstSample,
+            onChunk = FlacChannelPcmHandler { chunk -> channelChunks.add(chunk) }
+        )
+
+        assertEquals(interleavedSummary, channelSummary)
+        assertEquals(interleavedChunks.size, channelChunks.size)
+        assertEquals(firstSample, channelChunks.first().firstFrameIndex)
+    }
+
+    @Test
+    fun rangeDecodeReturnsRequestedPcmWindow() {
+        val decoder = FlacDecoder()
+        val full = decoder.decode(sampleFile)
+        val firstSample = full.streamInfo.totalSamples / 4
+        val maxFrames = 1_337L
+
+        val range = decoder.decode(sampleFile, firstSample, maxFrames)
+
+        assertEquals(full.streamInfo, range.streamInfo)
+        assertEquals(maxFrames, range.totalFrames)
+        assertSamplesMatchFullAudio(full, firstSample, range)
+    }
+
+    @Test
+    fun rangeInterleavedDecodeStopsAtRequestedFrameCount() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val firstSample = streamInfo.totalSamples / 3
+        val maxFrames = 2_049L
+        val chunks = ArrayList<FlacInterleavedPcmChunk>()
+
+        val summary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = firstSample,
+            maxFrames = maxFrames,
+            onChunk = FlacInterleavedPcmHandler { chunk -> chunks.add(chunk) }
+        )
+
+        assertEquals(maxFrames, summary.totalFrames)
+        assertTrue(chunks.isNotEmpty())
+        assertEquals(firstSample, chunks.first().firstFrameIndex)
+        assertEquals(firstSample + maxFrames, chunks.last().firstFrameIndex + chunks.last().frames)
+    }
+
+    @Test
+    fun rangeChannelDecodeUsesSameSummaryAsRangeInterleavedDecode() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val firstSample = streamInfo.totalSamples / 5
+        val maxFrames = 733L
+        val interleavedChunks = ArrayList<FlacInterleavedPcmChunk>()
+        val channelChunks = ArrayList<FlacChannelPcmChunk>()
+
+        val interleavedSummary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = firstSample,
+            maxFrames = maxFrames,
+            onChunk = FlacInterleavedPcmHandler { chunk -> interleavedChunks.add(chunk) }
+        )
+        val channelSummary = FlacDecoder().decodeChannels(
+            path = sampleFile,
+            firstSample = firstSample,
+            maxFrames = maxFrames,
+            onChunk = FlacChannelPcmHandler { chunk -> channelChunks.add(chunk) }
+        )
+
+        assertEquals(interleavedSummary, channelSummary)
+        assertEquals(maxFrames, channelSummary.totalFrames)
+        assertEquals(interleavedChunks.size, channelChunks.size)
+        assertEquals(firstSample, channelChunks.first().firstFrameIndex)
+    }
+
+    @Test
+    fun rangeDecodeClipsLongRequestAtEndOfStream() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val remainingFrames = 37L
+        val firstSample = streamInfo.totalSamples - remainingFrames
+        val chunks = ArrayList<FlacInterleavedPcmChunk>()
+
+        val summary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = firstSample,
+            maxFrames = remainingFrames + 1_000L,
+            onChunk = FlacInterleavedPcmHandler { chunk -> chunks.add(chunk) }
+        )
+
+        assertEquals(remainingFrames, summary.totalFrames)
+        assertTrue(chunks.isNotEmpty())
+        assertEquals(streamInfo.totalSamples, chunks.last().firstFrameIndex + chunks.last().frames)
+    }
+
+    @Test
+    fun rangeDecodeWithZeroFramesCompletesWithoutPcmChunks() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val firstSample = streamInfo.totalSamples / 2
+        val chunks = ArrayList<FlacInterleavedPcmChunk>()
+        var completedSummary: FlacDecodeSummary? = null
+
+        val summary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = firstSample,
+            maxFrames = 0,
+            onChunk = FlacInterleavedPcmHandler { chunk -> chunks.add(chunk) },
+            onComplete = FlacDecodeCompleteHandler { complete -> completedSummary = complete }
+        )
+
+        assertEquals(streamInfo, summary.streamInfo)
+        assertEquals(0L, summary.totalFrames)
+        assertEquals(summary, completedSummary)
+        assertTrue(chunks.isEmpty())
+    }
+
+    @Test
+    fun rangeDecodeStartingAtEndReturnsEmptyResult() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val chunks = ArrayList<FlacInterleavedPcmChunk>()
+
+        val summary = FlacDecoder().decodeInterleaved(
+            path = sampleFile,
+            firstSample = streamInfo.totalSamples,
+            maxFrames = 10,
+            onChunk = FlacInterleavedPcmHandler { chunk -> chunks.add(chunk) }
+        )
+
+        assertEquals(streamInfo, summary.streamInfo)
+        assertEquals(0L, summary.totalFrames)
+        assertTrue(chunks.isEmpty())
+    }
+
+    @Test
+    fun decodingSessionCanDecodeSeveralPcmWindows() {
+        val full = FlacDecoder().decode(sampleFile)
+        val firstSample = full.streamInfo.totalSamples / 6
+        val secondSample = full.streamInfo.totalSamples / 2
+
+        FlacDecoder().open(sampleFile).use { session ->
+            val first = session.decodeInterleaved(
+                firstSample = firstSample,
+                maxFrames = 300,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+            val secondChunks = ArrayList<FlacInterleavedPcmChunk>()
+            val second = session.decodeInterleaved(
+                firstSample = secondSample,
+                maxFrames = 512,
+                onChunk = FlacInterleavedPcmHandler { chunk -> secondChunks.add(chunk) }
+            )
+
+            assertEquals(300L, first.totalFrames)
+            assertEquals(512L, second.totalFrames)
+            assertTrue(secondChunks.isNotEmpty())
+            assertEquals(secondSample, secondChunks.first().firstFrameIndex)
+        }
+    }
+
+    @Test
+    fun decodingSessionRangeCallbackFailureReleasesNativeHandle() {
+        val session = FlacDecoder().open(sampleFile)
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                maxFrames = 10,
+                onChunk = FlacInterleavedPcmHandler { throw IllegalStateException("callback failed") }
+            )
+        }
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                maxFrames = 10,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun rangeDecodeRejectsNegativeMaxFrames() {
+        assertFailsWith<IllegalArgumentException> {
+            FlacDecoder().decode(sampleFile, firstSample = 0, maxFrames = -1)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            FlacDecoder().decodeInterleaved(
+                path = sampleFile,
+                firstSample = 0,
+                maxFrames = -1,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+
+        FlacDecoder().open(sampleFile).use { session ->
+            assertFailsWith<IllegalArgumentException> {
+                session.decodeInterleaved(
+                    firstSample = 0,
+                    maxFrames = -1,
+                    onChunk = FlacInterleavedPcmHandler { }
+                )
+            }
+        }
+    }
+
+    @Test
+    fun rangeDecodeRejectsOverflowingFrameWindow() {
+        assertFailsWith<IllegalArgumentException> {
+            FlacDecoder().decodeInterleaved(
+                path = sampleFile,
+                firstSample = 1,
+                maxFrames = Long.MAX_VALUE,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+
+        FlacDecoder().open(sampleFile).use { session ->
+            assertFailsWith<IllegalArgumentException> {
+                session.decodeInterleaved(
+                    firstSample = 1,
+                    maxFrames = Long.MAX_VALUE,
+                    onChunk = FlacInterleavedPcmHandler { }
+                )
+            }
+        }
+    }
+
+    @Test
+    fun seekBeyondEndThrowsDecodeException() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+
+        assertFailsWith<FlacDecodeException> {
+            FlacDecoder().decodeInterleaved(
+                path = sampleFile,
+                firstSample = streamInfo.totalSamples + 1,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionCanSeekDecodeMoreThanOnce() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val firstSeek = streamInfo.totalSamples / 4
+        val secondSeek = streamInfo.totalSamples / 2
+        val firstChunks = ArrayList<FlacInterleavedPcmChunk>()
+        val secondChunks = ArrayList<FlacInterleavedPcmChunk>()
+        val backwardChunks = ArrayList<FlacInterleavedPcmChunk>()
+
+        FlacDecoder().open(sampleFile).use { session ->
+            val firstSummary = session.decodeInterleaved(
+                firstSample = firstSeek,
+                onChunk = FlacInterleavedPcmHandler { chunk -> firstChunks.add(chunk) }
+            )
+            val secondSummary = session.decodeInterleaved(
+                firstSample = secondSeek,
+                onChunk = FlacInterleavedPcmHandler { chunk -> secondChunks.add(chunk) }
+            )
+            val backwardSummary = session.decodeInterleaved(
+                firstSample = firstSeek,
+                onChunk = FlacInterleavedPcmHandler { chunk -> backwardChunks.add(chunk) }
+            )
+
+            assertEquals(streamInfo.totalSamples - firstSeek, firstSummary.totalFrames)
+            assertEquals(streamInfo.totalSamples - secondSeek, secondSummary.totalFrames)
+            assertEquals(firstSummary, backwardSummary)
+            assertInterleavedChunksEqual(firstChunks, backwardChunks)
+            assertEquals(firstSeek, firstChunks.first().firstFrameIndex)
+            assertEquals(secondSeek, secondChunks.first().firstFrameIndex)
+        }
+    }
+
+    @Test
+    fun decodingSessionRejectsUseAfterClose() {
+        val session = FlacDecoder().open(sampleFile)
+        session.close()
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionCloseIsIdempotent() {
+        val session = FlacDecoder().open(sampleFile)
+
+        session.close()
+        session.close()
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionRejectsConcurrentDecode() {
+        FlacDecoder().open(sampleFile).use { session ->
+            val callbackEntered = CountDownLatch(1)
+            val releaseCallback = CountDownLatch(1)
+            val workerFailure = AtomicReference<Throwable?>()
+            val worker = Thread {
+                try {
+                    session.decodeInterleaved(
+                        firstSample = 0,
+                        onChunk = FlacInterleavedPcmHandler { },
+                        onStreamInfo = FlacStreamInfoHandler {
+                            callbackEntered.countDown()
+                            assertTrue(releaseCallback.await(5, TimeUnit.SECONDS))
+                        }
+                    )
+                } catch (t: Throwable) {
+                    workerFailure.set(t)
+                }
+            }
+
+            worker.start()
+            assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+            try {
+                assertFailsWith<IllegalStateException> {
+                    session.decodeInterleaved(
+                        firstSample = 0,
+                        onChunk = FlacInterleavedPcmHandler { }
+                    )
+                }
+            } finally {
+                releaseCallback.countDown()
+                worker.join(5_000)
+            }
+
+            assertTrue(!worker.isAlive)
+            workerFailure.get()?.let { throw it }
+        }
+    }
+
+    @Test
+    fun decodingSessionCloseDuringDecodeClosesAfterCurrentDecode() {
+        val session = FlacDecoder().open(sampleFile)
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val workerFailure = AtomicReference<Throwable?>()
+        val worker = Thread {
+            try {
+                session.decodeInterleaved(
+                    firstSample = 0,
+                    onChunk = FlacInterleavedPcmHandler { },
+                    onStreamInfo = FlacStreamInfoHandler {
+                        callbackEntered.countDown()
+                        assertTrue(releaseCallback.await(5, TimeUnit.SECONDS))
+                    }
+                )
+            } catch (t: Throwable) {
+                workerFailure.set(t)
+            }
+        }
+
+        worker.start()
+        assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+        try {
+            session.close()
+            assertFailsWith<IllegalStateException> {
+                session.decodeInterleaved(
+                    firstSample = 0,
+                    onChunk = FlacInterleavedPcmHandler { }
+                )
+            }
+        } finally {
+            releaseCallback.countDown()
+            worker.join(5_000)
+        }
+
+        assertTrue(!worker.isAlive)
+        workerFailure.get()?.let { throw it }
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionReleasesNativeHandleAfterSeekFailure() {
+        val streamInfo = FlacMetadataReader().read(sampleFile).streamInfo
+        val session = FlacDecoder().open(sampleFile)
+
+        assertFailsWith<FlacDecodeException> {
+            session.decodeInterleaved(
+                firstSample = streamInfo.totalSamples + 1,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionReleasesNativeHandleWhenStreamInfoCallbackFails() {
+        val session = FlacDecoder().open(sampleFile)
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = { },
+                onStreamInfo = { throw IllegalStateException("callback failed") }
+            )
+        }
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionReleasesNativeHandleWhenPcmCallbackFails() {
+        val session = FlacDecoder().open(sampleFile)
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { throw IllegalStateException("callback failed") }
+            )
+        }
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun decodingSessionReleasesNativeHandleWhenCompleteCallbackFails() {
+        val session = FlacDecoder().open(sampleFile)
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { },
+                onComplete = FlacDecodeCompleteHandler { throw IllegalStateException("callback failed") }
+            )
+        }
+
+        assertFailsWith<IllegalStateException> {
+            session.decodeInterleaved(
+                firstSample = 0,
+                onChunk = FlacInterleavedPcmHandler { }
+            )
+        }
+    }
+
+    @Test
+    fun nativeSessionDecodeRejectsInvalidHandle() {
+        FlacNativeLoader.load()
+
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.decodeDecoderFrom(0, 0, CollectingConsumer())
+        }
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.decodeDecoderRange(0, 0, 1, CollectingConsumer())
+        }
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.decodeDecoderFrom(Long.MAX_VALUE, 0, CollectingConsumer())
+        }
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.decodeDecoderRange(Long.MAX_VALUE, 0, 1, CollectingConsumer())
+        }
+
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        NativeBindings.releaseDecoder(handle)
+        NativeBindings.releaseDecoder(handle)
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.decodeDecoderFrom(handle, 0, CollectingConsumer())
+        }
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.decodeDecoderRange(handle, 0, 1, CollectingConsumer())
+        }
+    }
+
+    @Test
+    fun nativeSessionRangeDecodeRejectsInvalidArguments() {
+        FlacNativeLoader.load()
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+
+        try {
+            assertFailsWith<IllegalArgumentException> {
+                NativeBindings.decodeDecoderRange(handle, 0, -1, CollectingConsumer())
+            }
+            assertFailsWith<IllegalArgumentException> {
+                NativeBindings.decodeDecoderRange(handle, 0, 1, null)
+            }
+        } finally {
+            NativeBindings.releaseDecoder(handle)
+        }
+    }
+
+    @Test
+    fun nativeSessionRangeDecodeKeepsHandleReusable() {
+        FlacNativeLoader.load()
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        val first = CountingConsumer()
+        val second = CountingConsumer()
+
+        try {
+            NativeBindings.decodeDecoderRange(handle, 0, 7, first)
+            NativeBindings.decodeDecoderRange(handle, 0, 11, second)
+        } finally {
+            NativeBindings.releaseDecoder(handle)
+        }
+
+        assertEquals(7L, first.totalFrames)
+        assertEquals(11L, second.totalFrames)
+        assertTrue(first.completed)
+        assertTrue(second.completed)
+    }
+
+    @Test
+    fun nativeSessionDecodeRejectsConcurrentUse() {
+        FlacNativeLoader.load()
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val workerFailure = AtomicReference<Throwable?>()
+        val worker = Thread {
+            try {
+                NativeBindings.decodeDecoderFrom(
+                    handle,
+                    0,
+                    object : PcmConsumer {
+                        override fun onStreamInfo(info: FlacStreamInfo) = Unit
+
+                        override fun onPcmInterleaved(samples: IntArray, frames: Int) {
+                            callbackEntered.countDown()
+                            assertTrue(releaseCallback.await(5, TimeUnit.SECONDS))
+                        }
+
+                        override fun onComplete() = Unit
+                    }
+                )
+            } catch (t: Throwable) {
+                workerFailure.set(t)
+            }
+        }
+
+        try {
+            worker.start()
+            assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+            assertFailsWith<IllegalStateException> {
+                NativeBindings.decodeDecoderFrom(handle, 0, CollectingConsumer())
+            }
+        } finally {
+            releaseCallback.countDown()
+            worker.join(5_000)
+            NativeBindings.releaseDecoder(handle)
+        }
+
+        assertTrue(!worker.isAlive)
+        workerFailure.get()?.let { throw it }
+    }
+
+    @Test
+    fun missingFileThrowsStableException() {
+        val missing = sampleFile.resolveSibling("missing.flac")
+        assertFailsWith<FlacDecodeException> {
+            FlacMetadataReader().read(missing)
+        }
+    }
+
+    @Test
+    fun oggFlacIsRejected() {
+        // V1 rejects Ogg FLAC at the JVM boundary before JNI is entered.
+        val oggLike = Files.createTempFile("ogg-like", ".flac")
+        Files.write(oggLike, byteArrayOf(0x4f, 0x67, 0x67, 0x53, 0x00, 0x00))
+
+        assertFailsWith<UnsupportedFeatureException> {
+            FlacMetadataReader().read(oggLike)
+        }
+    }
+
+    @Test
+    fun truncatedFileFailsDecode() {
+        // A file that starts like FLAC but ends early should make the native
+        // decoder fail in a controlled way.
+        val truncated = Files.createTempFile(sampleFile.name.removeSuffix(".flac"), "-truncated.flac")
+        val bytes = Files.readAllBytes(sampleFile)
+        Files.write(truncated, bytes.copyOf(128))
+
+        assertFailsWith<FlacDecodeException> {
+            FlacDecoder().decode(truncated, CollectingConsumer())
+        }
+    }
+
+    @Test
+    fun nativeDecodeRejectsNullConsumerBeforeEnteringCallbackFlow() {
+        FlacNativeLoader.load()
+
+        assertFailsWith<IllegalArgumentException> {
+            NativeBindings.decodeFile(sampleFile.toString(), null)
+        }
+    }
+
+    private class CollectingConsumer : PcmConsumer {
+        /** Last STREAMINFO observed from the decoder. */
+        var streamInfo: FlacStreamInfo? = null
+
+        /** Running sum of decoded frame counts. */
+        var totalFrames: Long = 0
+
+        /** Counts malformed callback payloads for easier assertions. */
+        var invalidChunkCount: Long = 0
+
+        /** Set when the decoder completes normally. */
+        var completed: Boolean = false
+
+        override fun onStreamInfo(info: FlacStreamInfo) {
+            streamInfo = info
+        }
+
+        override fun onPcmInterleaved(samples: IntArray, frames: Int) {
+            val currentInfo = requireNotNull(streamInfo)
+            // Every callback must deliver exactly `frames * channels` values
+            // because the native shim interleaves channel-separated PCM first.
+            if (samples.size != frames * currentInfo.channels) {
+                invalidChunkCount += 1
+            }
+            totalFrames += frames.toLong()
+        }
+
+        override fun onComplete() {
+            completed = true
+        }
+    }
+
+    private class CountingConsumer : PcmConsumer {
+        var totalFrames: Long = 0
+        var completed: Boolean = false
+
+        override fun onStreamInfo(info: FlacStreamInfo) = Unit
+
+        override fun onPcmInterleaved(samples: IntArray, frames: Int) {
+            totalFrames += frames.toLong()
+        }
+
+        override fun onComplete() {
+            completed = true
+        }
+    }
+
+    private fun assertInterleavedChunksEqual(
+        expected: List<FlacInterleavedPcmChunk>,
+        actual: List<FlacInterleavedPcmChunk>
+    ) {
+        assertEquals(expected.size, actual.size)
+        expected.zip(actual).forEach { (expectedChunk, actualChunk) ->
+            assertEquals(expectedChunk.streamInfo, actualChunk.streamInfo)
+            assertEquals(expectedChunk.frames, actualChunk.frames)
+            assertEquals(expectedChunk.firstFrameIndex, actualChunk.firstFrameIndex)
+            assertContentEquals(expectedChunk.interleavedSamples, actualChunk.interleavedSamples)
+        }
+    }
+
+    private fun assertSamplesMatchFullAudio(
+        full: FlacDecodedAudio,
+        firstSample: Long,
+        range: FlacDecodedAudio
+    ) {
+        val channels = full.streamInfo.channels
+        val start = Math.multiplyExact(firstSample, channels.toLong())
+        val end = Math.addExact(start, range.interleavedSamples.size.toLong())
+        require(start <= Int.MAX_VALUE.toLong() && end <= Int.MAX_VALUE.toLong())
+        val expected = full.interleavedSamples.copyOfRange(start.toInt(), end.toInt())
+        assertContentEquals(expected, range.interleavedSamples)
+    }
+
+    private fun metadataOnlyFlacFixture(): ByteArray {
+        val output = ByteArrayOutputStream()
+        output.write("fLaC".toByteArray(Charsets.US_ASCII))
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_STREAMINFO,
+            isLast = false,
+            payload = streamInfoBlock()
+        )
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_PADDING,
+            isLast = false,
+            payload = byteArrayOf(0x00, 0x00, 0x00)
+        )
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_APPLICATION,
+            isLast = false,
+            payload = byteArrayOf(
+                'T'.code.toByte(),
+                'S'.code.toByte(),
+                'T'.code.toByte(),
+                '1'.code.toByte(),
+                0x10,
+                0x20
+            )
+        )
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_UNKNOWN_FIXTURE,
+            isLast = false,
+            payload = byteArrayOf(0x01, 0x02, 0x03)
+        )
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_VORBIS_COMMENT,
+            isLast = true,
+            payload = vorbisCommentBlock()
+        )
+        return output.toByteArray()
+    }
+
+    private fun streamInfoBlock(): ByteArray {
+        val output = ByteArrayOutputStream(FLAC_STREAMINFO_LENGTH)
+        output.writeUInt16BigEndian(16)
+        output.writeUInt16BigEndian(16)
+        output.writeUInt24BigEndian(0)
+        output.writeUInt24BigEndian(0)
+
+        /*
+         * STREAMINFO packs sample rate, channel count minus one, bit depth
+         * minus one, and total samples into one 64-bit big-endian field.
+         */
+        val sampleRate = 44_100L
+        val channelsMinusOne = 1L
+        val bitsPerSampleMinusOne = 15L
+        val totalSamples = 0L
+        val packedAudioFields =
+            (sampleRate shl 44) or (channelsMinusOne shl 41) or (bitsPerSampleMinusOne shl 36) or totalSamples
+        output.writeUInt64BigEndian(packedAudioFields)
+        output.write(ByteArray(16))
+        return output.toByteArray()
+    }
+
+    private fun vorbisCommentBlock(): ByteArray {
+        val vendor = "fixture".toByteArray(Charsets.UTF_8)
+        val entry = "TITLE=Fixture".toByteArray(Charsets.UTF_8)
+        val output = ByteArrayOutputStream()
+        // Vorbis comments store their string lengths in little-endian order.
+        output.writeUInt32LittleEndian(vendor.size)
+        output.write(vendor)
+        output.writeUInt32LittleEndian(1)
+        output.writeUInt32LittleEndian(entry.size)
+        output.write(entry)
+        return output.toByteArray()
+    }
+
+    private fun ByteArrayOutputStream.writeMetadataBlock(type: Int, isLast: Boolean, payload: ByteArray) {
+        require(payload.size <= FLAC_METADATA_MAX_PAYLOAD_LENGTH)
+        val typeByte = (if (isLast) FLAC_METADATA_LAST_BLOCK_FLAG else 0) or type
+        write(typeByte)
+        writeUInt24BigEndian(payload.size)
+        write(payload)
+    }
+
+    private fun ByteArrayOutputStream.writeUInt16BigEndian(value: Int) {
+        write((value ushr 8) and 0xff)
+        write(value and 0xff)
+    }
+
+    private fun ByteArrayOutputStream.writeUInt24BigEndian(value: Int) {
+        write((value ushr 16) and 0xff)
+        write((value ushr 8) and 0xff)
+        write(value and 0xff)
+    }
+
+    private fun ByteArrayOutputStream.writeUInt32LittleEndian(value: Int) {
+        write(value and 0xff)
+        write((value ushr 8) and 0xff)
+        write((value ushr 16) and 0xff)
+        write((value ushr 24) and 0xff)
+    }
+
+    private fun ByteArrayOutputStream.writeUInt64BigEndian(value: Long) {
+        for (shift in 56 downTo 0 step 8) {
+            write(((value ushr shift) and 0xff).toInt())
+        }
+    }
+}

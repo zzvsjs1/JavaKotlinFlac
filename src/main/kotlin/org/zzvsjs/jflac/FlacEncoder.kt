@@ -1,0 +1,432 @@
+package org.zzvsjs.jflac
+
+import org.zzvsjs.jflac.internal.NativeBindings
+import org.zzvsjs.jflac.internal.NativeEncodingRequest
+import java.nio.file.Files
+import java.nio.file.Path
+import kotlin.io.path.absolutePathString
+
+/*
+ * The write model uses -1 for the FLAC seekpoint placeholder because Java and
+ * Kotlin Long cannot represent the unsigned all-bits-set sample number.
+ */
+private const val FLAC_SEEKPOINT_PLACEHOLDER_SAMPLE_NUMBER = -1L
+
+/* FLAC stores seekpoint frame_samples in a 16-bit unsigned field. */
+private const val FLAC_SEEKPOINT_MAX_FRAME_SAMPLES = 65_535
+
+/* FLAC CUESHEET stores these text fields as fixed ASCII byte arrays. */
+private const val FLAC_CUESHEET_MAX_FIXED_FIELD_BYTES = 128
+private const val FLAC_CUESHEET_MAX_ISRC_BYTES = 12
+
+/* FLAC CUESHEET track and index counts are stored in unsigned 8-bit fields. */
+private const val FLAC_CUESHEET_MAX_LIST_ITEMS = 255
+
+/*
+ * FLAC metadata block type codes from the bitstream specification. STREAMINFO
+ * uses type 0 and is intentionally absent here because libFLAC owns it for new
+ * encoder streams.
+ */
+private const val FLAC_METADATA_TYPE_PADDING = 1
+private const val FLAC_METADATA_TYPE_APPLICATION = 2
+private const val FLAC_METADATA_TYPE_SEEKTABLE = 3
+private const val FLAC_METADATA_TYPE_VORBIS_COMMENT = 4
+private const val FLAC_METADATA_TYPE_CUESHEET = 5
+private const val FLAC_METADATA_TYPE_PICTURE = 6
+
+/**
+ * File-based FLAC encoder backed by libFLAC.
+ *
+ * The public surface mirrors the existing decoder philosophy:
+ * - JVM code validates caller input before crossing into JNI
+ * - the native layer owns all libFLAC objects and file lifecycle details
+ * - callers only work with small Kotlin/Java models and a session handle
+ */
+class FlacEncoder {
+    /**
+     * Opens a streaming encoder session for a native FLAC output file.
+     *
+     * The returned session accepts multiple PCM chunks. The caller is
+     * responsible for finishing the session when all frames have been written.
+     */
+    @JvmOverloads
+    fun open(
+        output: Path,
+        format: FlacAudioFormat,
+        metadata: FlacEncodingMetadata = FlacEncodingMetadata(),
+        options: FlacEncodingOptions = FlacEncodingOptions()
+    ): FlacEncodingSession {
+        val normalizedOutput = validateNativeFlacOutputPath(output)
+        validateFlacAudioFormat(format)
+        validateFlacEncodingOptions(options)
+        validateFlacEncodingMetadata(metadata)
+
+        FlacNativeLoader.load()
+        val handle = NativeBindings.openEncoderFile(
+            normalizedOutput.absolutePathString(),
+            metadata.toNativeRequest(format, options)
+        )
+        if (handle == 0L) {
+            throw FlacEncodeException(
+                "Native encoder initialization returned an invalid handle without throwing an exception."
+            )
+        }
+        return NativeFlacEncodingSession(handle, format)
+    }
+
+    /**
+     * Encodes one interleaved PCM buffer into a complete FLAC file.
+     *
+     * This is a convenience wrapper built on top of [open] so there is only one
+     * native encoder lifecycle implementation to maintain.
+     */
+    @JvmOverloads
+    fun encode(
+        output: Path,
+        format: FlacAudioFormat,
+        samples: IntArray,
+        metadata: FlacEncodingMetadata = FlacEncodingMetadata(),
+        options: FlacEncodingOptions = FlacEncodingOptions()
+    ) {
+        val frames = computeFrameCount(samples, format.channels)
+        open(output, format, metadata, options).use { session ->
+            session.writeInterleaved(samples, frames)
+        }
+    }
+}
+
+/**
+ * JVM-owned wrapper around one native encoder handle.
+ *
+ * The session becomes terminal after either a successful finish or a native
+ * failure. Further writes are rejected to keep lifecycle bugs obvious.
+ */
+internal class NativeFlacEncodingSession(
+    initialHandle: Long,
+    private val format: FlacAudioFormat
+) : FlacEncodingSession {
+    private var handle: Long = initialHandle
+    private var state: SessionState = SessionState.ACTIVE
+
+    override fun writeInterleaved(samples: IntArray, frames: Int) {
+        ensureActiveForWrite()
+        validateInterleavedPcmChunk(samples, frames, format)
+        if (frames == 0) {
+            return
+        }
+
+        try {
+            NativeBindings.writeEncoderInterleaved(handle, samples, frames)
+        } catch (t: Throwable) {
+            releaseAfterFailure()
+            throw t
+        }
+    }
+
+    override fun finish() {
+        when (state) {
+            SessionState.FINISHED -> return
+            SessionState.FAILED -> return
+            SessionState.ACTIVE -> Unit
+        }
+
+        val currentHandle = handle
+        handle = 0L
+        try {
+            NativeBindings.finishEncoder(currentHandle)
+            state = SessionState.FINISHED
+        } catch (t: Throwable) {
+            state = SessionState.FAILED
+            throw t
+        }
+    }
+
+    private fun ensureActiveForWrite() {
+        if (state != SessionState.ACTIVE || handle == 0L) {
+            throw IllegalStateException("The FLAC encoding session is no longer active.")
+        }
+    }
+
+    /**
+     * Best-effort release used after write failures.
+     *
+     * The native layer still owns the handle after a failed process call, so
+     * the JVM proactively releases it to avoid leaking encoder state.
+     */
+    private fun releaseAfterFailure() {
+        if (state != SessionState.ACTIVE) {
+            return
+        }
+
+        val currentHandle = handle
+        handle = 0L
+        state = SessionState.FAILED
+        if (currentHandle != 0L) {
+            NativeBindings.releaseEncoder(currentHandle)
+        }
+    }
+
+    private enum class SessionState {
+        ACTIVE,
+        FINISHED,
+        FAILED
+    }
+}
+
+/**
+ * Converts the high-level Kotlin models into the Java DTO used at the JNI
+ * boundary.
+ *
+ * Flattening comment entries on the JVM keeps the native layer focused on
+ * libFLAC object creation instead of wrapper-specific collection handling.
+ */
+private fun FlacEncodingMetadata.toNativeRequest(
+    format: FlacAudioFormat,
+    options: FlacEncodingOptions
+): NativeEncodingRequest {
+    val commentEntries = comments.toVorbisCommentEntries().toTypedArray()
+    val metadataBlockTypes = blocks.map { block -> block.nativeType() }.toIntArray()
+    val metadataBlockValues = blocks.map { block -> block.nativeValue() }.toTypedArray()
+
+    return NativeEncodingRequest(
+        format.sampleRate,
+        format.channels,
+        format.bitsPerSample,
+        format.totalSamplesEstimate,
+        options.compressionLevel,
+        options.verify,
+        options.streamableSubset,
+        options.blockSize,
+        commentEntries,
+        pictures.toTypedArray(),
+        applicationBlocks.toTypedArray(),
+        seekTables.toTypedArray(),
+        cueSheets.toTypedArray(),
+        paddingBlocks.toTypedArray(),
+        unknownBlocks.toTypedArray(),
+        metadataBlockTypes,
+        metadataBlockValues
+    )
+}
+
+private fun Map<String, List<String>>.toVorbisCommentEntries(): List<String> {
+    return entries.flatMap { (key, values) ->
+        values.map { value -> "$key=$value" }
+    }
+}
+
+private fun FlacMetadataBlock.nativeType(): Int {
+    return when (this) {
+        is FlacMetadataBlock.VorbisComment -> FLAC_METADATA_TYPE_VORBIS_COMMENT
+        is FlacMetadataBlock.Picture -> FLAC_METADATA_TYPE_PICTURE
+        is FlacMetadataBlock.Application -> FLAC_METADATA_TYPE_APPLICATION
+        is FlacMetadataBlock.SeekTable -> FLAC_METADATA_TYPE_SEEKTABLE
+        is FlacMetadataBlock.CueSheet -> FLAC_METADATA_TYPE_CUESHEET
+        is FlacMetadataBlock.Padding -> FLAC_METADATA_TYPE_PADDING
+        is FlacMetadataBlock.Unknown -> unknown.type
+    }
+}
+
+private fun FlacMetadataBlock.nativeValue(): Any {
+    return when (this) {
+        is FlacMetadataBlock.VorbisComment -> comment.comments.toVorbisCommentEntries().toTypedArray()
+        is FlacMetadataBlock.Picture -> picture
+        is FlacMetadataBlock.Application -> application
+        is FlacMetadataBlock.SeekTable -> seekTable
+        is FlacMetadataBlock.CueSheet -> cueSheet
+        is FlacMetadataBlock.Padding -> padding
+        is FlacMetadataBlock.Unknown -> unknown
+    }
+}
+
+/**
+ * Validates format values that libFLAC expects to be well-formed.
+ *
+ * The wrapper deliberately rejects obviously invalid audio descriptions here so
+ * callers get stable argument errors before the JNI boundary is crossed.
+ */
+internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
+    require(format.sampleRate > 0) { "Sample rate must be positive." }
+    require(format.channels in 1..8) { "Channel count must be between 1 and 8." }
+    require(format.bitsPerSample in 4..32) { "Bits per sample must be between 4 and 32." }
+    require(format.totalSamplesEstimate == null || format.totalSamplesEstimate >= 0L) {
+        "Total sample estimate must be null or non-negative."
+    }
+}
+
+/**
+ * Validates user-facing encoder options before JNI is entered.
+ *
+ * V1 intentionally exposes a small option subset, so the validation rules stay
+ * easy to understand and mirror the wrapper contract closely.
+ */
+internal fun validateFlacEncodingOptions(options: FlacEncodingOptions) {
+    require(options.compressionLevel in 0..8) { "Compression level must be between 0 and 8." }
+    require(options.blockSize == null || options.blockSize > 0) { "Block size must be positive when provided." }
+}
+
+/**
+ * Validates metadata values that the wrapper can check cheaply on the JVM.
+ *
+ * The goal is not to reimplement the full FLAC metadata specification, only to
+ * catch malformed wrapper input before native allocation work begins.
+ */
+internal fun validateFlacEncodingMetadata(metadata: FlacEncodingMetadata) {
+    if (metadata.blocks.isNotEmpty()) {
+        validateOrderedMetadataBlocks(metadata.blocks)
+        return
+    }
+
+    validateVorbisComments(metadata.comments)
+    metadata.pictures.forEach(::validatePictureMetadata)
+
+    require(metadata.seekTables.size <= 1) {
+        "At most one SEEKTABLE metadata block can be encoded."
+    }
+    metadata.seekTables.forEach(::validateSeekTableMetadata)
+    metadata.cueSheets.forEach(::validateCueSheetMetadata)
+}
+
+private fun validateOrderedMetadataBlocks(blocks: List<FlacMetadataBlock>) {
+    require(blocks.count { block -> block is FlacMetadataBlock.VorbisComment } <= 1) {
+        "At most one Vorbis comment metadata block can be encoded."
+    }
+    require(blocks.count { block -> block is FlacMetadataBlock.SeekTable } <= 1) {
+        "At most one SEEKTABLE metadata block can be encoded."
+    }
+
+    blocks.forEach { block ->
+        when (block) {
+            is FlacMetadataBlock.VorbisComment -> validateVorbisComments(block.comment.comments)
+            is FlacMetadataBlock.Picture -> validatePictureMetadata(block.picture)
+            is FlacMetadataBlock.SeekTable -> validateSeekTableMetadata(block.seekTable)
+            is FlacMetadataBlock.CueSheet -> validateCueSheetMetadata(block.cueSheet)
+            is FlacMetadataBlock.Application,
+            is FlacMetadataBlock.Padding,
+            is FlacMetadataBlock.Unknown -> Unit
+        }
+    }
+}
+
+private fun validateVorbisComments(comments: Map<String, List<String>>) {
+    comments.forEach { (key, _) ->
+        require(key.isNotBlank()) { "Vorbis comment keys must not be blank." }
+        require('=' !in key) { "Vorbis comment keys must not contain '='." }
+    }
+}
+
+private fun validatePictureMetadata(picture: FlacPicture) {
+    require(picture.type >= 0) { "Picture type must be non-negative." }
+    require(picture.mimeType.isNotBlank()) { "Picture MIME type must not be blank." }
+    require(picture.width >= 0) { "Picture width must be non-negative." }
+    require(picture.height >= 0) { "Picture height must be non-negative." }
+    require(picture.depth >= 0) { "Picture depth must be non-negative." }
+    require(picture.colors >= 0) { "Picture colour count must be non-negative." }
+}
+
+private fun validateSeekTableMetadata(seekTable: FlacSeekTable) {
+    seekTable.points.forEach { point ->
+        require(point.sampleNumber >= FLAC_SEEKPOINT_PLACEHOLDER_SAMPLE_NUMBER) {
+            "Seek point sample number must be non-negative or -1 for a placeholder."
+        }
+        require(point.streamOffset >= 0L) { "Seek point stream offset must be non-negative." }
+        require(point.frameSamples in 0..FLAC_SEEKPOINT_MAX_FRAME_SAMPLES) {
+            "Seek point frame sample count must fit the FLAC 16-bit field."
+        }
+    }
+}
+
+private fun validateCueSheetMetadata(cueSheet: FlacCueSheet) {
+    require(cueSheet.mediaCatalogNumber.isFixedAsciiField(FLAC_CUESHEET_MAX_FIXED_FIELD_BYTES)) {
+        "CUESHEET media catalog number must be printable ASCII and at most 128 bytes."
+    }
+    require(cueSheet.leadIn >= 0L) { "CUESHEET lead-in must be non-negative." }
+    require(cueSheet.tracks.size <= FLAC_CUESHEET_MAX_LIST_ITEMS) {
+        "CUESHEET track count must fit the FLAC 8-bit field."
+    }
+    cueSheet.tracks.forEach { track ->
+        require(track.offset >= 0L) { "CUESHEET track offset must be non-negative." }
+        require(track.number in 0..255) { "CUESHEET track number must fit the FLAC 8-bit field." }
+        require(track.isrc.isFixedAsciiField(FLAC_CUESHEET_MAX_ISRC_BYTES)) {
+            "CUESHEET track ISRC must be printable ASCII and at most 12 bytes."
+        }
+        require(track.type in 0..1) { "CUESHEET track type must be 0 or 1." }
+        require(track.indices.size <= FLAC_CUESHEET_MAX_LIST_ITEMS) {
+            "CUESHEET index count must fit the FLAC 8-bit field."
+        }
+        track.indices.forEach { index ->
+            require(index.offset >= 0L) { "CUESHEET index offset must be non-negative." }
+            require(index.number in 0..255) { "CUESHEET index number must fit the FLAC 8-bit field." }
+        }
+    }
+}
+
+private fun String.isFixedAsciiField(maxBytes: Int): Boolean {
+    if (length > maxBytes) {
+        return false
+    }
+    return all { char -> char.code in 0x20..0x7e }
+}
+
+/**
+ * Performs light path validation for encoder outputs.
+ *
+ * Missing parents are not rejected here because they are a useful integration
+ * test for the native file-open failure path. The JVM only rejects path shapes
+ * that are clearly inconsistent before libFLAC is involved.
+ */
+internal fun validateNativeFlacOutputPath(path: Path): Path {
+    val normalized = path.toAbsolutePath().normalize()
+    val parent = normalized.parent
+    require(parent == null || !Files.exists(parent) || Files.isDirectory(parent)) {
+        "Output parent path is not a directory."
+    }
+    return normalized
+}
+
+/**
+ * Converts the flat sample array into a frame count for one-shot encode calls.
+ *
+ * One-shot encoding always uses the full supplied array, so the only valid
+ * layout is a sample count divisible by the channel count.
+ */
+internal fun computeFrameCount(samples: IntArray, channels: Int): Int {
+    require(channels > 0) { "Channel count must be positive." }
+    require(samples.size % channels == 0) {
+        "Sample array length must be divisible by the channel count."
+    }
+    return samples.size / channels
+}
+
+/**
+ * Validates a PCM chunk against the declared FLAC audio format.
+ *
+ * Range checks stay on the JVM side so out-of-range PCM input is reported as a
+ * caller contract violation instead of a native encoder failure.
+ */
+internal fun validateInterleavedPcmChunk(samples: IntArray, frames: Int, format: FlacAudioFormat) {
+    require(frames >= 0) { "Frame count must be non-negative." }
+
+    val expectedSampleCount = frames.toLong() * format.channels.toLong()
+    require(expectedSampleCount <= Int.MAX_VALUE) { "Frame count is too large for one chunk." }
+    require(samples.size == expectedSampleCount.toInt()) {
+        "Sample array length must equal frames * channels."
+    }
+
+    val minSample: Int
+    val maxSample: Int
+    if (format.bitsPerSample == 32) {
+        minSample = Int.MIN_VALUE
+        maxSample = Int.MAX_VALUE
+    } else {
+        val limit = 1L shl (format.bitsPerSample - 1)
+        minSample = (-limit).toInt()
+        maxSample = (limit - 1L).toInt()
+    }
+
+    for (sample in samples) {
+        require(sample in minSample..maxSample) {
+            "PCM sample $sample is outside the signed ${format.bitsPerSample}-bit range [$minSample, $maxSample]."
+        }
+    }
+}
