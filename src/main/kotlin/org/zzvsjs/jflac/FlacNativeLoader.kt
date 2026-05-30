@@ -1,6 +1,10 @@
 package org.zzvsjs.jflac
 
 import java.io.IOException
+import java.io.InputStream
+import java.io.PushbackInputStream
+import java.nio.ByteBuffer
+import java.nio.channels.SeekableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -166,31 +170,104 @@ internal data class NativeLibrary(val fileName: String) {
     }
 }
 
+internal enum class NativeFlacContainer(val nativeCode: Int) {
+    NATIVE(0),
+    OGG(1)
+}
+
+internal data class NativeFlacPath(
+    val path: Path,
+    val container: NativeFlacContainer
+)
+
+internal data class NativeFlacStream(
+    val input: InputStream,
+    val container: NativeFlacContainer
+)
+
 /**
  * Performs cheap JVM-side validation before control crosses into JNI.
  *
- * This keeps common errors, such as missing files or known unsupported
- * containers, out of the native layer where diagnostics are harder to evolve.
+ * This keeps common errors, such as missing files, out of the native layer
+ * where diagnostics are harder to evolve. The detected container also lets
+ * callers route native FLAC and Ogg FLAC to the matching libFLAC entry point.
  */
-internal fun validateNativeFlacPath(path: Path): Path {
+internal fun inspectNativeFlacPath(path: Path): NativeFlacPath {
     val normalized = path.toAbsolutePath().normalize()
     if (!normalized.exists() || !normalized.isRegularFile()) {
         throw FlacDecodeException("FLAC file does not exist or is not a regular file.")
     }
 
-    // V1 explicitly rejects Ogg FLAC and checks for the Ogg capture pattern up
-    // front so the user gets a clear high-level error instead of a decoder one.
     val magic = ByteArray(4)
     try {
         Files.newInputStream(normalized).use { input ->
             val read = input.read(magic)
-            if (read == 4 && magic.contentEquals(byteArrayOf(0x4f, 0x67, 0x67, 0x53))) {
-                throw UnsupportedFeatureException("Ogg FLAC is not supported in V1.")
-            }
+            return NativeFlacPath(normalized, detectNativeFlacContainer(magic, read))
         }
     } catch (e: IOException) {
         throw FlacDecodeException("Failed to inspect FLAC file.", e)
     }
+}
 
-    return normalized
+internal fun inspectNativeFlacStream(input: InputStream): NativeFlacStream {
+    val magic = ByteArray(4)
+    return try {
+        if (input.markSupported()) {
+            input.mark(magic.size)
+            val read = readMagic(input, magic)
+            input.reset()
+            NativeFlacStream(input, detectNativeFlacContainer(magic, read))
+        } else {
+            val pushback = PushbackInputStream(input, magic.size)
+            val read = readMagic(pushback, magic)
+            if (read > 0) {
+                pushback.unread(magic, 0, read)
+            }
+            NativeFlacStream(pushback, detectNativeFlacContainer(magic, read))
+        }
+    } catch (e: IOException) {
+        throw FlacDecodeException("Failed to inspect FLAC stream.", e)
+    }
+}
+
+internal fun inspectNativeFlacChannel(channel: SeekableByteChannel): NativeFlacContainer {
+    val originalPosition = channel.position()
+    val magic = ByteArray(4)
+    val buffer = ByteBuffer.wrap(magic)
+    return try {
+        val read = channel.read(buffer)
+        detectNativeFlacContainer(magic, read)
+    } catch (e: IOException) {
+        throw FlacDecodeException("Failed to inspect FLAC channel.", e)
+    } finally {
+        channel.position(originalPosition)
+    }
+}
+
+internal fun validateNativeFlacMetadataEditPath(path: Path): Path {
+    val inspected = inspectNativeFlacPath(path)
+    if (inspected.container == NativeFlacContainer.OGG) {
+        throw UnsupportedFeatureException("Ogg FLAC metadata editing is not supported.")
+    }
+    return inspected.path
+}
+
+private fun detectNativeFlacContainer(magic: ByteArray, bytesRead: Int): NativeFlacContainer {
+    return if (bytesRead == 4 && magic.contentEquals(byteArrayOf(0x4f, 0x67, 0x67, 0x53))) {
+        NativeFlacContainer.OGG
+    } else {
+        NativeFlacContainer.NATIVE
+    }
+}
+
+private fun readMagic(input: InputStream, magic: ByteArray): Int {
+    var totalRead = 0
+    while (totalRead < magic.size) {
+        val read = input.read(magic, totalRead, magic.size - totalRead)
+        if (read < 0) {
+            break
+        }
+        totalRead += read
+    }
+    return totalRead
 }

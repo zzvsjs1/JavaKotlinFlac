@@ -19,30 +19,42 @@ public final class NativeBindings {
     private NativeBindings() {
     }
 
-    public static native NativeMetadataPayload readMetadata(String path);
+    public static native NativeMetadataPayload readMetadata(String path, int container);
 
-    public static native void decodeFile(String path, PcmConsumer consumer);
+    public static native void decodeFile(String path, int container, PcmConsumer consumer);
 
-    public static native void decodeStream(InputStream input, PcmConsumer consumer);
+    public static native void decodeStream(InputStream input, int container, PcmConsumer consumer);
 
-    public static native void decodeChannel(SeekableByteChannel input, PcmConsumer consumer);
+    public static native void decodeChannel(SeekableByteChannel input, int container, PcmConsumer consumer);
 
-    public static native void decodeFileFrom(String path, long firstSample, PcmConsumer consumer);
+    public static native void decodeFileFrom(String path, int container, long firstSample, PcmConsumer consumer);
 
-    public static native void decodeChannelFrom(SeekableByteChannel input, long firstSample, PcmConsumer consumer);
-
-    public static native void decodeFileRange(String path, long firstSample, long maxFrames, PcmConsumer consumer);
-
-    public static native void decodeChannelRange(
+    public static native void decodeChannelFrom(
             SeekableByteChannel input,
+            int container,
+            long firstSample,
+            PcmConsumer consumer
+    );
+
+    public static native void decodeFileRange(
+            String path,
+            int container,
             long firstSample,
             long maxFrames,
             PcmConsumer consumer
     );
 
-    public static native long openDecoderFile(String path);
+    public static native void decodeChannelRange(
+            SeekableByteChannel input,
+            int container,
+            long firstSample,
+            long maxFrames,
+            PcmConsumer consumer
+    );
 
-    public static native long openDecoderChannel(SeekableByteChannel input);
+    public static native long openDecoderFile(String path, int container);
+
+    public static native long openDecoderChannel(SeekableByteChannel input, int container);
 
     public static native void decodeDecoderFrom(long handle, long firstSample, PcmConsumer consumer);
 

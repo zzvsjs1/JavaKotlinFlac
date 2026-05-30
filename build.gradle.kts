@@ -44,6 +44,14 @@ val flacSourceDir = flacSourceParentDir.map { it.dir("flac-$flacVersion") }
 val flacBuildDir = layout.buildDirectory.dir("flac-native")
 val flacDll = flacBuildDir.map { it.file("objs/FLAC.dll") }
 val flacImportLib = flacBuildDir.map { it.file("src/libFLAC/FLAC.lib") }
+val oggVersion = "1.3.6"
+val oggSourceUrl = "https://downloads.xiph.org/releases/ogg/libogg-$oggVersion.tar.xz"
+val oggSourceSha256 = "5c8253428e181840cd20d41f3ca16557a9cc04bad4a3d04cce84808677fa1061"
+val oggArchive = layout.buildDirectory.file("downloads/libogg-$oggVersion.tar.xz")
+val oggSourceParentDir = layout.buildDirectory.dir("ogg-source")
+val oggSourceDir = oggSourceParentDir.map { it.dir("libogg-$oggVersion") }
+val oggBuildDir = layout.buildDirectory.dir("ogg-native")
+val oggStaticLib = oggBuildDir.map { it.file("lib/ogg.lib") }
 val javaHomeDir = file(System.getProperty("java.home"))
 val jniIncludeDir = javaHomeDir.resolve("include")
 val jniPlatformIncludeDir = jniIncludeDir.resolve("win32")
@@ -51,6 +59,7 @@ val jniPlatformIncludeDir = jniIncludeDir.resolve("win32")
 val isWindows = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
 val msvcRuntimeLibrary = "MultiThreaded"
 val msvcRuntimeCmakeOptions = listOf(
+    "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=$msvcRuntimeLibrary"
 )
 
@@ -128,6 +137,7 @@ val requiredFlacDllSymbols = listOf(
     "FLAC__metadata_chain_new",
     "FLAC__metadata_chain_delete",
     "FLAC__metadata_chain_read",
+    "FLAC__metadata_chain_read_ogg",
     "FLAC__metadata_chain_status",
     "FLAC__metadata_chain_write",
     "FLAC__metadata_iterator_new",
@@ -140,7 +150,9 @@ val requiredFlacDllSymbols = listOf(
     "FLAC__stream_decoder_new",
     "FLAC__stream_decoder_delete",
     "FLAC__stream_decoder_init_file",
+    "FLAC__stream_decoder_init_ogg_file",
     "FLAC__stream_decoder_init_stream",
+    "FLAC__stream_decoder_init_ogg_stream",
     "FLAC__stream_decoder_process_until_end_of_metadata",
     "FLAC__stream_decoder_seek_absolute",
     "FLAC__stream_decoder_process_single",
@@ -247,11 +259,92 @@ val extractFlacSource by tasks.registering(Exec::class) {
     }
 }
 
+val downloadOggSource by tasks.registering {
+    group = "build setup"
+    description = "Downloads the official libogg $oggVersion source archive."
+    outputs.file(oggArchive)
+
+    doLast {
+        val archiveFile = oggArchive.get().asFile
+        val needsDownload = !archiveFile.exists() || sha256(archiveFile) != oggSourceSha256
+        if (needsDownload) {
+            archiveFile.parentFile.mkdirs()
+            URI(oggSourceUrl).toURL().openStream().use { input ->
+                archiveFile.outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+
+        val actualSha256 = sha256(archiveFile)
+        check(actualSha256 == oggSourceSha256) {
+            "Downloaded libogg source checksum mismatch. Expected $oggSourceSha256 but got $actualSha256."
+        }
+    }
+}
+
+val extractOggSource by tasks.registering(Exec::class) {
+    group = "build setup"
+    description = "Extracts the libogg $oggVersion source archive."
+    dependsOn(downloadOggSource)
+    inputs.file(oggArchive)
+    outputs.dir(oggSourceDir)
+
+    doFirst {
+        val sourceParent = oggSourceParentDir.get().asFile
+        val sourceRoot = oggSourceDir.get().asFile
+        sourceRoot.deleteRecursively()
+        sourceParent.mkdirs()
+        commandLine("tar", "-xf", oggArchive.get().asFile.absolutePath, "-C", sourceParent.absolutePath)
+    }
+}
+
+val buildOggNative by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds a static libogg library used by bundled FLAC.dll Ogg support."
+    dependsOn(extractOggSource)
+    inputs.dir(oggSourceDir)
+    inputs.property("msvcRuntimeLibrary", msvcRuntimeLibrary)
+    outputs.file(oggStaticLib)
+    onlyIf { isWindows }
+
+    doFirst {
+        val resolvedVcvars64 = vcvars64
+            ?: error("Unable to locate Visual Studio C++ tools. Install Desktop C++ tools or set up Visual Studio Build Tools.")
+        val resolvedNinjaExe = ninjaExe
+            ?: error("Unable to locate Visual Studio Ninja. Install the CMake tools for Visual Studio.")
+
+        oggBuildDir.get().asFile.mkdirs()
+        oggBuildDir.get().file("CMakeCache.txt").asFile.delete()
+        oggBuildDir.get().dir("CMakeFiles").asFile.deleteRecursively()
+        commandLine(
+            "cmd",
+            "/c",
+            listOf(
+                "call \"${resolvedVcvars64.cmdPath()}\" >nul",
+                listOf(
+                    "cmake -S \"${oggSourceDir.get().asFile.cmdPath()}\"",
+                    "-B \"${oggBuildDir.get().asFile.cmdPath()}\"",
+                    "-G Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_MAKE_PROGRAM=\"${resolvedNinjaExe.cmdPath()}\"",
+                    *msvcRuntimeCmakeOptions.toTypedArray(),
+                    "-DBUILD_SHARED_LIBS=OFF",
+                    "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=\"${oggBuildDir.get().dir("lib").asFile.cmdPath()}\"",
+                    "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=\"${oggBuildDir.get().dir("bin").asFile.cmdPath()}\"",
+                    "-DINSTALL_DOCS=OFF"
+                ).joinToString(" "),
+                "\"${resolvedNinjaExe.cmdPath()}\" -C \"${oggBuildDir.get().asFile.cmdPath()}\" ogg -v"
+            ).joinToString(" && ")
+        )
+    }
+}
+
 val buildFlacNative by tasks.registering(Exec::class) {
     group = "build"
     description = "Builds FLAC.dll from the official FLAC $flacVersion source archive."
-    dependsOn(extractFlacSource)
+    dependsOn(extractFlacSource, buildOggNative)
     inputs.dir(flacSourceDir)
+    inputs.dir(oggSourceDir.map { it.dir("include") })
+    inputs.file(oggStaticLib)
     inputs.property("msvcRuntimeLibrary", msvcRuntimeLibrary)
     outputs.files(flacDll, flacImportLib)
     onlyIf { isWindows }
@@ -278,7 +371,9 @@ val buildFlacNative by tasks.registering(Exec::class) {
                     "-DCMAKE_MAKE_PROGRAM=\"${resolvedNinjaExe.cmdPath()}\"",
                     *msvcRuntimeCmakeOptions.toTypedArray(),
                     "-DBUILD_SHARED_LIBS=ON",
-                    "-DWITH_OGG=OFF",
+                    "-DWITH_OGG=ON",
+                    "-DOGG_INCLUDE_DIR=\"${oggSourceDir.get().dir("include").asFile.cmdPath()}\"",
+                    "-DOGG_LIBRARY=\"${oggStaticLib.get().asFile.cmdPath()}\"",
                     "-DBUILD_CXXLIBS=OFF",
                     "-DBUILD_PROGRAMS=OFF",
                     "-DBUILD_EXAMPLES=OFF",

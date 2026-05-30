@@ -10,6 +10,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class FlacStreamIoIntegrationTest {
     @Test
@@ -76,6 +77,21 @@ class FlacStreamIoIntegrationTest {
     }
 
     @Test
+    fun inputStreamDecodeSupportsOggFlac() {
+        val oggFile = createOggFlacFixture("jflac-ogg-input-stream")
+
+        try {
+            val decoded = FlacDecoder().decode(ByteArrayInputStream(Files.readAllBytes(oggFile)))
+
+            assertEquals(8_000, decoded.streamInfo.sampleRate)
+            assertEquals(1, decoded.streamInfo.channels)
+            assertEquals(80, decoded.totalFrames)
+        } finally {
+            Files.deleteIfExists(oggFile)
+        }
+    }
+
+    @Test
     fun seekableChannelDecodeSupportsWholeFileAndRange() {
         val frames = 47
         val format = FlacAudioFormat(
@@ -111,6 +127,44 @@ class FlacStreamIoIntegrationTest {
             )
         } finally {
             Files.deleteIfExists(file)
+        }
+    }
+
+    @Test
+    fun seekableChannelDecodeSupportsOggFlac() {
+        val oggFile = createOggFlacFixture("jflac-ogg-seekable-channel")
+
+        try {
+            Files.newByteChannel(oggFile, StandardOpenOption.READ).use { channel ->
+                val decoded = FlacDecoder().decode(channel)
+
+                assertEquals(8_000, decoded.streamInfo.sampleRate)
+                assertEquals(1, decoded.streamInfo.channels)
+                assertEquals(80, decoded.totalFrames)
+            }
+            Files.newByteChannel(oggFile, StandardOpenOption.READ).use { channel ->
+                val range = FlacDecoder().decode(channel, firstSample = 5, maxFrames = 12)
+
+                assertEquals(12L, range.totalFrames)
+                assertEquals(12, range.interleavedSamples.size)
+            }
+            Files.newByteChannel(oggFile, StandardOpenOption.READ).use { channel ->
+                FlacDecoder().open(channel).use { session ->
+                    val chunks = ArrayList<FlacInterleavedPcmChunk>()
+                    val summary = session.decodeInterleaved(
+                        firstSample = 9,
+                        maxFrames = 7,
+                        onChunk = FlacInterleavedPcmHandler { chunk -> chunks += chunk }
+                    )
+
+                    assertEquals(7L, summary.totalFrames)
+                    assertTrue(chunks.isNotEmpty())
+                    assertEquals(9L, chunks.first().firstFrameIndex)
+                    assertEquals(7, chunks.sumOf { chunk -> chunk.frames })
+                }
+            }
+        } finally {
+            Files.deleteIfExists(oggFile)
         }
     }
 

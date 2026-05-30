@@ -22,12 +22,15 @@ class FlacDecoder {
      * caller. Use Kotlin `use { ... }` or Java try-with-resources.
      */
     fun open(path: Path): FlacDecodingSession {
-        val normalizedPath = validateNativeFlacPath(path)
+        val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        val streamInfo = NativeBindings.readMetadata(normalizedPath.absolutePathString())
+        val streamInfo = NativeBindings.readMetadata(
+            inspected.path.absolutePathString(),
+            inspected.container.nativeCode
+        )
             .toPublicMetadata()
             .streamInfo
-        val handle = NativeBindings.openDecoderFile(normalizedPath.absolutePathString())
+        val handle = NativeBindings.openDecoderFile(inspected.path.absolutePathString(), inspected.container.nativeCode)
         if (handle == 0L) {
             throw FlacDecodeException("Native decoder initialization returned an invalid handle without throwing an exception.")
         }
@@ -35,15 +38,16 @@ class FlacDecoder {
     }
 
     /**
-     * Opens a reusable decode session for a seekable native FLAC channel.
+     * Opens a reusable decode session for a seekable FLAC or Ogg FLAC channel.
      *
      * The channel is not closed by the returned session. libFLAC byte offsets
      * are relative to the channel position at open time.
      */
     fun open(input: SeekableByteChannel): FlacDecodingSession {
         FlacNativeLoader.load()
-        val streamInfo = readChannelStreamInfo(input)
-        val handle = NativeBindings.openDecoderChannel(input)
+        val container = inspectNativeFlacChannel(input)
+        val streamInfo = readChannelStreamInfo(input, container)
+        val handle = NativeBindings.openDecoderChannel(input, container.nativeCode)
         if (handle == 0L) {
             throw FlacDecodeException("Native channel decoder initialization returned an invalid handle without throwing an exception.")
         }
@@ -63,7 +67,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a native FLAC stream into one JVM-owned PCM buffer.
+     * Decodes a FLAC or Ogg FLAC stream into one JVM-owned PCM buffer.
      *
      * Plain streams are sequential-only in V1. Use file or seekable-channel
      * APIs when the caller needs range decode or a reusable seekable session.
@@ -75,7 +79,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a seekable native FLAC channel into one JVM-owned PCM buffer.
+     * Decodes a seekable FLAC or Ogg FLAC channel into one JVM-owned PCM buffer.
      */
     fun decode(input: SeekableByteChannel): FlacDecodedAudio {
         val consumer = BufferingPcmConsumer()
@@ -95,7 +99,7 @@ class FlacDecoder {
 
     /**
      * Seeks to [firstSample] and decodes at most [maxFrames] PCM frames from a
-     * seekable native FLAC channel into one JVM-owned buffer.
+     * seekable FLAC or Ogg FLAC channel into one JVM-owned buffer.
      */
     fun decode(input: SeekableByteChannel, firstSample: Long, maxFrames: Long): FlacDecodedAudio {
         val consumer = BufferingPcmConsumer(firstSample, maxFrames)
@@ -127,7 +131,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a native FLAC stream and forwards interleaved PCM chunks.
+     * Decodes a FLAC or Ogg FLAC stream and forwards interleaved PCM chunks.
      */
     @JvmOverloads
     fun decodeInterleaved(
@@ -146,7 +150,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a seekable native FLAC channel and forwards interleaved PCM
+     * Decodes a seekable FLAC or Ogg FLAC channel and forwards interleaved PCM
      * chunks.
      */
     @JvmOverloads
@@ -284,7 +288,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a native FLAC stream and forwards channel-separated PCM chunks.
+     * Decodes a FLAC or Ogg FLAC stream and forwards channel-separated PCM chunks.
      */
     @JvmOverloads
     fun decodeChannels(
@@ -303,7 +307,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a seekable native FLAC channel and forwards channel-separated
+     * Decodes a seekable FLAC or Ogg FLAC channel and forwards channel-separated
      * PCM chunks.
      */
     @JvmOverloads
@@ -430,7 +434,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a native FLAC stream into the richer streaming listener API.
+     * Decodes a FLAC or Ogg FLAC stream into the richer streaming listener API.
      */
     fun decode(input: InputStream, listener: FlacDecodeListener): FlacDecodeSummary {
         val consumer = InterleavedForwardingPcmConsumer(
@@ -443,7 +447,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a seekable native FLAC channel into the richer streaming
+     * Decodes a seekable FLAC or Ogg FLAC channel into the richer streaming
      * listener API.
      */
     fun decode(input: SeekableByteChannel, listener: FlacDecodeListener): FlacDecodeSummary {
@@ -539,7 +543,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a native FLAC stream into the channel-oriented listener API.
+     * Decodes a FLAC or Ogg FLAC stream into the channel-oriented listener API.
      */
     fun decode(input: InputStream, listener: FlacChannelDecodeListener): FlacDecodeSummary {
         val consumer = ChannelForwardingPcmConsumer(
@@ -552,7 +556,7 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a seekable native FLAC channel into the channel-oriented
+     * Decodes a seekable FLAC or Ogg FLAC channel into the channel-oriented
      * listener API.
      */
     fun decode(input: SeekableByteChannel, listener: FlacChannelDecodeListener): FlacDecodeSummary {
@@ -632,28 +636,29 @@ class FlacDecoder {
     }
 
     /**
-     * Decodes a native FLAC file and streams PCM data into [consumer].
+     * Decodes a FLAC or Ogg FLAC file and streams PCM data into [consumer].
      *
      * The call blocks until decoding completes or throws an exception.
      */
     fun decode(path: Path, consumer: PcmConsumer) {
-        val normalizedPath = validateNativeFlacPath(path)
+        val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        NativeBindings.decodeFile(normalizedPath.absolutePathString(), consumer)
+        NativeBindings.decodeFile(inspected.path.absolutePathString(), inspected.container.nativeCode, consumer)
     }
 
     /**
-     * Decodes a native FLAC stream and streams PCM data into [consumer].
+     * Decodes a FLAC or Ogg FLAC stream and streams PCM data into [consumer].
      *
      * The stream is read sequentially and is not closed by this method.
      */
     fun decode(input: InputStream, consumer: PcmConsumer) {
         FlacNativeLoader.load()
-        NativeBindings.decodeStream(input, consumer)
+        val inspected = inspectNativeFlacStream(input)
+        NativeBindings.decodeStream(inspected.input, inspected.container.nativeCode, consumer)
     }
 
     /**
-     * Decodes a seekable native FLAC channel and streams PCM data into
+     * Decodes a seekable FLAC or Ogg FLAC channel and streams PCM data into
      * [consumer].
      *
      * The channel is not closed by this method. libFLAC byte offsets are
@@ -661,7 +666,8 @@ class FlacDecoder {
      */
     fun decode(input: SeekableByteChannel, consumer: PcmConsumer) {
         FlacNativeLoader.load()
-        NativeBindings.decodeChannel(input, consumer)
+        val container = inspectNativeFlacChannel(input)
+        NativeBindings.decodeChannel(input, container.nativeCode, consumer)
     }
 
     /**
@@ -669,9 +675,14 @@ class FlacDecoder {
      */
     fun decode(path: Path, firstSample: Long, consumer: PcmConsumer) {
         require(firstSample >= 0L) { "First sample must be non-negative." }
-        val normalizedPath = validateNativeFlacPath(path)
+        val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        NativeBindings.decodeFileFrom(normalizedPath.absolutePathString(), firstSample, consumer)
+        NativeBindings.decodeFileFrom(
+            inspected.path.absolutePathString(),
+            inspected.container.nativeCode,
+            firstSample,
+            consumer
+        )
     }
 
     /**
@@ -681,7 +692,8 @@ class FlacDecoder {
     fun decode(input: SeekableByteChannel, firstSample: Long, consumer: PcmConsumer) {
         require(firstSample >= 0L) { "First sample must be non-negative." }
         FlacNativeLoader.load()
-        NativeBindings.decodeChannelFrom(input, firstSample, consumer)
+        val container = inspectNativeFlacChannel(input)
+        NativeBindings.decodeChannelFrom(input, container.nativeCode, firstSample, consumer)
     }
 
     /**
@@ -690,9 +702,15 @@ class FlacDecoder {
      */
     fun decode(path: Path, firstSample: Long, maxFrames: Long, consumer: PcmConsumer) {
         validateDecodeRange(firstSample, maxFrames)
-        val normalizedPath = validateNativeFlacPath(path)
+        val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        NativeBindings.decodeFileRange(normalizedPath.absolutePathString(), firstSample, maxFrames, consumer)
+        NativeBindings.decodeFileRange(
+            inspected.path.absolutePathString(),
+            inspected.container.nativeCode,
+            firstSample,
+            maxFrames,
+            consumer
+        )
     }
 
     /**
@@ -702,14 +720,15 @@ class FlacDecoder {
     fun decode(input: SeekableByteChannel, firstSample: Long, maxFrames: Long, consumer: PcmConsumer) {
         validateDecodeRange(firstSample, maxFrames)
         FlacNativeLoader.load()
-        NativeBindings.decodeChannelRange(input, firstSample, maxFrames, consumer)
+        val container = inspectNativeFlacChannel(input)
+        NativeBindings.decodeChannelRange(input, container.nativeCode, firstSample, maxFrames, consumer)
     }
 
-    private fun readChannelStreamInfo(input: SeekableByteChannel): FlacStreamInfo {
+    private fun readChannelStreamInfo(input: SeekableByteChannel, container: NativeFlacContainer): FlacStreamInfo {
         val originalPosition = input.position()
         val consumer = BufferingPcmConsumer(firstFrameIndex = 0, maxFrames = 0)
         try {
-            NativeBindings.decodeChannelRange(input, 0, 0, consumer)
+            NativeBindings.decodeChannelRange(input, container.nativeCode, 0, 0, consumer)
             return consumer.toDecodedAudio().streamInfo
         } finally {
             input.position(originalPosition)

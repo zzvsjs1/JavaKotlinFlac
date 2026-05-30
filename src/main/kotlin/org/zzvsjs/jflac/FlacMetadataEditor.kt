@@ -112,7 +112,7 @@ class FlacMetadataEditor {
     }
 
     fun replace(path: Path, metadata: FlacEncodingMetadata, options: FlacMetadataEditOptions) {
-        val normalizedPath = validateNativeFlacPath(path)
+        val normalizedPath = validateNativeFlacMetadataEditPath(path)
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()

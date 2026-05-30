@@ -45,6 +45,8 @@
 #define JFLAC_SUPPRESS_METADATA_CALLBACKS 1         /* Session range decode reuses cached STREAMINFO. */
 #define JFLAC_UNLIMITED_RANGE 0                     /* Decode until end-of-stream. */
 #define JFLAC_LIMITED_RANGE 1                       /* Stop after the requested maxFrames window. */
+#define JFLAC_CONTAINER_NATIVE 0                    /* Raw native FLAC stream, starting with fLaC. */
+#define JFLAC_CONTAINER_OGG 1                       /* Ogg container carrying a FLAC stream. */
 #define JFLAC_SEEKPOINT_PLACEHOLDER_JAVA_VALUE -1LL /* Signed Java sentinel for libFLAC's UINT64_MAX placeholder. */
 /*
  * FLAC stores metadata body lengths in a 24-bit header field and reserves
@@ -72,6 +74,7 @@ typedef struct FlacApi
     FLAC__Metadata_Chain *(*metadata_chain_new)(void);
     void (*metadata_chain_delete)(FLAC__Metadata_Chain *chain);
     FLAC__bool (*metadata_chain_read)(FLAC__Metadata_Chain *chain, const char *filename);
+    FLAC__bool (*metadata_chain_read_ogg)(FLAC__Metadata_Chain *chain, const char *filename);
     FLAC__Metadata_ChainStatus (*metadata_chain_status)(FLAC__Metadata_Chain *chain);
     FLAC__bool (*metadata_chain_write)(FLAC__Metadata_Chain *chain, FLAC__bool use_padding,
                                        FLAC__bool preserve_file_stats);
@@ -92,7 +95,18 @@ typedef struct FlacApi
                                                               FLAC__StreamDecoderMetadataCallback metadata_callback,
                                                               FLAC__StreamDecoderErrorCallback error_callback,
                                                               void *client_data);
+    FLAC__StreamDecoderInitStatus (*stream_decoder_init_ogg_file)(FLAC__StreamDecoder *decoder, const char *filename,
+                                                                  FLAC__StreamDecoderWriteCallback write_callback,
+                                                                  FLAC__StreamDecoderMetadataCallback metadata_callback,
+                                                                  FLAC__StreamDecoderErrorCallback error_callback,
+                                                                  void *client_data);
     FLAC__StreamDecoderInitStatus (*stream_decoder_init_stream)(
+        FLAC__StreamDecoder *decoder, FLAC__StreamDecoderReadCallback read_callback,
+        FLAC__StreamDecoderSeekCallback seek_callback, FLAC__StreamDecoderTellCallback tell_callback,
+        FLAC__StreamDecoderLengthCallback length_callback, FLAC__StreamDecoderEofCallback eof_callback,
+        FLAC__StreamDecoderWriteCallback write_callback, FLAC__StreamDecoderMetadataCallback metadata_callback,
+        FLAC__StreamDecoderErrorCallback error_callback, void *client_data);
+    FLAC__StreamDecoderInitStatus (*stream_decoder_init_ogg_stream)(
         FLAC__StreamDecoder *decoder, FLAC__StreamDecoderReadCallback read_callback,
         FLAC__StreamDecoderSeekCallback seek_callback, FLAC__StreamDecoderTellCallback tell_callback,
         FLAC__StreamDecoderLengthCallback length_callback, FLAC__StreamDecoderEofCallback eof_callback,
@@ -237,6 +251,7 @@ static BOOL CALLBACK init_flac_api(PINIT_ONCE init_once, PVOID parameter, PVOID 
     RESOLVE(metadata_chain_new, FLAC__metadata_chain_new);
     RESOLVE(metadata_chain_delete, FLAC__metadata_chain_delete);
     RESOLVE(metadata_chain_read, FLAC__metadata_chain_read);
+    RESOLVE(metadata_chain_read_ogg, FLAC__metadata_chain_read_ogg);
     RESOLVE(metadata_chain_status, FLAC__metadata_chain_status);
     RESOLVE(metadata_chain_write, FLAC__metadata_chain_write);
     RESOLVE(metadata_iterator_new, FLAC__metadata_iterator_new);
@@ -249,7 +264,9 @@ static BOOL CALLBACK init_flac_api(PINIT_ONCE init_once, PVOID parameter, PVOID 
     RESOLVE(stream_decoder_new, FLAC__stream_decoder_new);
     RESOLVE(stream_decoder_delete, FLAC__stream_decoder_delete);
     RESOLVE(stream_decoder_init_file, FLAC__stream_decoder_init_file);
+    RESOLVE(stream_decoder_init_ogg_file, FLAC__stream_decoder_init_ogg_file);
     RESOLVE(stream_decoder_init_stream, FLAC__stream_decoder_init_stream);
+    RESOLVE(stream_decoder_init_ogg_stream, FLAC__stream_decoder_init_ogg_stream);
     RESOLVE(stream_decoder_process_until_end_of_metadata, FLAC__stream_decoder_process_until_end_of_metadata);
     RESOLVE(stream_decoder_seek_absolute, FLAC__stream_decoder_seek_absolute);
     RESOLVE(stream_decoder_process_single, FLAC__stream_decoder_process_single);
@@ -375,6 +392,56 @@ static void throw_illegal_argument_exception(JNIEnv *env, const char *message)
     {
         (*env)->ThrowNew(env, exception_class, message);
     }
+}
+
+static int is_valid_container(jint container)
+{
+    return container == JFLAC_CONTAINER_NATIVE || container == JFLAC_CONTAINER_OGG;
+}
+
+static int validate_container(JNIEnv *env, jint container)
+{
+    if (!is_valid_container(container))
+    {
+        throw_illegal_argument_exception(env, "FLAC container code must be native or Ogg.");
+        return 0;
+    }
+    return 1;
+}
+
+static FLAC__bool read_metadata_chain_for_container(FLAC__Metadata_Chain *chain, const char *filename,
+                                                   jint container)
+{
+    return container == JFLAC_CONTAINER_OGG ? g_flac_api.metadata_chain_read_ogg(chain, filename)
+                                           : g_flac_api.metadata_chain_read(chain, filename);
+}
+
+static FLAC__StreamDecoderInitStatus init_file_decoder_for_container(
+    FLAC__StreamDecoder *decoder, const char *filename, FLAC__StreamDecoderWriteCallback write_callback,
+    FLAC__StreamDecoderMetadataCallback metadata_callback, FLAC__StreamDecoderErrorCallback error_callback,
+    void *client_data, jint container)
+{
+    return container == JFLAC_CONTAINER_OGG
+               ? g_flac_api.stream_decoder_init_ogg_file(decoder, filename, write_callback, metadata_callback,
+                                                         error_callback, client_data)
+               : g_flac_api.stream_decoder_init_file(decoder, filename, write_callback, metadata_callback,
+                                                     error_callback, client_data);
+}
+
+static FLAC__StreamDecoderInitStatus init_stream_decoder_for_container(
+    FLAC__StreamDecoder *decoder, FLAC__StreamDecoderReadCallback read_callback,
+    FLAC__StreamDecoderSeekCallback seek_callback, FLAC__StreamDecoderTellCallback tell_callback,
+    FLAC__StreamDecoderLengthCallback length_callback, FLAC__StreamDecoderEofCallback eof_callback,
+    FLAC__StreamDecoderWriteCallback write_callback, FLAC__StreamDecoderMetadataCallback metadata_callback,
+    FLAC__StreamDecoderErrorCallback error_callback, void *client_data, jint container)
+{
+    return container == JFLAC_CONTAINER_OGG
+               ? g_flac_api.stream_decoder_init_ogg_stream(decoder, read_callback, seek_callback, tell_callback,
+                                                           length_callback, eof_callback, write_callback,
+                                                           metadata_callback, error_callback, client_data)
+               : g_flac_api.stream_decoder_init_stream(decoder, read_callback, seek_callback, tell_callback,
+                                                       length_callback, eof_callback, write_callback,
+                                                       metadata_callback, error_callback, client_data);
 }
 
 /*
@@ -959,10 +1026,14 @@ static FLAC__bool build_picture_block(JNIEnv *env, jobject picture_object, FLAC_
  * that lets Kotlin reconstruct the original non-STREAMINFO block order.
  */
 JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMetadata(JNIEnv *env, jclass clazz,
-                                                                                     jstring path)
+                                                                                     jstring path, jint container)
 {
     (void)clazz;
     if (!flac_api_ready(env))
+    {
+        return NULL;
+    }
+    if (!validate_container(env, container))
     {
         return NULL;
     }
@@ -993,7 +1064,7 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
         return NULL;
     }
 
-    if (!g_flac_api.metadata_chain_read(chain, utf8_path))
+    if (!read_metadata_chain_for_container(chain, utf8_path, container))
     {
         g_flac_api.metadata_chain_delete(chain);
         free(utf8_path);
@@ -2714,8 +2785,8 @@ static void decode_error_callback(const FLAC__StreamDecoder *decoder, FLAC__Stre
  * Shared one-shot file decode implementation for full, seeked, and ranged
  * public JNI entry points.
  */
-static void decode_file_internal(JNIEnv *env, jstring path, jlong first_sample, jlong max_frames, jobject consumer,
-                                 int seek_before_decode, int range_limited)
+static void decode_file_internal(JNIEnv *env, jstring path, jint container, jlong first_sample, jlong max_frames,
+                                 jobject consumer, int seek_before_decode, int range_limited)
 {
     /*
      * Shared one-shot decoder implementation:
@@ -2727,6 +2798,10 @@ static void decode_file_internal(JNIEnv *env, jstring path, jlong first_sample, 
      * native resource cleanup identical for all public entry points.
      */
     if (!flac_api_ready(env))
+    {
+        return;
+    }
+    if (!validate_container(env, container))
     {
         return;
     }
@@ -2771,8 +2846,8 @@ static void decode_file_internal(JNIEnv *env, jstring path, jlong first_sample, 
         return;
     }
 
-    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_file(
-        decoder, utf8_path, decode_write_callback, decode_metadata_callback, decode_error_callback, &context);
+    FLAC__StreamDecoderInitStatus init_status = init_file_decoder_for_container(
+        decoder, utf8_path, decode_write_callback, decode_metadata_callback, decode_error_callback, &context, container);
     /*
      * libFLAC has consumed the path during initialisation. Keep ownership
      * simple by freeing the temporary UTF-8 buffer immediately after init.
@@ -2898,9 +2973,13 @@ static void decode_file_internal(JNIEnv *env, jstring path, jlong first_sample, 
  * Range and reusable-session decode stay file-only because plain InputStream
  * does not provide a clean seek/tell/length contract.
  */
-static void decode_stream_internal(JNIEnv *env, jobject input_stream, jobject consumer)
+static void decode_stream_internal(JNIEnv *env, jobject input_stream, jint container, jobject consumer)
 {
     if (!flac_api_ready(env))
+    {
+        return;
+    }
+    if (!validate_container(env, container))
     {
         return;
     }
@@ -2929,9 +3008,9 @@ static void decode_stream_internal(JNIEnv *env, jobject input_stream, jobject co
         return;
     }
 
-    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_stream(
+    FLAC__StreamDecoderInitStatus init_status = init_stream_decoder_for_container(
         decoder, decode_read_callback, NULL, NULL, NULL, NULL, decode_write_callback, decode_metadata_callback,
-        decode_error_callback, &context);
+        decode_error_callback, &context, container);
     /*
      * NULL seek/tell/length/eof callbacks tell libFLAC this source is
      * non-seekable. That is why InputStream has no range or reusable session
@@ -2983,10 +3062,14 @@ static void decode_stream_internal(JNIEnv *env, jobject input_stream, jobject co
  * Decodes a SeekableByteChannel through libFLAC's direct callback API. The
  * channel position at call entry is treated as byte offset zero for libFLAC.
  */
-static void decode_channel_internal(JNIEnv *env, jobject channel, jlong first_sample, jlong max_frames, jobject consumer,
-                                    int seek_before_decode, int range_limited)
+static void decode_channel_internal(JNIEnv *env, jobject channel, jint container, jlong first_sample, jlong max_frames,
+                                    jobject consumer, int seek_before_decode, int range_limited)
 {
     if (!flac_api_ready(env))
+    {
+        return;
+    }
+    if (!validate_container(env, container))
     {
         return;
     }
@@ -3024,10 +3107,10 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jlong first_sa
         return;
     }
 
-    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_stream(
+    FLAC__StreamDecoderInitStatus init_status = init_stream_decoder_for_container(
         decoder, decode_read_callback, decode_channel_seek_callback, decode_channel_tell_callback,
         decode_channel_length_callback, decode_channel_eof_callback, decode_write_callback, decode_metadata_callback,
-        decode_error_callback, &context);
+        decode_error_callback, &context, container);
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
     {
         g_flac_api.stream_decoder_delete(decoder);
@@ -3162,10 +3245,10 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jlong first_sa
  * the simplest one-shot path and uses libFLAC's file initialiser.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFile(JNIEnv *env, jclass clazz, jstring path,
-                                                                                jobject consumer)
+                                                                                jint container, jobject consumer)
 {
     (void)clazz;
-    decode_file_internal(env, path, 0, 0, consumer, JFLAC_EMIT_METADATA_CALLBACKS, JFLAC_UNLIMITED_RANGE);
+    decode_file_internal(env, path, container, 0, 0, consumer, JFLAC_EMIT_METADATA_CALLBACKS, JFLAC_UNLIMITED_RANGE);
 }
 
 /*
@@ -3174,11 +3257,11 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFile(
  * session operations are intentionally not routed here.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeStream(JNIEnv *env, jclass clazz,
-                                                                                  jobject input_stream,
+                                                                                  jobject input_stream, jint container,
                                                                                   jobject consumer)
 {
     (void)clazz;
-    decode_stream_internal(env, input_stream, consumer);
+    decode_stream_internal(env, input_stream, container, consumer);
 }
 
 /*
@@ -3186,10 +3269,12 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeStrea
  * The channel callback set includes read, seek, tell, length, and EOF.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChannel(JNIEnv *env, jclass clazz,
-                                                                                   jobject channel, jobject consumer)
+                                                                                   jobject channel, jint container,
+                                                                                   jobject consumer)
 {
     (void)clazz;
-    decode_channel_internal(env, channel, 0, 0, consumer, JFLAC_EMIT_METADATA_CALLBACKS, JFLAC_UNLIMITED_RANGE);
+    decode_channel_internal(env, channel, container, 0, 0, consumer, JFLAC_EMIT_METADATA_CALLBACKS,
+                            JFLAC_UNLIMITED_RANGE);
 }
 
 /*
@@ -3197,11 +3282,11 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChann
  * before seeking so out-of-range requests can be reported consistently.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileFrom(JNIEnv *env, jclass clazz,
-                                                                                    jstring path, jlong first_sample,
-                                                                                    jobject consumer)
+                                                                                    jstring path, jint container,
+                                                                                    jlong first_sample, jobject consumer)
 {
     (void)clazz;
-    decode_file_internal(env, path, first_sample, 0, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
+    decode_file_internal(env, path, container, first_sample, 0, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
                          JFLAC_UNLIMITED_RANGE);
 }
 
@@ -3212,11 +3297,11 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileF
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChannelFrom(JNIEnv *env, jclass clazz,
                                                                                        jobject channel,
-                                                                                       jlong first_sample,
+                                                                                       jint container, jlong first_sample,
                                                                                        jobject consumer)
 {
     (void)clazz;
-    decode_channel_internal(env, channel, first_sample, 0, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
+    decode_channel_internal(env, channel, container, first_sample, 0, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
                             JFLAC_UNLIMITED_RANGE);
 }
 
@@ -3225,11 +3310,12 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChann
  * meaning one value per channel, not interleaved integer sample count.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileRange(JNIEnv *env, jclass clazz,
-                                                                                     jstring path, jlong first_sample,
+                                                                                     jstring path, jint container,
+                                                                                     jlong first_sample,
                                                                                      jlong max_frames, jobject consumer)
 {
     (void)clazz;
-    decode_file_internal(env, path, first_sample, max_frames, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
+    decode_file_internal(env, path, container, first_sample, max_frames, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
                          JFLAC_LIMITED_RANGE);
 }
 
@@ -3239,10 +3325,10 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileR
  * number of frames unless EOF is reached first.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChannelRange(
-    JNIEnv *env, jclass clazz, jobject channel, jlong first_sample, jlong max_frames, jobject consumer)
+    JNIEnv *env, jclass clazz, jobject channel, jint container, jlong first_sample, jlong max_frames, jobject consumer)
 {
     (void)clazz;
-    decode_channel_internal(env, channel, first_sample, max_frames, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
+    decode_channel_internal(env, channel, container, first_sample, max_frames, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
                             JFLAC_LIMITED_RANGE);
 }
 
@@ -3253,10 +3339,14 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChann
  * be rejected without treating arbitrary long values as pointers.
  */
 JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecoderFile(JNIEnv *env, jclass clazz,
-                                                                                      jstring path)
+                                                                                      jstring path, jint container)
 {
     (void)clazz;
     if (!flac_api_ready(env))
+    {
+        return 0;
+    }
+    if (!validate_container(env, container))
     {
         return 0;
     }
@@ -3301,9 +3391,9 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
      * context; Kotlin separately exposes cached STREAMINFO to users on each
      * session decode.
      */
-    FLAC__StreamDecoderInitStatus init_status =
-        g_flac_api.stream_decoder_init_file(session->decoder, utf8_path, decode_write_callback,
-                                            decode_metadata_callback, decode_error_callback, &session->context);
+    FLAC__StreamDecoderInitStatus init_status = init_file_decoder_for_container(
+        session->decoder, utf8_path, decode_write_callback, decode_metadata_callback, decode_error_callback,
+        &session->context, container);
     free(utf8_path);
 
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
@@ -3358,10 +3448,15 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
  * as a global reference because the session can outlive this JNI call.
  */
 JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecoderChannel(JNIEnv *env, jclass clazz,
-                                                                                         jobject channel)
+                                                                                         jobject channel,
+                                                                                         jint container)
 {
     (void)clazz;
     if (!flac_api_ready(env))
+    {
+        return 0;
+    }
+    if (!validate_container(env, container))
     {
         return 0;
     }
@@ -3400,10 +3495,10 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
         return 0;
     }
 
-    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_stream(
+    FLAC__StreamDecoderInitStatus init_status = init_stream_decoder_for_container(
         session->decoder, decode_read_callback, decode_channel_seek_callback, decode_channel_tell_callback,
         decode_channel_length_callback, decode_channel_eof_callback, decode_write_callback, decode_metadata_callback,
-        decode_error_callback, &session->context);
+        decode_error_callback, &session->context, container);
 
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
     {

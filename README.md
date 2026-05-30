@@ -11,7 +11,9 @@ stream, and seekable channel APIs for decode and encode workflows.
 - Bundled native libraries: `FLAC.dll`, `jflac-jni.dll`
 - MSVC runtime: statically linked into the bundled Windows DLLs
 - FLAC source: official FLAC 1.5.0 archive, SHA-256 checked during build
-- Ogg FLAC: not supported, because the bundled libFLAC build uses `WITH_OGG=OFF`
+- libogg source: official libogg 1.3.6 archive, SHA-256 checked during build
+- Ogg FLAC: decode and metadata reading supported; encoding and existing-file
+  metadata editing are not supported
 - Linux and macOS: not built yet; native resources are organised as
   `META-INF/native/<platform>` so more platform bundles can be added later
 
@@ -29,9 +31,10 @@ stream, and seekable channel APIs for decode and encode workflows.
 .\gradlew.bat build
 ```
 
-The build downloads FLAC 1.5.0, verifies the archive checksum, builds
-`FLAC.dll`, builds `jflac-jni.dll`, verifies required exports, and stages the
-native files into the JAR resources.
+The build downloads FLAC 1.5.0 and libogg 1.3.6, verifies both archive
+checksums, builds a static `ogg.lib`, builds `FLAC.dll` with Ogg FLAC support,
+builds `jflac-jni.dll`, verifies required exports, and stages the native files
+into the JAR resources.
 
 For clangd, `buildNative` also generates `compile_commands.json` at the project
 root and under `build/native`.
@@ -108,10 +111,10 @@ Pick the target that matches the operations the caller needs:
 
 | Target | Decode | Encode | Best fit | Notes |
 | --- | --- | --- | --- | --- |
-| `Path` | Whole file, chunked decode, ranged decode, reusable decode sessions | `open(...)` sessions and one-shot `encode(...)` | Normal files | Strongest path for exact final STREAMINFO because libFLAC owns a seekable file target. Metadata reading and editing are file-based. |
-| `InputStream` | Whole stream only | Not applicable | Network responses, classpath resources, existing Java streams | Sequential-only in V1. No range decode, no reusable session, no metadata editor. The stream is not closed by jflac. |
-| `OutputStream` | Not applicable | Sequential `open(...)` sessions and one-shot `encode(...)` | HTTP responses, byte-array streams, caller-managed streams | Produces valid native FLAC, but libFLAC cannot seek back to patch final STREAMINFO statistics. The stream is flushed on finish but not closed. |
-| `SeekableByteChannel` | Whole channel, ranged decode, reusable decode sessions | `open(...)` sessions and one-shot `encode(...)` with seek/tell callbacks | Embedded FLAC data, custom storage, caller-managed seekable targets | The current channel position is treated as byte offset zero. The channel is not closed by jflac. |
+| `Path` | Native FLAC or Ogg FLAC whole file, chunked decode, ranged decode, reusable decode sessions | Native FLAC `open(...)` sessions and one-shot `encode(...)` | Normal files | Strongest encode path for exact final STREAMINFO because libFLAC owns a seekable file target. Metadata reading is file-based for native FLAC and Ogg FLAC; metadata editing is native FLAC only. |
+| `InputStream` | Native FLAC or Ogg FLAC whole stream only | Not applicable | Network responses, classpath resources, existing Java streams | Sequential-only in V1. No range decode, no reusable session, no metadata editor. The stream is not closed by jflac. |
+| `OutputStream` | Not applicable | Native FLAC sequential `open(...)` sessions and one-shot `encode(...)` | HTTP responses, byte-array streams, caller-managed streams | Produces valid native FLAC, but libFLAC cannot seek back to patch final STREAMINFO statistics. The stream is flushed on finish but not closed. |
+| `SeekableByteChannel` | Native FLAC or Ogg FLAC whole channel, ranged decode, reusable decode sessions | Native FLAC `open(...)` sessions and one-shot `encode(...)` with seek/tell callbacks | Embedded FLAC data, custom storage, caller-managed seekable targets | The current channel position is treated as byte offset zero. The channel is not closed by jflac. |
 
 `InputStream`, `OutputStream`, and `SeekableByteChannel` overloads are standard
 Java types, so they are usable from both Java and Kotlin. Session objects are
@@ -223,7 +226,7 @@ FlacDecoder().open(Path.of("music.flac")).use { session ->
 }
 ```
 
-Decode sequential native FLAC streams:
+Decode sequential native FLAC or Ogg FLAC streams:
 
 ```kotlin
 import org.zzvsjs.jflac.FlacDecoder
@@ -246,7 +249,7 @@ Plain streams are decoded with `FLAC__stream_decoder_init_stream` and only a
 read callback. Because there is no seek/tell/length contract, the stream
 overloads intentionally do not expose range decode or reusable sessions.
 
-Decode seekable native FLAC channels when callers need ranges or reusable
+Decode seekable native FLAC or Ogg FLAC channels when callers need ranges or reusable
 sessions without passing a file path:
 
 ```kotlin
@@ -477,6 +480,7 @@ libFLAC state.
 bundled `FLAC.dll` at runtime. This keeps the JNI wrapper in control of error
 messages when the FLAC runtime is missing or incompatible, but it also means the
 bundled FLAC DLL must contain every export expected by the wrapper build.
+Ogg support is provided by a static libogg build linked into `FLAC.dll`.
 
 PCM crossing the JNI boundary is interleaved signed integer PCM in Java
 `IntArray` values. One frame means one sample per channel, so a stereo chunk of
@@ -499,7 +503,8 @@ or stale handle is treated as an invalid native session.
 - Native packaging is currently Windows x64 only. The resource layout is ready
   for future platforms, but Linux and macOS DLL/shared-library builds are not
   produced yet.
-- Ogg FLAC is not supported because the bundled libFLAC build disables Ogg.
+- Ogg FLAC decode and metadata reading are supported. Ogg FLAC encoding and
+  existing-file metadata editing are not supported.
 - `InputStream` and `OutputStream` APIs are sequential-only. File and
   `SeekableByteChannel` decode APIs support ranges and reusable seek sessions.
   Metadata reading and editing remain file-based.
@@ -532,6 +537,9 @@ META-INF/native/windows-x86_64/FLAC.dll
 META-INF/native/windows-x86_64/jflac-jni.dll
 ```
 
+libogg is statically linked into the bundled `FLAC.dll`; there is no separate
+`ogg.dll` resource to load.
+
 The loader detects the current platform and currently accepts only
 `windows-x86_64`. Future Linux or macOS support should add new directories with
 the same shape and extend the platform detector:
@@ -543,6 +551,7 @@ META-INF/native/<platform>/jflac-jni.dll or platform JNI library equivalent
 
 ## Licences
 
-The wrapper is licensed under `LICENSE`. The bundled libFLAC binary is covered
-by the upstream FLAC licence reproduced in `THIRD_PARTY_NOTICES.md`; both files
-are also included under `META-INF` in the built JAR.
+The wrapper is licensed under `LICENSE`. The bundled libFLAC binary and its
+statically linked libogg code are covered by the upstream licences reproduced
+in `THIRD_PARTY_NOTICES.md`; both files are also included under `META-INF` in
+the built JAR.

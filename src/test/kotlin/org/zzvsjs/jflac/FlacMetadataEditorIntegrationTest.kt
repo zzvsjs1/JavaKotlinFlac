@@ -7,6 +7,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertTrue
 
 class FlacMetadataEditorIntegrationTest {
     @Test
@@ -195,6 +196,26 @@ class FlacMetadataEditorIntegrationTest {
         } finally {
             setReadOnly(output, false)
             Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun oggFlacMetadataCanBeReadButNotEdited() {
+        val oggFile = createOggFlacFixture("jflac-ogg-edit")
+
+        try {
+            val metadata = FlacMetadataReader().read(oggFile)
+
+            assertEquals(8_000, metadata.streamInfo.sampleRate)
+            val error = assertFailsWith<UnsupportedFeatureException> {
+                FlacMetadataEditor().replace(
+                    oggFile,
+                    FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("Edited")))
+                )
+            }
+            assertTrue(error.message!!.contains("Ogg FLAC metadata editing"))
+        } finally {
+            Files.deleteIfExists(oggFile)
         }
     }
 

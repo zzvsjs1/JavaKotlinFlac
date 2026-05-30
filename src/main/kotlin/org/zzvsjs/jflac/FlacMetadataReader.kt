@@ -15,8 +15,11 @@ import kotlin.io.path.absolutePathString
  */
 class FlacMetadataReader {
     fun read(path: Path): FlacMetadata {
-        val normalizedPath = validateNativeFlacPath(path)
+        val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        return NativeBindings.readMetadata(normalizedPath.absolutePathString()).toPublicMetadata()
+        return NativeBindings.readMetadata(
+            inspected.path.absolutePathString(),
+            inspected.container.nativeCode
+        ).toPublicMetadata()
     }
 }

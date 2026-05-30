@@ -702,7 +702,7 @@ class FlacIntegrationTest {
             NativeBindings.decodeDecoderRange(Long.MAX_VALUE, 0, 1, CollectingConsumer())
         }
 
-        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode)
         NativeBindings.releaseDecoder(handle)
         NativeBindings.releaseDecoder(handle)
         assertFailsWith<IllegalStateException> {
@@ -716,7 +716,7 @@ class FlacIntegrationTest {
     @Test
     fun nativeSessionRangeDecodeRejectsInvalidArguments() {
         FlacNativeLoader.load()
-        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode)
 
         try {
             assertFailsWith<IllegalArgumentException> {
@@ -733,7 +733,7 @@ class FlacIntegrationTest {
     @Test
     fun nativeSessionRangeDecodeKeepsHandleReusable() {
         FlacNativeLoader.load()
-        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode)
         val first = CountingConsumer()
         val second = CountingConsumer()
 
@@ -753,7 +753,7 @@ class FlacIntegrationTest {
     @Test
     fun nativeSessionDecodeRejectsConcurrentUse() {
         FlacNativeLoader.load()
-        val handle = NativeBindings.openDecoderFile(sampleFile.toString())
+        val handle = NativeBindings.openDecoderFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode)
         val callbackEntered = CountDownLatch(1)
         val releaseCallback = CountDownLatch(1)
         val workerFailure = AtomicReference<Throwable?>()
@@ -803,13 +803,80 @@ class FlacIntegrationTest {
     }
 
     @Test
-    fun oggFlacIsRejected() {
-        // V1 rejects Ogg FLAC at the JVM boundary before JNI is entered.
-        val oggLike = Files.createTempFile("ogg-like", ".flac")
-        Files.write(oggLike, byteArrayOf(0x4f, 0x67, 0x67, 0x53, 0x00, 0x00))
+    fun oggFlacMetadataReaderReturnsExpectedStructure() {
+        val oggFile = createOggFlacFixture("jflac-ogg-metadata")
 
-        assertFailsWith<UnsupportedFeatureException> {
-            FlacMetadataReader().read(oggLike)
+        try {
+            val metadata = FlacMetadataReader().read(oggFile)
+
+            assertEquals(8_000, metadata.streamInfo.sampleRate)
+            assertEquals(1, metadata.streamInfo.channels)
+            assertEquals(16, metadata.streamInfo.bitsPerSample)
+            assertEquals(listOf("Ogg FLAC Fixture"), metadata.vorbisComment?.comments?.get("title"))
+        } finally {
+            Files.deleteIfExists(oggFile)
+        }
+    }
+
+    @Test
+    fun oggFlacFileDecodeReturnsPcm() {
+        val oggFile = createOggFlacFixture("jflac-ogg-decode")
+
+        try {
+            val decoded = FlacDecoder().decode(oggFile)
+
+            assertEquals(8_000, decoded.streamInfo.sampleRate)
+            assertEquals(1, decoded.streamInfo.channels)
+            assertEquals(16, decoded.streamInfo.bitsPerSample)
+            assertEquals(80, decoded.totalFrames)
+            assertEquals(80, decoded.interleavedSamples.size)
+        } finally {
+            Files.deleteIfExists(oggFile)
+        }
+    }
+
+    @Test
+    fun oggFlacFileRangeDecodeReturnsPcmWindow() {
+        val oggFile = createOggFlacFixture("jflac-ogg-range")
+
+        try {
+            val chunks = ArrayList<FlacInterleavedPcmChunk>()
+            val summary = FlacDecoder().decodeInterleaved(
+                path = oggFile,
+                firstSample = 7,
+                maxFrames = 11,
+                onChunk = FlacInterleavedPcmHandler { chunk -> chunks += chunk }
+            )
+
+            assertEquals(11L, summary.totalFrames)
+            assertTrue(chunks.isNotEmpty())
+            assertEquals(7L, chunks.first().firstFrameIndex)
+            assertEquals(11, chunks.sumOf { chunk -> chunk.frames })
+        } finally {
+            Files.deleteIfExists(oggFile)
+        }
+    }
+
+    @Test
+    fun oggFlacFileDecodeSessionCanDecodeRange() {
+        val oggFile = createOggFlacFixture("jflac-ogg-session")
+
+        try {
+            FlacDecoder().open(oggFile).use { session ->
+                val chunks = ArrayList<FlacInterleavedPcmChunk>()
+                val summary = session.decodeInterleaved(
+                    firstSample = 13,
+                    maxFrames = 9,
+                    onChunk = FlacInterleavedPcmHandler { chunk -> chunks += chunk }
+                )
+
+                assertEquals(9L, summary.totalFrames)
+                assertTrue(chunks.isNotEmpty())
+                assertEquals(13L, chunks.first().firstFrameIndex)
+                assertEquals(9, chunks.sumOf { chunk -> chunk.frames })
+            }
+        } finally {
+            Files.deleteIfExists(oggFile)
         }
     }
 
@@ -831,7 +898,7 @@ class FlacIntegrationTest {
         FlacNativeLoader.load()
 
         assertFailsWith<IllegalArgumentException> {
-            NativeBindings.decodeFile(sampleFile.toString(), null)
+            NativeBindings.decodeFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode, null)
         }
     }
 
