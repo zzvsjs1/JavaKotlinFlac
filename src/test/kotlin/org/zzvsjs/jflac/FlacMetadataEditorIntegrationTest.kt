@@ -1,9 +1,11 @@
 package org.zzvsjs.jflac
 
 import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 
 class FlacMetadataEditorIntegrationTest {
@@ -37,6 +39,7 @@ class FlacMetadataEditorIntegrationTest {
             val decodedBefore = FlacDecoder().decode(output)
 
             FlacMetadataEditor().edit(output) { session ->
+                assertEquals(3, session.blocks.size)
                 session.setVorbisComments(
                     mapOf(
                         "TITLE" to listOf("After"),
@@ -61,7 +64,7 @@ class FlacMetadataEditorIntegrationTest {
     }
 
     @Test
-    fun writeBlocksReplacesNonStreamInfoBlocksInCallerOrder() {
+    fun replaceReplacesNonStreamInfoBlocksInCallerOrder() {
         val frames = 12
         val format = FlacAudioFormat(
             sampleRate = 32_000,
@@ -90,12 +93,14 @@ class FlacMetadataEditorIntegrationTest {
             )
             val decodedBefore = FlacDecoder().decode(output)
 
-            FlacMetadataEditor().writeBlocks(
+            FlacMetadataEditor().replace(
                 output,
-                listOf(
-                    FlacMetadataBlock.Padding(padding),
-                    FlacMetadataBlock.Application(application),
-                    FlacMetadataBlock.VorbisComment(comment)
+                FlacEncodingMetadata(
+                    blocks = listOf(
+                        FlacMetadataBlock.Padding(padding),
+                        FlacMetadataBlock.Application(application),
+                        FlacMetadataBlock.VorbisComment(comment)
+                    )
                 )
             )
 
@@ -113,6 +118,106 @@ class FlacMetadataEditorIntegrationTest {
         } finally {
             Files.deleteIfExists(output)
         }
+    }
+
+    @Test
+    fun replaceRejectsMalformedFlac() {
+        val malformed = Files.createTempFile("jflac-malformed-metadata-edit", ".flac")
+
+        try {
+            Files.write(
+                malformed,
+                byteArrayOf('n'.code.toByte(), 'o'.code.toByte(), 'p'.code.toByte(), 'e'.code.toByte())
+            )
+
+            assertFailsWith<FlacMetadataEditException> {
+                FlacMetadataEditor().replace(
+                    malformed,
+                    FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("Invalid")))
+                )
+            }
+        } finally {
+            Files.deleteIfExists(malformed)
+        }
+    }
+
+    @Test
+    fun editRejectsMalformedFlacBeforeOpeningEditSession() {
+        val malformed = Files.createTempFile("jflac-malformed-edit-session", ".flac")
+
+        try {
+            Files.write(
+                malformed,
+                byteArrayOf('n'.code.toByte(), 'o'.code.toByte(), 'p'.code.toByte(), 'e'.code.toByte())
+            )
+
+            assertFailsWith<FlacDecodeException> {
+                FlacMetadataEditor().edit(malformed) { session ->
+                    session.setVorbisComments(mapOf("TITLE" to listOf("Invalid")))
+                }
+            }
+        } finally {
+            Files.deleteIfExists(malformed)
+        }
+    }
+
+    @Test
+    fun editRejectsInvalidVorbisCommentKeysBeforeNativeWrite() {
+        val output = createSmallFlac("jflac-invalid-metadata-edit")
+
+        try {
+            assertFailsWith<IllegalArgumentException> {
+                FlacMetadataEditor().edit(output) { session ->
+                    session.setVorbisComments(mapOf("BAD=KEY" to listOf("value")))
+                }
+            }
+
+            val metadataAfter = FlacMetadataReader().read(output)
+            assertEquals(listOf("Original"), metadataAfter.vorbisComment?.comments?.get("TITLE"))
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun replaceReportsReadOnlyFileWriteFailure() {
+        val output = createSmallFlac("jflac-read-only-metadata-edit")
+
+        try {
+            setReadOnly(output, true)
+
+            assertFailsWith<FlacMetadataEditException> {
+                FlacMetadataEditor().replace(
+                    output,
+                    FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("Cannot write")))
+                )
+            }
+        } finally {
+            setReadOnly(output, false)
+            Files.deleteIfExists(output)
+        }
+    }
+
+    private fun createSmallFlac(prefix: String): Path {
+        val frames = 8
+        val format = FlacAudioFormat(
+            sampleRate = 22_050,
+            channels = 1,
+            bitsPerSample = 16,
+            totalSamplesEstimate = frames.toLong()
+        )
+        val output = Files.createTempFile(prefix, ".flac")
+        FlacEncoder().encode(
+            output = output,
+            format = format,
+            samples = deterministicPcm(frames, format),
+            metadata = FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("Original")))
+        )
+        return output
+    }
+
+    private fun setReadOnly(path: Path, readOnly: Boolean) {
+        Files.setAttribute(path, "dos:readonly", readOnly)
     }
 
     private fun deterministicPcm(frames: Int, format: FlacAudioFormat): IntArray {

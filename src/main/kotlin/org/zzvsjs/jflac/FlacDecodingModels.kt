@@ -162,14 +162,14 @@ open class FlacChannelDecodeAdapter : FlacChannelDecodeListener {
 }
 
 /**
- * Reusable file-based decoder session for repeated seek-decode operations.
+ * Reusable decoder session for repeated seek-decode operations.
  *
  * A session owns one native decoder handle. It is useful when callers need to
- * inspect several ranges from the same file without reopening native state for
- * each request.
+ * inspect several ranges from the same source without reopening native state
+ * for each request.
  */
 interface FlacDecodingSession : AutoCloseable {
-    /** STREAMINFO for the opened FLAC file. */
+    /** STREAMINFO for the opened FLAC source. */
     val streamInfo: FlacStreamInfo
 
     /**

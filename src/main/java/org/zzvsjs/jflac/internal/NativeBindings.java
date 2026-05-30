@@ -3,6 +3,10 @@ package org.zzvsjs.jflac.internal;
 import org.zzvsjs.jflac.PcmConsumer;
 import org.zzvsjs.jflac.FlacPicture;
 
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.channels.SeekableByteChannel;
+
 /**
  * Java declaration layer for JNI entry points.
  *
@@ -19,11 +23,26 @@ public final class NativeBindings {
 
     public static native void decodeFile(String path, PcmConsumer consumer);
 
+    public static native void decodeStream(InputStream input, PcmConsumer consumer);
+
+    public static native void decodeChannel(SeekableByteChannel input, PcmConsumer consumer);
+
     public static native void decodeFileFrom(String path, long firstSample, PcmConsumer consumer);
+
+    public static native void decodeChannelFrom(SeekableByteChannel input, long firstSample, PcmConsumer consumer);
 
     public static native void decodeFileRange(String path, long firstSample, long maxFrames, PcmConsumer consumer);
 
+    public static native void decodeChannelRange(
+            SeekableByteChannel input,
+            long firstSample,
+            long maxFrames,
+            PcmConsumer consumer
+    );
+
     public static native long openDecoderFile(String path);
+
+    public static native long openDecoderChannel(SeekableByteChannel input);
 
     public static native void decodeDecoderFrom(long handle, long firstSample, PcmConsumer consumer);
 
@@ -32,6 +51,10 @@ public final class NativeBindings {
     public static native void releaseDecoder(long handle);
 
     public static native long openEncoderFile(String path, NativeEncodingRequest request);
+
+    public static native long openEncoderStream(OutputStream output, NativeEncodingRequest request);
+
+    public static native long openEncoderChannel(SeekableByteChannel output, NativeEncodingRequest request);
 
     public static native void writeMetadata(
             String path,

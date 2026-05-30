@@ -10,7 +10,7 @@ repositories {
 val jflacVersion = providers.gradleProperty("jflacVersion")
     .getOrElse("0.1.0-SNAPSHOT")
 val samplePath = providers.gradleProperty("jflacSamplePath")
-    .orElse(layout.projectDirectory.file("../music.flac").asFile.absolutePath)
+    .orElse(layout.buildDirectory.file("consumer-smoke/music.flac").map { it.asFile.absolutePath })
 
 dependencies {
     implementation("org.zzvsjs:jflac:$jflacVersion")

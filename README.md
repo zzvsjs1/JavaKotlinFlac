@@ -1,8 +1,8 @@
 # JavaKotlinFlac
 
 Java and Kotlin JNI wrapper for libFLAC. The current artefact bundles a
-Windows x64 native runtime and exposes file-based metadata, decode and encode
-APIs.
+Windows x64 native runtime, file-based metadata APIs, and file, sequential
+stream, and seekable channel APIs for decode and encode workflows.
 
 ## Status
 
@@ -59,9 +59,10 @@ To verify the published artefact from a separate Java consumer project:
 ```
 
 The smoke test resolves `org.zzvsjs:jflac` from `mavenLocal()`, loads the
-bundled Windows DLLs from the JAR, and decodes a small range from `music.flac`.
-It also encodes a deterministic PCM buffer, reads the metadata back, and
-decodes the output again to verify the published artefact.
+bundled Windows DLLs from the JAR, and decodes a small range from a generated
+FLAC fixture under `build/consumer-smoke/`. It also encodes a deterministic PCM
+buffer, reads the metadata back, and decodes the output again to verify the
+published artefact.
 
 Consumer dependency after local publication:
 
@@ -161,6 +162,46 @@ FlacDecoder().open(Path.of("music.flac")).use { session ->
 }
 ```
 
+Decode sequential native FLAC streams:
+
+```kotlin
+import org.zzvsjs.jflac.FlacDecoder
+import org.zzvsjs.jflac.FlacInterleavedPcmHandler
+import java.io.InputStream
+
+fun inspect(input: InputStream) {
+    val summary = FlacDecoder().decodeInterleaved(
+        input = input,
+        onChunk = FlacInterleavedPcmHandler { chunk ->
+            println(chunk.frames)
+        }
+    )
+
+    println(summary.totalFrames)
+}
+```
+
+Decode seekable native FLAC channels when callers need ranges or reusable
+sessions without passing a file path:
+
+```kotlin
+import org.zzvsjs.jflac.FlacDecoder
+import org.zzvsjs.jflac.FlacInterleavedPcmHandler
+import java.nio.channels.SeekableByteChannel
+
+fun inspectRange(input: SeekableByteChannel) {
+    FlacDecoder().open(input).use { session ->
+        session.decodeInterleaved(
+            firstSample = 2048,
+            maxFrames = 4096,
+            onChunk = FlacInterleavedPcmHandler { chunk ->
+                println(chunk.firstFrameIndex)
+            }
+        )
+    }
+}
+```
+
 ## Encode
 
 ```kotlin
@@ -186,6 +227,58 @@ FlacEncoder().encode(
         comments = mapOf("TITLE" to listOf("Example"))
     )
 )
+```
+
+Encode sequential native FLAC streams:
+
+```kotlin
+import org.zzvsjs.jflac.FlacAudioFormat
+import org.zzvsjs.jflac.FlacEncoder
+import java.io.OutputStream
+
+fun writeFlac(output: OutputStream, samples: IntArray) {
+    val format = FlacAudioFormat(
+        sampleRate = 44100,
+        channels = 2,
+        bitsPerSample = 16,
+        totalSamplesEstimate = samples.size.toLong() / 2
+    )
+
+    FlacEncoder().encode(
+        output = output,
+        format = format,
+        samples = samples
+    )
+}
+```
+
+Output streams are sequential in V1. The encoder does not receive seek/tell
+callbacks, so libFLAC cannot back-patch final STREAMINFO statistics after the
+last PCM frame. The output is still valid native FLAC; use file output or a
+seekable channel when you need libFLAC to seek back and update final
+STREAMINFO fields.
+
+Encode seekable channels when the output target is not a file path but can seek
+and tell:
+
+```kotlin
+import org.zzvsjs.jflac.FlacAudioFormat
+import org.zzvsjs.jflac.FlacEncoder
+import java.nio.channels.SeekableByteChannel
+
+fun writeSeekable(output: SeekableByteChannel, samples: IntArray) {
+    val format = FlacAudioFormat(
+        sampleRate = 44100,
+        channels = 2,
+        bitsPerSample = 16
+    )
+
+    FlacEncoder().encode(
+        output = output,
+        format = format,
+        samples = samples
+    )
+}
 ```
 
 For exact metadata round trips, read `FlacMetadata.blocks` and pass it through
@@ -218,15 +311,18 @@ For exact block-level edits, replace the ordered non-STREAMINFO block list:
 ```kotlin
 import org.zzvsjs.jflac.FlacMetadataBlock
 import org.zzvsjs.jflac.FlacMetadataEditor
+import org.zzvsjs.jflac.FlacEncodingMetadata
 import org.zzvsjs.jflac.FlacMetadataReader
 import java.nio.file.Path
 
 val editor = FlacMetadataEditor()
 val metadata = FlacMetadataReader().read(Path.of("music.flac"))
 
-editor.writeBlocks(
+editor.replace(
     Path.of("music.flac"),
-    metadata.blocks.filterNot { block -> block is FlacMetadataBlock.Picture }
+    FlacEncodingMetadata(
+        blocks = metadata.blocks.filterNot { block -> block is FlacMetadataBlock.Picture }
+    )
 )
 ```
 
@@ -260,8 +356,9 @@ chunks.
   for future platforms, but Linux and macOS DLL/shared-library builds are not
   produced yet.
 - Ogg FLAC is not supported because the bundled libFLAC build disables Ogg.
-- APIs are file-based. There is no custom stream, socket, memory-buffer, or
-  callback I/O API yet.
+- `InputStream` and `OutputStream` APIs are sequential-only. File and
+  `SeekableByteChannel` decode APIs support ranges and reusable seek sessions.
+  Metadata reading and editing remain file-based.
 - Metadata reading exposes STREAMINFO, Vorbis comments, pictures, APPLICATION
   blocks, SEEKTABLE blocks, CUESHEET blocks, PADDING blocks, and raw unknown
   blocks. `FlacMetadata.blocks` preserves the physical order of non-STREAMINFO

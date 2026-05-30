@@ -1,6 +1,8 @@
 package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeBindings
+import org.junit.AfterClass
+import org.junit.BeforeClass
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -29,10 +31,29 @@ private const val FLAC_METADATA_MAX_PAYLOAD_LENGTH = 0xFF_FFFF
  * End-to-end tests for the file-based wrapper.
  *
  * The goal is to cover the public API behaviour, not libFLAC internals. The
- * sample file in the repository is treated as the integration fixture.
+ * generated sample file is treated as the integration fixture.
  */
 class FlacIntegrationTest {
-    private val sampleFile: Path = Path.of("music.flac").toAbsolutePath()
+    private val sampleFile: Path
+        get() = sharedSampleFile
+
+    companion object {
+        private lateinit var sharedSampleFile: Path
+
+        @JvmStatic
+        @BeforeClass
+        fun createSampleFixture() {
+            sharedSampleFile = createDecodeFixture("jflac-music-fixture")
+        }
+
+        @JvmStatic
+        @AfterClass
+        fun deleteSampleFixture() {
+            if (::sharedSampleFile.isInitialized) {
+                Files.deleteIfExists(sharedSampleFile)
+            }
+        }
+    }
 
     @Test
     fun metadataReaderReturnsExpectedStructure() {

@@ -2,6 +2,8 @@ package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeBindings
 import org.zzvsjs.jflac.internal.NativeEncodingRequest
+import java.io.OutputStream
+import java.nio.channels.SeekableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
@@ -35,7 +37,7 @@ private const val FLAC_METADATA_TYPE_CUESHEET = 5
 private const val FLAC_METADATA_TYPE_PICTURE = 6
 
 /**
- * File-based FLAC encoder backed by libFLAC.
+ * FLAC encoder backed by libFLAC.
  *
  * The public surface mirrors the existing decoder philosophy:
  * - JVM code validates caller input before crossing into JNI
@@ -75,6 +77,68 @@ class FlacEncoder {
     }
 
     /**
+     * Opens a streaming encoder session for a sequential FLAC output stream.
+     *
+     * The stream is not closed by the returned session. V1 does not provide
+     * seek/tell callbacks, so libFLAC cannot back-patch final STREAMINFO
+     * statistics on this path.
+     */
+    @JvmOverloads
+    fun open(
+        output: OutputStream,
+        format: FlacAudioFormat,
+        metadata: FlacEncodingMetadata = FlacEncodingMetadata(),
+        options: FlacEncodingOptions = FlacEncodingOptions()
+    ): FlacEncodingSession {
+        validateFlacAudioFormat(format)
+        validateFlacEncodingOptions(options)
+        validateFlacEncodingMetadata(metadata)
+
+        FlacNativeLoader.load()
+        val handle = NativeBindings.openEncoderStream(
+            output,
+            metadata.toNativeRequest(format, options)
+        )
+        if (handle == 0L) {
+            throw FlacEncodeException(
+                "Native stream encoder initialization returned an invalid handle without throwing an exception."
+            )
+        }
+        return NativeFlacEncodingSession(handle, format)
+    }
+
+    /**
+     * Opens a streaming encoder session for a seekable FLAC output channel.
+     *
+     * The channel is not closed by the returned session. libFLAC byte offsets
+     * are relative to the channel position at open time, and seek/tell
+     * callbacks let libFLAC back-patch final STREAMINFO statistics.
+     */
+    @JvmOverloads
+    fun open(
+        output: SeekableByteChannel,
+        format: FlacAudioFormat,
+        metadata: FlacEncodingMetadata = FlacEncodingMetadata(),
+        options: FlacEncodingOptions = FlacEncodingOptions()
+    ): FlacEncodingSession {
+        validateFlacAudioFormat(format)
+        validateFlacEncodingOptions(options)
+        validateFlacEncodingMetadata(metadata)
+
+        FlacNativeLoader.load()
+        val handle = NativeBindings.openEncoderChannel(
+            output,
+            metadata.toNativeRequest(format, options)
+        )
+        if (handle == 0L) {
+            throw FlacEncodeException(
+                "Native channel encoder initialization returned an invalid handle without throwing an exception."
+            )
+        }
+        return NativeFlacEncodingSession(handle, format)
+    }
+
+    /**
      * Encodes one interleaved PCM buffer into a complete FLAC file.
      *
      * This is a convenience wrapper built on top of [open] so there is only one
@@ -83,6 +147,40 @@ class FlacEncoder {
     @JvmOverloads
     fun encode(
         output: Path,
+        format: FlacAudioFormat,
+        samples: IntArray,
+        metadata: FlacEncodingMetadata = FlacEncodingMetadata(),
+        options: FlacEncodingOptions = FlacEncodingOptions()
+    ) {
+        val frames = computeFrameCount(samples, format.channels)
+        open(output, format, metadata, options).use { session ->
+            session.writeInterleaved(samples, frames)
+        }
+    }
+
+    /**
+     * Encodes one interleaved PCM buffer into a sequential FLAC output stream.
+     */
+    @JvmOverloads
+    fun encode(
+        output: OutputStream,
+        format: FlacAudioFormat,
+        samples: IntArray,
+        metadata: FlacEncodingMetadata = FlacEncodingMetadata(),
+        options: FlacEncodingOptions = FlacEncodingOptions()
+    ) {
+        val frames = computeFrameCount(samples, format.channels)
+        open(output, format, metadata, options).use { session ->
+            session.writeInterleaved(samples, frames)
+        }
+    }
+
+    /**
+     * Encodes one interleaved PCM buffer into a seekable FLAC output channel.
+     */
+    @JvmOverloads
+    fun encode(
+        output: SeekableByteChannel,
         format: FlacAudioFormat,
         samples: IntArray,
         metadata: FlacEncodingMetadata = FlacEncodingMetadata(),

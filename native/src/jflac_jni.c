@@ -74,6 +74,12 @@ typedef struct FlacApi
                                                               FLAC__StreamDecoderMetadataCallback metadata_callback,
                                                               FLAC__StreamDecoderErrorCallback error_callback,
                                                               void *client_data);
+    FLAC__StreamDecoderInitStatus (*stream_decoder_init_stream)(
+        FLAC__StreamDecoder *decoder, FLAC__StreamDecoderReadCallback read_callback,
+        FLAC__StreamDecoderSeekCallback seek_callback, FLAC__StreamDecoderTellCallback tell_callback,
+        FLAC__StreamDecoderLengthCallback length_callback, FLAC__StreamDecoderEofCallback eof_callback,
+        FLAC__StreamDecoderWriteCallback write_callback, FLAC__StreamDecoderMetadataCallback metadata_callback,
+        FLAC__StreamDecoderErrorCallback error_callback, void *client_data);
     FLAC__bool (*stream_decoder_process_until_end_of_metadata)(FLAC__StreamDecoder *decoder);
     FLAC__bool (*stream_decoder_seek_absolute)(FLAC__StreamDecoder *decoder, FLAC__uint64 sample);
     FLAC__bool (*stream_decoder_process_single)(FLAC__StreamDecoder *decoder);
@@ -97,6 +103,10 @@ typedef struct FlacApi
     FLAC__StreamEncoderInitStatus (*stream_encoder_init_file)(FLAC__StreamEncoder *encoder, const char *filename,
                                                               FLAC__StreamEncoderProgressCallback progress_callback,
                                                               void *client_data);
+    FLAC__StreamEncoderInitStatus (*stream_encoder_init_stream)(
+        FLAC__StreamEncoder *encoder, FLAC__StreamEncoderWriteCallback write_callback,
+        FLAC__StreamEncoderSeekCallback seek_callback, FLAC__StreamEncoderTellCallback tell_callback,
+        FLAC__StreamEncoderMetadataCallback metadata_callback, void *client_data);
     FLAC__bool (*stream_encoder_process_interleaved)(FLAC__StreamEncoder *encoder, const FLAC__int32 buffer[],
                                                      uint32_t samples);
     FLAC__bool (*stream_encoder_finish)(FLAC__StreamEncoder *encoder);
@@ -216,6 +226,7 @@ static BOOL CALLBACK init_flac_api(PINIT_ONCE init_once, PVOID parameter, PVOID 
     RESOLVE(stream_decoder_new, FLAC__stream_decoder_new);
     RESOLVE(stream_decoder_delete, FLAC__stream_decoder_delete);
     RESOLVE(stream_decoder_init_file, FLAC__stream_decoder_init_file);
+    RESOLVE(stream_decoder_init_stream, FLAC__stream_decoder_init_stream);
     RESOLVE(stream_decoder_process_until_end_of_metadata, FLAC__stream_decoder_process_until_end_of_metadata);
     RESOLVE(stream_decoder_seek_absolute, FLAC__stream_decoder_seek_absolute);
     RESOLVE(stream_decoder_process_single, FLAC__stream_decoder_process_single);
@@ -235,6 +246,7 @@ static BOOL CALLBACK init_flac_api(PINIT_ONCE init_once, PVOID parameter, PVOID 
     RESOLVE(stream_encoder_set_total_samples_estimate, FLAC__stream_encoder_set_total_samples_estimate);
     RESOLVE(stream_encoder_set_metadata, FLAC__stream_encoder_set_metadata);
     RESOLVE(stream_encoder_init_file, FLAC__stream_encoder_init_file);
+    RESOLVE(stream_encoder_init_stream, FLAC__stream_encoder_init_stream);
     RESOLVE(stream_encoder_process_interleaved, FLAC__stream_encoder_process_interleaved);
     RESOLVE(stream_encoder_finish, FLAC__stream_encoder_finish);
     RESOLVE(stream_encoder_get_resolved_state_string, FLAC__stream_encoder_get_resolved_state_string);
@@ -1464,6 +1476,27 @@ typedef struct DecodeContext
     jmethodID on_complete;
 
     /*
+     * Sequential InputStream decode uses libFLAC's read callback. The stream
+     * reference is local to the JNI decode call because libFLAC invokes the
+     * callback synchronously before the native method returns.
+     */
+    jobject input_stream;
+    jmethodID input_read;
+
+    /*
+     * SeekableByteChannel decode uses the same libFLAC stream API as
+     * InputStream, but also supplies seek/tell/length/eof callbacks. The
+     * global reference is needed for reusable decoder sessions.
+     */
+    JavaVM *jvm;
+    jobject seekable_channel;
+    jmethodID channel_read;
+    jmethodID channel_position;
+    jmethodID channel_seek;
+    jmethodID channel_size;
+    jlong channel_base_offset;
+
+    /*
      * libFLAC reports detailed decoder errors through the error callback, but
      * the failing API call often only returns false. These fields remember the
      * last callback status so Java receives an actionable exception message.
@@ -1559,6 +1592,22 @@ static void unlock_decode_session_registry(void)
     LeaveCriticalSection(&g_decode_session_registry_lock);
 }
 
+/* Deletes a global seekable-channel reference held by a decode context. */
+static void clear_decode_seekable_channel(DecodeContext *context)
+{
+    if (context == NULL || context->seekable_channel == NULL || context->jvm == NULL)
+    {
+        return;
+    }
+
+    JNIEnv *env = NULL;
+    if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK && env != NULL)
+    {
+        (*env)->DeleteGlobalRef(env, context->seekable_channel);
+    }
+    context->seekable_channel = NULL;
+}
+
 /*
  * Finds a live decoder session registry entry by handle. When requested,
  * previous receives the preceding list node so callers can remove the entry.
@@ -1627,6 +1676,7 @@ static void destroy_decode_session(DecodeSession *session)
         g_flac_api.stream_decoder_delete(session->decoder);
         session->decoder = NULL;
     }
+    clear_decode_seekable_channel(&session->context);
     free(session);
 }
 
@@ -1805,6 +1855,8 @@ static int prepare_decode_context(JNIEnv *env, DecodeContext *context, jobject c
         (*env)->GetMethodID(env, consumer_class, "onStreamInfo", "(Lorg/zzvsjs/jflac/FlacStreamInfo;)V");
     context->on_pcm_interleaved = (*env)->GetMethodID(env, consumer_class, "onPcmInterleaved", "([II)V");
     context->on_complete = (*env)->GetMethodID(env, consumer_class, "onComplete", "()V");
+    context->input_stream = NULL;
+    context->input_read = NULL;
     context->saw_error = 0;
     context->suppress_metadata = 0;
     context->range_limited = 0;
@@ -1953,6 +2005,333 @@ static const char *decoder_error_status_name(FLAC__StreamDecoderErrorStatus stat
     default:
         return "UNKNOWN";
     }
+}
+
+/* Resolves InputStream.read(byte[], int, int) for sequential stream decode. */
+static int prepare_decode_input_stream(JNIEnv *env, DecodeContext *context, jobject input_stream)
+{
+    if (input_stream == NULL)
+    {
+        throw_illegal_argument_exception(env, "Decoder input stream must not be null.");
+        return 0;
+    }
+
+    jclass input_class = (*env)->GetObjectClass(env, input_stream);
+    if (input_class == NULL)
+    {
+        return 0;
+    }
+
+    context->input_stream = input_stream;
+    context->input_read = (*env)->GetMethodID(env, input_class, "read", "([BII)I");
+    if (context->input_read == NULL)
+    {
+        return 0;
+    }
+    return 1;
+}
+
+/* Resolves SeekableByteChannel callbacks and promotes the channel reference. */
+static int prepare_decode_seekable_channel(JNIEnv *env, DecodeContext *context, jobject channel)
+{
+    if (channel == NULL)
+    {
+        throw_illegal_argument_exception(env, "Decoder seekable channel must not be null.");
+        return 0;
+    }
+
+    jclass readable_class = (*env)->FindClass(env, "java/nio/channels/ReadableByteChannel");
+    jclass seekable_class = (*env)->FindClass(env, "java/nio/channels/SeekableByteChannel");
+    if (readable_class == NULL || seekable_class == NULL)
+    {
+        return 0;
+    }
+
+    context->channel_read = (*env)->GetMethodID(env, readable_class, "read", "(Ljava/nio/ByteBuffer;)I");
+    context->channel_position = (*env)->GetMethodID(env, seekable_class, "position", "()J");
+    context->channel_seek =
+        (*env)->GetMethodID(env, seekable_class, "position", "(J)Ljava/nio/channels/SeekableByteChannel;");
+    context->channel_size = (*env)->GetMethodID(env, seekable_class, "size", "()J");
+    if (context->channel_read == NULL || context->channel_position == NULL || context->channel_seek == NULL ||
+        context->channel_size == NULL)
+    {
+        return 0;
+    }
+
+    if ((*env)->GetJavaVM(env, &context->jvm) != JNI_OK)
+    {
+        throw_decode_exception(env, "Failed to access JVM for channel decoder callbacks.");
+        return 0;
+    }
+
+    context->seekable_channel = (*env)->NewGlobalRef(env, channel);
+    if (context->seekable_channel == NULL)
+    {
+        return 0;
+    }
+
+    context->channel_base_offset = (*env)->CallLongMethod(env, channel, context->channel_position);
+    if ((*env)->ExceptionCheck(env))
+    {
+        clear_decode_seekable_channel(context);
+        return 0;
+    }
+    if (context->channel_base_offset < 0)
+    {
+        clear_decode_seekable_channel(context);
+        throw_decode_exception(env, "SeekableByteChannel returned a negative position.");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* libFLAC read callback backed by java.nio.channels.SeekableByteChannel. */
+static FLAC__StreamDecoderReadStatus decode_channel_read_callback(const FLAC__StreamDecoder *decoder,
+                                                                  FLAC__byte buffer[], size_t *bytes,
+                                                                  void *client_data)
+{
+    (void)decoder;
+    DecodeContext *context = (DecodeContext *)client_data;
+    JNIEnv *env = context->env;
+
+    if ((*env)->ExceptionCheck(env))
+    {
+        if (bytes != NULL)
+        {
+            *bytes = 0u;
+        }
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (bytes == NULL)
+    {
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (context->seekable_channel == NULL || context->channel_read == NULL || *bytes == 0u)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (*bytes > (size_t)INT_MAX)
+    {
+        *bytes = 0u;
+        throw_decode_exception(env, "SeekableByteChannel read request is too large for one ByteBuffer.");
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    jobject byte_buffer = (*env)->NewDirectByteBuffer(env, buffer, (jlong)*bytes);
+    if (byte_buffer == NULL)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    jint read = (*env)->CallIntMethod(env, context->seekable_channel, context->channel_read, byte_buffer);
+    (*env)->DeleteLocalRef(env, byte_buffer);
+    if ((*env)->ExceptionCheck(env))
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (read < 0)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+    }
+    if (read == 0)
+    {
+        *bytes = 0u;
+        throw_decode_exception(env, "SeekableByteChannel returned zero bytes for a non-empty read request.");
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    *bytes = (size_t)read;
+    return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+}
+
+/* libFLAC seek callback backed by SeekableByteChannel.position(long). */
+static FLAC__StreamDecoderSeekStatus decode_channel_seek_callback(const FLAC__StreamDecoder *decoder,
+                                                                  FLAC__uint64 absolute_byte_offset,
+                                                                  void *client_data)
+{
+    (void)decoder;
+    DecodeContext *context = (DecodeContext *)client_data;
+    JNIEnv *env = context->env;
+
+    if (context->seekable_channel == NULL || context->channel_seek == NULL ||
+        absolute_byte_offset > (FLAC__uint64)(LLONG_MAX - context->channel_base_offset))
+    {
+        return FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
+    }
+
+    jobject ignored = (*env)->CallObjectMethod(env, context->seekable_channel, context->channel_seek,
+                                               context->channel_base_offset + (jlong)absolute_byte_offset);
+    if (ignored != NULL)
+    {
+        (*env)->DeleteLocalRef(env, ignored);
+    }
+    return (*env)->ExceptionCheck(env) ? FLAC__STREAM_DECODER_SEEK_STATUS_ERROR : FLAC__STREAM_DECODER_SEEK_STATUS_OK;
+}
+
+/* libFLAC tell callback backed by SeekableByteChannel.position(). */
+static FLAC__StreamDecoderTellStatus decode_channel_tell_callback(const FLAC__StreamDecoder *decoder,
+                                                                  FLAC__uint64 *absolute_byte_offset,
+                                                                  void *client_data)
+{
+    (void)decoder;
+    DecodeContext *context = (DecodeContext *)client_data;
+    JNIEnv *env = context->env;
+
+    if (context->seekable_channel == NULL || context->channel_position == NULL || absolute_byte_offset == NULL)
+    {
+        return FLAC__STREAM_DECODER_TELL_STATUS_ERROR;
+    }
+
+    jlong position = (*env)->CallLongMethod(env, context->seekable_channel, context->channel_position);
+    if ((*env)->ExceptionCheck(env) || position < context->channel_base_offset)
+    {
+        return FLAC__STREAM_DECODER_TELL_STATUS_ERROR;
+    }
+
+    *absolute_byte_offset = (FLAC__uint64)(position - context->channel_base_offset);
+    return FLAC__STREAM_DECODER_TELL_STATUS_OK;
+}
+
+/* libFLAC length callback backed by SeekableByteChannel.size(). */
+static FLAC__StreamDecoderLengthStatus decode_channel_length_callback(const FLAC__StreamDecoder *decoder,
+                                                                      FLAC__uint64 *stream_length, void *client_data)
+{
+    (void)decoder;
+    DecodeContext *context = (DecodeContext *)client_data;
+    JNIEnv *env = context->env;
+
+    if (context->seekable_channel == NULL || context->channel_size == NULL || stream_length == NULL)
+    {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+
+    jlong size = (*env)->CallLongMethod(env, context->seekable_channel, context->channel_size);
+    if ((*env)->ExceptionCheck(env) || size < context->channel_base_offset)
+    {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+
+    *stream_length = (FLAC__uint64)(size - context->channel_base_offset);
+    return FLAC__STREAM_DECODER_LENGTH_STATUS_OK;
+}
+
+/* libFLAC EOF callback backed by current channel position and size. */
+static FLAC__bool decode_channel_eof_callback(const FLAC__StreamDecoder *decoder, void *client_data)
+{
+    (void)decoder;
+    DecodeContext *context = (DecodeContext *)client_data;
+    JNIEnv *env = context->env;
+
+    if (context->seekable_channel == NULL || context->channel_position == NULL || context->channel_size == NULL)
+    {
+        return true;
+    }
+
+    jlong position = (*env)->CallLongMethod(env, context->seekable_channel, context->channel_position);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return true;
+    }
+    jlong size = (*env)->CallLongMethod(env, context->seekable_channel, context->channel_size);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return true;
+    }
+    return position >= size ? true : false;
+}
+
+/*
+ * libFLAC read callback backed by java.io.InputStream. It copies through a
+ * temporary JVM byte array because InputStream cannot fill a native pointer.
+ */
+static FLAC__StreamDecoderReadStatus decode_read_callback(const FLAC__StreamDecoder *decoder, FLAC__byte buffer[],
+                                                          size_t *bytes, void *client_data)
+{
+    DecodeContext *context = (DecodeContext *)client_data;
+    if (context != NULL && context->seekable_channel != NULL)
+    {
+        return decode_channel_read_callback(decoder, buffer, bytes, client_data);
+    }
+
+    (void)decoder;
+    JNIEnv *env = context->env;
+
+    if ((*env)->ExceptionCheck(env))
+    {
+        if (bytes != NULL)
+        {
+            *bytes = 0u;
+        }
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (bytes == NULL)
+    {
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (context->input_stream == NULL || context->input_read == NULL || *bytes == 0u)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (*bytes > (size_t)INT_MAX)
+    {
+        *bytes = 0u;
+        throw_decode_exception(env, "InputStream read request is too large for one JVM ByteArray.");
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    jsize requested = (jsize)*bytes;
+    jbyteArray chunk = (*env)->NewByteArray(env, requested);
+    if (chunk == NULL)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    jint read = (*env)->CallIntMethod(env, context->input_stream, context->input_read, chunk, (jint)0, (jint)requested);
+    if ((*env)->ExceptionCheck(env))
+    {
+        (*env)->DeleteLocalRef(env, chunk);
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (read < 0)
+    {
+        (*env)->DeleteLocalRef(env, chunk);
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+    }
+    if (read == 0)
+    {
+        (*env)->DeleteLocalRef(env, chunk);
+        *bytes = 0u;
+        throw_decode_exception(env, "InputStream returned zero bytes for a non-empty read request.");
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    (*env)->GetByteArrayRegion(env, chunk, 0, read, (jbyte *)buffer);
+    (*env)->DeleteLocalRef(env, chunk);
+    if ((*env)->ExceptionCheck(env))
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    *bytes = (size_t)read;
+    return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
 }
 
 /*
@@ -2292,12 +2671,252 @@ static void decode_file_internal(JNIEnv *env, jstring path, jlong first_sample, 
     g_flac_api.stream_decoder_delete(decoder);
 }
 
+/*
+ * Decodes a sequential InputStream through libFLAC's stream callback API.
+ * Range and reusable-session decode stay file-only because plain InputStream
+ * does not provide a clean seek/tell/length contract.
+ */
+static void decode_stream_internal(JNIEnv *env, jobject input_stream, jobject consumer)
+{
+    if (!flac_api_ready(env))
+    {
+        return;
+    }
+
+    if (input_stream == NULL || consumer == NULL)
+    {
+        throw_illegal_argument_exception(env, "Decoder input stream and consumer must not be null.");
+        return;
+    }
+
+    DecodeContext context;
+    memset(&context, 0, sizeof(context));
+    if (!prepare_decode_context(env, &context, consumer) || !prepare_decode_input_stream(env, &context, input_stream))
+    {
+        return;
+    }
+
+    FLAC__StreamDecoder *decoder = g_flac_api.stream_decoder_new();
+    if (decoder == NULL)
+    {
+        throw_decode_exception(env, "Failed to allocate FLAC stream decoder.");
+        return;
+    }
+
+    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_stream(
+        decoder, decode_read_callback, NULL, NULL, NULL, NULL, decode_write_callback, decode_metadata_callback,
+        decode_error_callback, &context);
+    if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
+    {
+        g_flac_api.stream_decoder_delete(decoder);
+        throw_decode_exception(env, "Failed to initialize FLAC stream decoder.");
+        return;
+    }
+
+    FLAC__bool success = process_decode_stream(decoder, &context);
+    FLAC__bool finish_success = g_flac_api.stream_decoder_finish(decoder);
+
+    if (!(*env)->ExceptionCheck(env) && !success)
+    {
+        const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
+        char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+        snprintf(buffer, sizeof(buffer), "FLAC stream decoding failed%s%s%s%s%s.", state != NULL ? ": " : "",
+                 state != NULL ? state : "", context.saw_error ? " (decoder error callback: " : "",
+                 context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                 context.saw_error ? ")" : "");
+        throw_decode_exception(env, buffer);
+    }
+
+    if (!(*env)->ExceptionCheck(env) && success && !finish_success)
+    {
+        const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
+        char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+        snprintf(buffer, sizeof(buffer), "FLAC stream decoding failed while finishing%s%s.",
+                 state != NULL ? ": " : "", state != NULL ? state : "");
+        throw_decode_exception(env, buffer);
+    }
+
+    if (!(*env)->ExceptionCheck(env) && success && finish_success)
+    {
+        (*env)->CallVoidMethod(env, consumer, context.on_complete);
+    }
+
+    g_flac_api.stream_decoder_delete(decoder);
+}
+
+/*
+ * Decodes a SeekableByteChannel through libFLAC's direct callback API. The
+ * channel position at call entry is treated as byte offset zero for libFLAC.
+ */
+static void decode_channel_internal(JNIEnv *env, jobject channel, jlong first_sample, jlong max_frames, jobject consumer,
+                                    int seek_before_decode, int range_limited)
+{
+    if (!flac_api_ready(env))
+    {
+        return;
+    }
+
+    if (channel == NULL || consumer == NULL)
+    {
+        throw_illegal_argument_exception(env, "Decoder seekable channel and consumer must not be null.");
+        return;
+    }
+
+    if ((seek_before_decode || range_limited) && !validate_decode_request(env, first_sample, range_limited, max_frames))
+    {
+        return;
+    }
+
+    DecodeContext context;
+    memset(&context, 0, sizeof(context));
+    if (!prepare_decode_context(env, &context, consumer) || !prepare_decode_seekable_channel(env, &context, channel))
+    {
+        clear_decode_seekable_channel(&context);
+        return;
+    }
+    configure_decode_range(&context, range_limited, max_frames);
+
+    FLAC__StreamDecoder *decoder = g_flac_api.stream_decoder_new();
+    if (decoder == NULL)
+    {
+        clear_decode_seekable_channel(&context);
+        throw_decode_exception(env, "Failed to allocate FLAC channel decoder.");
+        return;
+    }
+
+    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_stream(
+        decoder, decode_read_callback, decode_channel_seek_callback, decode_channel_tell_callback,
+        decode_channel_length_callback, decode_channel_eof_callback, decode_write_callback, decode_metadata_callback,
+        decode_error_callback, &context);
+    if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
+    {
+        g_flac_api.stream_decoder_delete(decoder);
+        clear_decode_seekable_channel(&context);
+        throw_decode_exception(env, "Failed to initialize FLAC channel decoder.");
+        return;
+    }
+
+    if (seek_before_decode || range_limited)
+    {
+        FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(decoder);
+        if (!(*env)->ExceptionCheck(env) && !metadata_success)
+        {
+            const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
+            char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+            snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed while reading metadata%s%s%s%s%s.",
+                     state != NULL ? ": " : "", state != NULL ? state : "",
+                     context.saw_error ? " (decoder error callback: " : "",
+                     context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                     context.saw_error ? ")" : "");
+            throw_decode_exception(env, buffer);
+        }
+        if ((*env)->ExceptionCheck(env) || !metadata_success)
+        {
+            g_flac_api.stream_decoder_finish(decoder);
+            g_flac_api.stream_decoder_delete(decoder);
+            clear_decode_seekable_channel(&context);
+            return;
+        }
+
+        if (decode_range_starts_after_stream(&context, first_sample))
+        {
+            g_flac_api.stream_decoder_finish(decoder);
+            g_flac_api.stream_decoder_delete(decoder);
+            clear_decode_seekable_channel(&context);
+            throw_range_after_stream_exception(env);
+            return;
+        }
+
+        if (context.range_complete || decode_range_starts_at_stream_end(&context, first_sample))
+        {
+            FLAC__bool finish_success = g_flac_api.stream_decoder_finish(decoder);
+            if (!(*env)->ExceptionCheck(env) && finish_success)
+            {
+                (*env)->CallVoidMethod(env, consumer, context.on_complete);
+            }
+            g_flac_api.stream_decoder_delete(decoder);
+            clear_decode_seekable_channel(&context);
+            return;
+        }
+
+        FLAC__bool seek_success =
+            first_sample == 0 ? true : g_flac_api.stream_decoder_seek_absolute(decoder, (FLAC__uint64)first_sample);
+        if (!(*env)->ExceptionCheck(env) && !seek_success)
+        {
+            const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
+            char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+            snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed while seeking%s%s%s%s%s.",
+                     state != NULL ? ": " : "", state != NULL ? state : "",
+                     context.saw_error ? " (decoder error callback: " : "",
+                     context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                     context.saw_error ? ")" : "");
+            throw_decode_exception(env, buffer);
+        }
+
+        if ((*env)->ExceptionCheck(env) || !seek_success)
+        {
+            g_flac_api.stream_decoder_finish(decoder);
+            g_flac_api.stream_decoder_delete(decoder);
+            clear_decode_seekable_channel(&context);
+            return;
+        }
+    }
+
+    FLAC__bool success = process_decode_stream(decoder, &context);
+    FLAC__bool finish_success = g_flac_api.stream_decoder_finish(decoder);
+
+    if (!(*env)->ExceptionCheck(env) && !success)
+    {
+        const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
+        char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+        snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed%s%s%s%s%s.", state != NULL ? ": " : "",
+                 state != NULL ? state : "", context.saw_error ? " (decoder error callback: " : "",
+                 context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                 context.saw_error ? ")" : "");
+        throw_decode_exception(env, buffer);
+    }
+
+    if (!(*env)->ExceptionCheck(env) && success && !finish_success)
+    {
+        const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
+        char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+        snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed while finishing%s%s.",
+                 state != NULL ? ": " : "", state != NULL ? state : "");
+        throw_decode_exception(env, buffer);
+    }
+
+    if (!(*env)->ExceptionCheck(env) && success && finish_success)
+    {
+        (*env)->CallVoidMethod(env, consumer, context.on_complete);
+    }
+
+    g_flac_api.stream_decoder_delete(decoder);
+    clear_decode_seekable_channel(&context);
+}
+
 /* Decodes a whole FLAC file and emits STREAMINFO plus PCM callbacks. */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFile(JNIEnv *env, jclass clazz, jstring path,
                                                                                 jobject consumer)
 {
     (void)clazz;
     decode_file_internal(env, path, 0, 0, consumer, JFLAC_EMIT_METADATA_CALLBACKS, JFLAC_UNLIMITED_RANGE);
+}
+
+/* Decodes a whole FLAC stream and emits STREAMINFO plus PCM callbacks. */
+JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeStream(JNIEnv *env, jclass clazz,
+                                                                                  jobject input_stream,
+                                                                                  jobject consumer)
+{
+    (void)clazz;
+    decode_stream_internal(env, input_stream, consumer);
+}
+
+/* Decodes a whole seekable channel and emits STREAMINFO plus PCM callbacks. */
+JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChannel(JNIEnv *env, jclass clazz,
+                                                                                   jobject channel, jobject consumer)
+{
+    (void)clazz;
+    decode_channel_internal(env, channel, 0, 0, consumer, JFLAC_EMIT_METADATA_CALLBACKS, JFLAC_UNLIMITED_RANGE);
 }
 
 /* Decodes from an absolute sample frame to end-of-stream. */
@@ -2310,6 +2929,17 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileF
                          JFLAC_UNLIMITED_RANGE);
 }
 
+/* Decodes from an absolute sample frame to end-of-stream from a seekable channel. */
+JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChannelFrom(JNIEnv *env, jclass clazz,
+                                                                                       jobject channel,
+                                                                                       jlong first_sample,
+                                                                                       jobject consumer)
+{
+    (void)clazz;
+    decode_channel_internal(env, channel, first_sample, 0, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
+                            JFLAC_UNLIMITED_RANGE);
+}
+
 /* Decodes a bounded frame range from a file. */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileRange(JNIEnv *env, jclass clazz,
                                                                                      jstring path, jlong first_sample,
@@ -2318,6 +2948,15 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeFileR
     (void)clazz;
     decode_file_internal(env, path, first_sample, max_frames, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
                          JFLAC_LIMITED_RANGE);
+}
+
+/* Decodes a bounded frame range from a seekable channel. */
+JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeChannelRange(
+    JNIEnv *env, jclass clazz, jobject channel, jlong first_sample, jlong max_frames, jobject consumer)
+{
+    (void)clazz;
+    decode_channel_internal(env, channel, first_sample, max_frames, consumer, JFLAC_SUPPRESS_METADATA_CALLBACKS,
+                            JFLAC_LIMITED_RANGE);
 }
 
 /*
@@ -2414,6 +3053,92 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     {
         destroy_decode_session(session);
         throw_decode_exception(env, "Failed to register FLAC decoder session.");
+        return 0;
+    }
+
+    return handle;
+}
+
+/*
+ * Opens a reusable seekable-channel decoder session and reads STREAMINFO once
+ * so later range decodes can use the same native handle.
+ */
+JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecoderChannel(JNIEnv *env, jclass clazz,
+                                                                                         jobject channel)
+{
+    (void)clazz;
+    if (!flac_api_ready(env))
+    {
+        return 0;
+    }
+
+    if (channel == NULL)
+    {
+        throw_illegal_argument_exception(env, "Decoder seekable channel must not be null.");
+        return 0;
+    }
+
+    DecodeSession *session = (DecodeSession *)calloc(1u, sizeof(DecodeSession));
+    if (session == NULL)
+    {
+        throw_decode_exception(env, "Failed to allocate FLAC decoder session.");
+        return 0;
+    }
+
+    session->decoder = g_flac_api.stream_decoder_new();
+    if (session->decoder == NULL)
+    {
+        free(session);
+        throw_decode_exception(env, "Failed to allocate FLAC decoder.");
+        return 0;
+    }
+
+    session->context.env = env;
+    session->context.consumer = NULL;
+    session->context.suppress_metadata = JFLAC_SUPPRESS_METADATA_CALLBACKS;
+    if (!prepare_decode_seekable_channel(env, &session->context, channel))
+    {
+        destroy_decode_session(session);
+        return 0;
+    }
+
+    FLAC__StreamDecoderInitStatus init_status = g_flac_api.stream_decoder_init_stream(
+        session->decoder, decode_read_callback, decode_channel_seek_callback, decode_channel_tell_callback,
+        decode_channel_length_callback, decode_channel_eof_callback, decode_write_callback, decode_metadata_callback,
+        decode_error_callback, &session->context);
+
+    if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
+    {
+        destroy_decode_session(session);
+        throw_decode_exception(env, "Failed to initialize FLAC channel decoder.");
+        return 0;
+    }
+
+    FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(session->decoder);
+    if (!(*env)->ExceptionCheck(env) && !metadata_success)
+    {
+        const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
+        char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
+        snprintf(buffer, sizeof(buffer), "FLAC channel decoder session failed while reading metadata%s%s%s%s%s.",
+                 state != NULL ? ": " : "", state != NULL ? state : "",
+                 session->context.saw_error ? " (decoder error callback: " : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? ")" : "");
+        destroy_decode_session(session);
+        throw_decode_exception(env, buffer);
+        return 0;
+    }
+    if ((*env)->ExceptionCheck(env) || !metadata_success)
+    {
+        destroy_decode_session(session);
+        return 0;
+    }
+
+    jlong handle = register_decode_session(session);
+    if (handle == 0)
+    {
+        destroy_decode_session(session);
+        throw_decode_exception(env, "Failed to register FLAC channel decoder session.");
         return 0;
     }
 
@@ -2647,6 +3372,25 @@ typedef struct EncodeContext
     FLAC__StreamMetadata **metadata_blocks;
     uint32_t metadata_count;
     uint32_t channels;
+
+    /*
+     * OutputStream encoding keeps a global reference because libFLAC invokes
+     * write callbacks across open, write, and finish JNI calls.
+     */
+    JavaVM *jvm;
+    jobject output_stream;
+    jmethodID output_write;
+    jmethodID output_flush;
+
+    /*
+     * SeekableByteChannel encoding uses write plus seek/tell callbacks so
+     * libFLAC can patch final STREAMINFO fields after PCM frames are written.
+     */
+    jobject output_channel;
+    jmethodID channel_write;
+    jmethodID channel_position;
+    jmethodID channel_seek;
+    jlong channel_base_offset;
 } EncodeContext;
 
 /* Deletes all libFLAC metadata blocks owned by an encoder context. */
@@ -2685,6 +3429,27 @@ static void destroy_encode_context(EncodeContext *context)
     }
 
     destroy_metadata_blocks(context);
+
+    if (context->output_stream != NULL && context->jvm != NULL)
+    {
+        JNIEnv *env = NULL;
+        if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK && env != NULL)
+        {
+            (*env)->DeleteGlobalRef(env, context->output_stream);
+        }
+        context->output_stream = NULL;
+    }
+
+    if (context->output_channel != NULL && context->jvm != NULL)
+    {
+        JNIEnv *env = NULL;
+        if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK && env != NULL)
+        {
+            (*env)->DeleteGlobalRef(env, context->output_channel);
+        }
+        context->output_channel = NULL;
+    }
+
     free(context);
 }
 
@@ -3859,26 +4624,274 @@ static const char *encoder_state_or_unknown(const FLAC__StreamEncoder *encoder)
     return state != NULL ? state : "unknown encoder state";
 }
 
-/* Opens and configures a file encoder, returning an opaque native handle. */
-JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncoderFile(JNIEnv *env, jclass clazz,
-                                                                                      jstring path, jobject request)
+/* Returns the JNIEnv for synchronous libFLAC callbacks on the calling thread. */
+static JNIEnv *encode_context_env(EncodeContext *context)
 {
-    (void)clazz;
-    if (!flac_api_ready(env))
+    if (context == NULL || context->jvm == NULL)
+    {
+        return NULL;
+    }
+
+    JNIEnv *env = NULL;
+    if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) != JNI_OK)
+    {
+        return NULL;
+    }
+    return env;
+}
+
+/* Resolves OutputStream callbacks and promotes the stream to session lifetime. */
+static int prepare_encode_output_stream(JNIEnv *env, EncodeContext *context, jobject output_stream)
+{
+    if (output_stream == NULL)
+    {
+        throw_illegal_argument_exception(env, "Encoder output stream must not be null.");
+        return 0;
+    }
+
+    jclass output_class = (*env)->GetObjectClass(env, output_stream);
+    if (output_class == NULL)
     {
         return 0;
     }
 
-    if (path == NULL || request == NULL)
+    context->output_write = (*env)->GetMethodID(env, output_class, "write", "([BII)V");
+    context->output_flush = (*env)->GetMethodID(env, output_class, "flush", "()V");
+    if (context->output_write == NULL || context->output_flush == NULL)
     {
-        throw_illegal_argument_exception(env, "Encoder path and request must not be null.");
         return 0;
     }
 
-    char *utf8_path = jstring_to_utf8(env, path);
-    if (utf8_path == NULL)
+    if ((*env)->GetJavaVM(env, &context->jvm) != JNI_OK)
     {
-        throw_encode_exception(env, "Failed to encode output file path to UTF-8.");
+        throw_encode_exception(env, "Failed to access JVM for stream encoder callbacks.");
+        return 0;
+    }
+
+    context->output_stream = (*env)->NewGlobalRef(env, output_stream);
+    if (context->output_stream == NULL)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Resolves SeekableByteChannel callbacks and promotes the channel reference. */
+static int prepare_encode_output_channel(JNIEnv *env, EncodeContext *context, jobject output_channel)
+{
+    if (output_channel == NULL)
+    {
+        throw_illegal_argument_exception(env, "Encoder output channel must not be null.");
+        return 0;
+    }
+
+    jclass writable_class = (*env)->FindClass(env, "java/nio/channels/WritableByteChannel");
+    jclass seekable_class = (*env)->FindClass(env, "java/nio/channels/SeekableByteChannel");
+    if (writable_class == NULL || seekable_class == NULL)
+    {
+        return 0;
+    }
+
+    context->channel_write = (*env)->GetMethodID(env, writable_class, "write", "(Ljava/nio/ByteBuffer;)I");
+    context->channel_position = (*env)->GetMethodID(env, seekable_class, "position", "()J");
+    context->channel_seek =
+        (*env)->GetMethodID(env, seekable_class, "position", "(J)Ljava/nio/channels/SeekableByteChannel;");
+    if (context->channel_write == NULL || context->channel_position == NULL || context->channel_seek == NULL)
+    {
+        return 0;
+    }
+
+    if ((*env)->GetJavaVM(env, &context->jvm) != JNI_OK)
+    {
+        throw_encode_exception(env, "Failed to access JVM for channel encoder callbacks.");
+        return 0;
+    }
+
+    context->output_channel = (*env)->NewGlobalRef(env, output_channel);
+    if (context->output_channel == NULL)
+    {
+        return 0;
+    }
+
+    context->channel_base_offset = (*env)->CallLongMethod(env, output_channel, context->channel_position);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return 0;
+    }
+    if (context->channel_base_offset < 0)
+    {
+        throw_encode_exception(env, "SeekableByteChannel returned a negative position.");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* libFLAC write callback backed by java.nio.channels.SeekableByteChannel. */
+static FLAC__StreamEncoderWriteStatus encode_channel_write_callback(const FLAC__StreamEncoder *encoder,
+                                                                    const FLAC__byte buffer[], size_t bytes,
+                                                                    uint32_t samples, uint32_t current_frame,
+                                                                    void *client_data)
+{
+    (void)encoder;
+    (void)samples;
+    (void)current_frame;
+
+    EncodeContext *context = (EncodeContext *)client_data;
+    JNIEnv *env = encode_context_env(context);
+    if (env == NULL || context->output_channel == NULL || context->channel_write == NULL)
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    if ((*env)->ExceptionCheck(env))
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    if (bytes > (size_t)INT_MAX)
+    {
+        throw_encode_exception(env, "Encoded FLAC chunk is too large for one ByteBuffer.");
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    jobject byte_buffer = (*env)->NewDirectByteBuffer(env, (void *)buffer, (jlong)bytes);
+    if (byte_buffer == NULL)
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    size_t written_total = 0u;
+    while (written_total < bytes)
+    {
+        jint written = (*env)->CallIntMethod(env, context->output_channel, context->channel_write, byte_buffer);
+        if ((*env)->ExceptionCheck(env))
+        {
+            (*env)->DeleteLocalRef(env, byte_buffer);
+            return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+        }
+        if (written <= 0)
+        {
+            (*env)->DeleteLocalRef(env, byte_buffer);
+            throw_encode_exception(env, "SeekableByteChannel returned zero bytes for a non-empty write request.");
+            return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+        }
+        written_total += (size_t)written;
+    }
+
+    (*env)->DeleteLocalRef(env, byte_buffer);
+    return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+}
+
+/* libFLAC seek callback backed by SeekableByteChannel.position(long). */
+static FLAC__StreamEncoderSeekStatus encode_channel_seek_callback(const FLAC__StreamEncoder *encoder,
+                                                                  FLAC__uint64 absolute_byte_offset,
+                                                                  void *client_data)
+{
+    (void)encoder;
+    EncodeContext *context = (EncodeContext *)client_data;
+    JNIEnv *env = encode_context_env(context);
+    if (env == NULL || context->output_channel == NULL || context->channel_seek == NULL ||
+        absolute_byte_offset > (FLAC__uint64)(LLONG_MAX - context->channel_base_offset))
+    {
+        return FLAC__STREAM_ENCODER_SEEK_STATUS_ERROR;
+    }
+
+    jobject ignored = (*env)->CallObjectMethod(env, context->output_channel, context->channel_seek,
+                                               context->channel_base_offset + (jlong)absolute_byte_offset);
+    if (ignored != NULL)
+    {
+        (*env)->DeleteLocalRef(env, ignored);
+    }
+    return (*env)->ExceptionCheck(env) ? FLAC__STREAM_ENCODER_SEEK_STATUS_ERROR : FLAC__STREAM_ENCODER_SEEK_STATUS_OK;
+}
+
+/* libFLAC tell callback backed by SeekableByteChannel.position(). */
+static FLAC__StreamEncoderTellStatus encode_channel_tell_callback(const FLAC__StreamEncoder *encoder,
+                                                                  FLAC__uint64 *absolute_byte_offset,
+                                                                  void *client_data)
+{
+    (void)encoder;
+    EncodeContext *context = (EncodeContext *)client_data;
+    JNIEnv *env = encode_context_env(context);
+    if (env == NULL || context->output_channel == NULL || context->channel_position == NULL ||
+        absolute_byte_offset == NULL)
+    {
+        return FLAC__STREAM_ENCODER_TELL_STATUS_ERROR;
+    }
+
+    jlong position = (*env)->CallLongMethod(env, context->output_channel, context->channel_position);
+    if ((*env)->ExceptionCheck(env) || position < context->channel_base_offset)
+    {
+        return FLAC__STREAM_ENCODER_TELL_STATUS_ERROR;
+    }
+
+    *absolute_byte_offset = (FLAC__uint64)(position - context->channel_base_offset);
+    return FLAC__STREAM_ENCODER_TELL_STATUS_OK;
+}
+
+/* libFLAC write callback backed by java.io.OutputStream. */
+static FLAC__StreamEncoderWriteStatus encode_write_callback(const FLAC__StreamEncoder *encoder,
+                                                            const FLAC__byte buffer[], size_t bytes,
+                                                            uint32_t samples, uint32_t current_frame,
+                                                            void *client_data)
+{
+    EncodeContext *context = (EncodeContext *)client_data;
+    if (context != NULL && context->output_channel != NULL)
+    {
+        return encode_channel_write_callback(encoder, buffer, bytes, samples, current_frame, client_data);
+    }
+
+    (void)encoder;
+    (void)samples;
+    (void)current_frame;
+
+    JNIEnv *env = encode_context_env(context);
+    if (env == NULL || context->output_stream == NULL || context->output_write == NULL)
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    if ((*env)->ExceptionCheck(env))
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    if (bytes > (size_t)INT_MAX)
+    {
+        throw_encode_exception(env, "Encoded FLAC chunk is too large for one JVM ByteArray.");
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    jbyteArray chunk = (*env)->NewByteArray(env, (jsize)bytes);
+    if (chunk == NULL)
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    if (bytes > 0u)
+    {
+        (*env)->SetByteArrayRegion(env, chunk, 0, (jsize)bytes, (const jbyte *)buffer);
+    }
+    if (!(*env)->ExceptionCheck(env))
+    {
+        (*env)->CallVoidMethod(env, context->output_stream, context->output_write, chunk, (jint)0, (jint)bytes);
+    }
+    (*env)->DeleteLocalRef(env, chunk);
+
+    return (*env)->ExceptionCheck(env) ? FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR
+                                      : FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+}
+
+/* Opens and configures a file, OutputStream, or SeekableByteChannel encoder. */
+static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_stream, jobject output_channel,
+                                   jobject request)
+{
+    if ((utf8_path == NULL && output_stream == NULL && output_channel == NULL) || request == NULL)
+    {
+        free(utf8_path);
+        throw_illegal_argument_exception(env, "Encoder output and request must not be null.");
         return 0;
     }
 
@@ -3981,6 +4994,19 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncode
     }
 
     context->channels = (uint32_t)channels;
+    if (output_stream != NULL && !prepare_encode_output_stream(env, context, output_stream))
+    {
+        destroy_encode_context(context);
+        free(utf8_path);
+        return 0;
+    }
+    if (output_channel != NULL && !prepare_encode_output_channel(env, context, output_channel))
+    {
+        destroy_encode_context(context);
+        free(utf8_path);
+        return 0;
+    }
+
     context->encoder = g_flac_api.stream_encoder_new();
     if (context->encoder == NULL)
     {
@@ -4039,20 +5065,92 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncode
         return 0;
     }
 
-    FLAC__StreamEncoderInitStatus init_status =
-        g_flac_api.stream_encoder_init_file(context->encoder, utf8_path, NULL, NULL);
+    FLAC__StreamEncoderInitStatus init_status;
+    if (output_stream != NULL)
+    {
+        init_status =
+            g_flac_api.stream_encoder_init_stream(context->encoder, encode_write_callback, NULL, NULL, NULL, context);
+    }
+    else if (output_channel != NULL)
+    {
+        init_status = g_flac_api.stream_encoder_init_stream(context->encoder, encode_write_callback,
+                                                            encode_channel_seek_callback,
+                                                            encode_channel_tell_callback, NULL, context);
+    }
+    else
+    {
+        init_status = g_flac_api.stream_encoder_init_file(context->encoder, utf8_path, NULL, NULL);
+    }
     free(utf8_path);
     if (init_status != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
     {
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
-        snprintf(buffer, sizeof(buffer), "Failed to initialize FLAC encoder output: %s.",
+        snprintf(buffer, sizeof(buffer), "Failed to initialize FLAC encoder output%s%s.",
+                 encoder_state_or_unknown(context->encoder) != NULL ? ": " : "",
                  encoder_state_or_unknown(context->encoder));
         destroy_encode_context(context);
-        throw_encode_exception(env, buffer);
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_encode_exception(env, buffer);
+        }
         return 0;
     }
 
     return (jlong)(intptr_t)context;
+}
+
+/* Opens and configures a file encoder, returning an opaque native handle. */
+JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncoderFile(JNIEnv *env, jclass clazz,
+                                                                                      jstring path, jobject request)
+{
+    (void)clazz;
+    if (!flac_api_ready(env))
+    {
+        return 0;
+    }
+
+    if (path == NULL || request == NULL)
+    {
+        throw_illegal_argument_exception(env, "Encoder path and request must not be null.");
+        return 0;
+    }
+
+    char *utf8_path = jstring_to_utf8(env, path);
+    if (utf8_path == NULL)
+    {
+        throw_encode_exception(env, "Failed to encode output file path to UTF-8.");
+        return 0;
+    }
+
+    return open_encoder_internal(env, utf8_path, NULL, NULL, request);
+}
+
+/* Opens and configures a sequential OutputStream encoder. */
+JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncoderStream(JNIEnv *env, jclass clazz,
+                                                                                        jobject output_stream,
+                                                                                        jobject request)
+{
+    (void)clazz;
+    if (!flac_api_ready(env))
+    {
+        return 0;
+    }
+
+    return open_encoder_internal(env, NULL, output_stream, NULL, request);
+}
+
+/* Opens and configures a seekable channel encoder. */
+JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncoderChannel(JNIEnv *env, jclass clazz,
+                                                                                         jobject output_channel,
+                                                                                         jobject request)
+{
+    (void)clazz;
+    if (!flac_api_ready(env))
+    {
+        return 0;
+    }
+
+    return open_encoder_internal(env, NULL, NULL, output_channel, request);
 }
 
 /* Writes one interleaved PCM chunk into an active encoder handle. */
@@ -4133,7 +5231,16 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_finishEncod
                  encoder_state_or_unknown(context->encoder));
     }
 
+    if (success && context->output_stream != NULL && context->output_flush != NULL)
+    {
+        (*env)->CallVoidMethod(env, context->output_stream, context->output_flush);
+    }
+
     destroy_encode_context(context);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return;
+    }
     if (!success)
     {
         throw_encode_exception(env, buffer);

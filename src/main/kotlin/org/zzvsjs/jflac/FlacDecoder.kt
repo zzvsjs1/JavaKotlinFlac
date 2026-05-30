@@ -2,14 +2,17 @@ package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeBindings
 import org.zzvsjs.jflac.internal.toPublicMetadata
+import java.io.InputStream
+import java.nio.channels.SeekableByteChannel
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 
 /**
- * Synchronous file-based decoder backed by libFLAC.
+ * Synchronous decoder backed by libFLAC.
  *
- * Path validation and native library loading are handled on the JVM side so
- * decode failures stay predictable before entering JNI.
+ * File paths, sequential streams, and seekable channels share the same public
+ * callback models while mapping to the libFLAC entry point that fits each
+ * source.
  */
 class FlacDecoder {
     /**
@@ -32,6 +35,22 @@ class FlacDecoder {
     }
 
     /**
+     * Opens a reusable decode session for a seekable native FLAC channel.
+     *
+     * The channel is not closed by the returned session. libFLAC byte offsets
+     * are relative to the channel position at open time.
+     */
+    fun open(input: SeekableByteChannel): FlacDecodingSession {
+        FlacNativeLoader.load()
+        val streamInfo = readChannelStreamInfo(input)
+        val handle = NativeBindings.openDecoderChannel(input)
+        if (handle == 0L) {
+            throw FlacDecodeException("Native channel decoder initialization returned an invalid handle without throwing an exception.")
+        }
+        return NativeFlacDecodingSession(handle, streamInfo)
+    }
+
+    /**
      * Decodes the whole FLAC file into one JVM-owned PCM buffer.
      *
      * This overload is the simplest entry point for callers that want the
@@ -44,12 +63,43 @@ class FlacDecoder {
     }
 
     /**
+     * Decodes a native FLAC stream into one JVM-owned PCM buffer.
+     *
+     * Plain streams are sequential-only in V1. Use file or seekable-channel
+     * APIs when the caller needs range decode or a reusable seekable session.
+     */
+    fun decode(input: InputStream): FlacDecodedAudio {
+        val consumer = BufferingPcmConsumer()
+        decode(input, consumer)
+        return consumer.toDecodedAudio()
+    }
+
+    /**
+     * Decodes a seekable native FLAC channel into one JVM-owned PCM buffer.
+     */
+    fun decode(input: SeekableByteChannel): FlacDecodedAudio {
+        val consumer = BufferingPcmConsumer()
+        decode(input, consumer)
+        return consumer.toDecodedAudio()
+    }
+
+    /**
      * Seeks to [firstSample] and decodes at most [maxFrames] PCM frames into
      * one JVM-owned buffer.
      */
     fun decode(path: Path, firstSample: Long, maxFrames: Long): FlacDecodedAudio {
         val consumer = BufferingPcmConsumer(firstSample, maxFrames)
         decode(path, firstSample, maxFrames, consumer)
+        return consumer.toDecodedAudio()
+    }
+
+    /**
+     * Seeks to [firstSample] and decodes at most [maxFrames] PCM frames from a
+     * seekable native FLAC channel into one JVM-owned buffer.
+     */
+    fun decode(input: SeekableByteChannel, firstSample: Long, maxFrames: Long): FlacDecodedAudio {
+        val consumer = BufferingPcmConsumer(firstSample, maxFrames)
+        decode(input, firstSample, maxFrames, consumer)
         return consumer.toDecodedAudio()
     }
 
@@ -77,6 +127,45 @@ class FlacDecoder {
     }
 
     /**
+     * Decodes a native FLAC stream and forwards interleaved PCM chunks.
+     */
+    @JvmOverloads
+    fun decodeInterleaved(
+        input: InputStream,
+        onChunk: FlacInterleavedPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Decodes a seekable native FLAC channel and forwards interleaved PCM
+     * chunks.
+     */
+    @JvmOverloads
+    fun decodeInterleaved(
+        input: SeekableByteChannel,
+        onChunk: FlacInterleavedPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Seeks to [firstSample] and decodes from there to end-of-stream.
      *
      * Chunk frame positions stay absolute to the original stream, so a seek to
@@ -97,6 +186,28 @@ class FlacDecoder {
             onComplete = onComplete
         )
         decode(path, firstSample, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Seeks to [firstSample] on a seekable channel and decodes from there to
+     * end-of-stream.
+     */
+    @JvmOverloads
+    fun decodeInterleaved(
+        input: SeekableByteChannel,
+        firstSample: Long,
+        onChunk: FlacInterleavedPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, firstSample, consumer)
         return consumer.summary()
     }
 
@@ -127,6 +238,30 @@ class FlacDecoder {
     }
 
     /**
+     * Seeks to [firstSample] on a seekable channel and decodes at most
+     * [maxFrames] interleaved PCM frames.
+     */
+    @JvmOverloads
+    fun decodeInterleaved(
+        input: SeekableByteChannel,
+        firstSample: Long,
+        maxFrames: Long,
+        onChunk: FlacInterleavedPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            maxFrames = maxFrames,
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, firstSample, maxFrames, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Decodes a FLAC file and forwards channel-separated PCM chunks.
      *
      * Channel separation adds one copy per chunk but produces a layout that is
@@ -149,6 +284,45 @@ class FlacDecoder {
     }
 
     /**
+     * Decodes a native FLAC stream and forwards channel-separated PCM chunks.
+     */
+    @JvmOverloads
+    fun decodeChannels(
+        input: InputStream,
+        onChunk: FlacChannelPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Decodes a seekable native FLAC channel and forwards channel-separated
+     * PCM chunks.
+     */
+    @JvmOverloads
+    fun decodeChannels(
+        input: SeekableByteChannel,
+        onChunk: FlacChannelPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Seeks to [firstSample] and forwards channel-separated PCM chunks.
      */
     @JvmOverloads
@@ -166,6 +340,28 @@ class FlacDecoder {
             onComplete = onComplete
         )
         decode(path, firstSample, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Seeks to [firstSample] on a seekable channel and forwards
+     * channel-separated PCM chunks.
+     */
+    @JvmOverloads
+    fun decodeChannels(
+        input: SeekableByteChannel,
+        firstSample: Long,
+        onChunk: FlacChannelPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, firstSample, consumer)
         return consumer.summary()
     }
 
@@ -194,6 +390,30 @@ class FlacDecoder {
     }
 
     /**
+     * Seeks to [firstSample] on a seekable channel and decodes at most
+     * [maxFrames] channel-separated PCM frames.
+     */
+    @JvmOverloads
+    fun decodeChannels(
+        input: SeekableByteChannel,
+        firstSample: Long,
+        maxFrames: Long,
+        onChunk: FlacChannelPcmHandler,
+        onStreamInfo: FlacStreamInfoHandler? = null,
+        onComplete: FlacDecodeCompleteHandler? = null
+    ): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            maxFrames = maxFrames,
+            onStreamInfo = onStreamInfo,
+            onChunk = onChunk,
+            onComplete = onComplete
+        )
+        decode(input, firstSample, maxFrames, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Decodes a FLAC file into the richer streaming listener interface.
      *
      * This overload keeps the public API close to libFLAC's callback model
@@ -210,6 +430,33 @@ class FlacDecoder {
     }
 
     /**
+     * Decodes a native FLAC stream into the richer streaming listener API.
+     */
+    fun decode(input: InputStream, listener: FlacDecodeListener): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacInterleavedPcmHandler { chunk -> listener.onInterleavedPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Decodes a seekable native FLAC channel into the richer streaming
+     * listener API.
+     */
+    fun decode(input: SeekableByteChannel, listener: FlacDecodeListener): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacInterleavedPcmHandler { chunk -> listener.onInterleavedPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Seeks to [firstSample] and decodes into the interleaved listener API.
      */
     fun decode(path: Path, firstSample: Long, listener: FlacDecodeListener): FlacDecodeSummary {
@@ -220,6 +467,21 @@ class FlacDecoder {
             onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
         )
         decode(path, firstSample, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Seeks to [firstSample] on a seekable channel and decodes into the
+     * interleaved listener API.
+     */
+    fun decode(input: SeekableByteChannel, firstSample: Long, listener: FlacDecodeListener): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacInterleavedPcmHandler { chunk -> listener.onInterleavedPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, firstSample, consumer)
         return consumer.summary()
     }
 
@@ -240,6 +502,27 @@ class FlacDecoder {
     }
 
     /**
+     * Seeks to [firstSample] on a seekable channel and decodes at most
+     * [maxFrames] into the interleaved listener API.
+     */
+    fun decode(
+        input: SeekableByteChannel,
+        firstSample: Long,
+        maxFrames: Long,
+        listener: FlacDecodeListener
+    ): FlacDecodeSummary {
+        val consumer = InterleavedForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            maxFrames = maxFrames,
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacInterleavedPcmHandler { chunk -> listener.onInterleavedPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, firstSample, maxFrames, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Decodes a FLAC file into the channel-oriented streaming listener.
      *
      * This is the most convenient decode path for callers that never want to
@@ -256,6 +539,33 @@ class FlacDecoder {
     }
 
     /**
+     * Decodes a native FLAC stream into the channel-oriented listener API.
+     */
+    fun decode(input: InputStream, listener: FlacChannelDecodeListener): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacChannelPcmHandler { chunk -> listener.onChannelPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Decodes a seekable native FLAC channel into the channel-oriented
+     * listener API.
+     */
+    fun decode(input: SeekableByteChannel, listener: FlacChannelDecodeListener): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacChannelPcmHandler { chunk -> listener.onChannelPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Seeks to [firstSample] and decodes into the channel listener API.
      */
     fun decode(path: Path, firstSample: Long, listener: FlacChannelDecodeListener): FlacDecodeSummary {
@@ -266,6 +576,21 @@ class FlacDecoder {
             onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
         )
         decode(path, firstSample, consumer)
+        return consumer.summary()
+    }
+
+    /**
+     * Seeks to [firstSample] on a seekable channel and decodes into the
+     * channel listener API.
+     */
+    fun decode(input: SeekableByteChannel, firstSample: Long, listener: FlacChannelDecodeListener): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacChannelPcmHandler { chunk -> listener.onChannelPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, firstSample, consumer)
         return consumer.summary()
     }
 
@@ -286,6 +611,27 @@ class FlacDecoder {
     }
 
     /**
+     * Seeks to [firstSample] on a seekable channel and decodes at most
+     * [maxFrames] into the channel listener API.
+     */
+    fun decode(
+        input: SeekableByteChannel,
+        firstSample: Long,
+        maxFrames: Long,
+        listener: FlacChannelDecodeListener
+    ): FlacDecodeSummary {
+        val consumer = ChannelForwardingPcmConsumer(
+            firstFrameIndex = firstSample,
+            maxFrames = maxFrames,
+            onStreamInfo = FlacStreamInfoHandler { info -> listener.onStreamInfo(info) },
+            onChunk = FlacChannelPcmHandler { chunk -> listener.onChannelPcm(chunk) },
+            onComplete = FlacDecodeCompleteHandler { summary -> listener.onComplete(summary) }
+        )
+        decode(input, firstSample, maxFrames, consumer)
+        return consumer.summary()
+    }
+
+    /**
      * Decodes a native FLAC file and streams PCM data into [consumer].
      *
      * The call blocks until decoding completes or throws an exception.
@@ -294,6 +640,28 @@ class FlacDecoder {
         val normalizedPath = validateNativeFlacPath(path)
         FlacNativeLoader.load()
         NativeBindings.decodeFile(normalizedPath.absolutePathString(), consumer)
+    }
+
+    /**
+     * Decodes a native FLAC stream and streams PCM data into [consumer].
+     *
+     * The stream is read sequentially and is not closed by this method.
+     */
+    fun decode(input: InputStream, consumer: PcmConsumer) {
+        FlacNativeLoader.load()
+        NativeBindings.decodeStream(input, consumer)
+    }
+
+    /**
+     * Decodes a seekable native FLAC channel and streams PCM data into
+     * [consumer].
+     *
+     * The channel is not closed by this method. libFLAC byte offsets are
+     * relative to the channel position when the call starts.
+     */
+    fun decode(input: SeekableByteChannel, consumer: PcmConsumer) {
+        FlacNativeLoader.load()
+        NativeBindings.decodeChannel(input, consumer)
     }
 
     /**
@@ -307,6 +675,16 @@ class FlacDecoder {
     }
 
     /**
+     * Seeks to [firstSample] on a seekable channel, then streams PCM data into
+     * [consumer].
+     */
+    fun decode(input: SeekableByteChannel, firstSample: Long, consumer: PcmConsumer) {
+        require(firstSample >= 0L) { "First sample must be non-negative." }
+        FlacNativeLoader.load()
+        NativeBindings.decodeChannelFrom(input, firstSample, consumer)
+    }
+
+    /**
      * Seeks to [firstSample], then streams at most [maxFrames] PCM frames into
      * [consumer].
      */
@@ -315,6 +693,27 @@ class FlacDecoder {
         val normalizedPath = validateNativeFlacPath(path)
         FlacNativeLoader.load()
         NativeBindings.decodeFileRange(normalizedPath.absolutePathString(), firstSample, maxFrames, consumer)
+    }
+
+    /**
+     * Seeks to [firstSample] on a seekable channel, then streams at most
+     * [maxFrames] PCM frames into [consumer].
+     */
+    fun decode(input: SeekableByteChannel, firstSample: Long, maxFrames: Long, consumer: PcmConsumer) {
+        validateDecodeRange(firstSample, maxFrames)
+        FlacNativeLoader.load()
+        NativeBindings.decodeChannelRange(input, firstSample, maxFrames, consumer)
+    }
+
+    private fun readChannelStreamInfo(input: SeekableByteChannel): FlacStreamInfo {
+        val originalPosition = input.position()
+        val consumer = BufferingPcmConsumer(firstFrameIndex = 0, maxFrames = 0)
+        try {
+            NativeBindings.decodeChannelRange(input, 0, 0, consumer)
+            return consumer.toDecodedAudio().streamInfo
+        } finally {
+            input.position(originalPosition)
+        }
     }
 }
 

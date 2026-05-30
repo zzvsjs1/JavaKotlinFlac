@@ -33,13 +33,14 @@ fun interface FlacMetadataEditAction {
 class FlacMetadataEditSession internal constructor(
     val originalMetadata: FlacMetadata
 ) {
-    private val blocks = originalMetadata.blocks.toMutableList()
+    private val mutableBlocks = originalMetadata.blocks.toMutableList()
 
-    fun blocks(): List<FlacMetadataBlock> = blocks.toList()
+    val blocks: List<FlacMetadataBlock>
+        get() = mutableBlocks.toList()
 
     fun replaceBlocks(blocks: List<FlacMetadataBlock>): FlacMetadataEditSession {
-        this.blocks.clear()
-        this.blocks.addAll(blocks)
+        mutableBlocks.clear()
+        mutableBlocks.addAll(blocks)
         return this
     }
 
@@ -48,9 +49,9 @@ class FlacMetadataEditSession internal constructor(
             return removeVorbisComments()
         }
 
-        val existingIndex = blocks.indexOfFirst { block -> block is FlacMetadataBlock.VorbisComment }
+        val existingIndex = mutableBlocks.indexOfFirst { block -> block is FlacMetadataBlock.VorbisComment }
         val vendor = when {
-            existingIndex >= 0 -> (blocks[existingIndex] as FlacMetadataBlock.VorbisComment).comment.vendor
+            existingIndex >= 0 -> (mutableBlocks[existingIndex] as FlacMetadataBlock.VorbisComment).comment.vendor
             originalMetadata.vorbisComment != null -> originalMetadata.vorbisComment.vendor
             else -> ""
         }
@@ -62,30 +63,30 @@ class FlacMetadataEditSession internal constructor(
         )
 
         if (existingIndex >= 0) {
-            blocks[existingIndex] = block
+            mutableBlocks[existingIndex] = block
         } else {
-            blocks.add(0, block)
+            mutableBlocks.add(0, block)
         }
         return this
     }
 
     fun removeVorbisComments(): FlacMetadataEditSession {
-        blocks.removeAll { block -> block is FlacMetadataBlock.VorbisComment }
+        mutableBlocks.removeAll { block -> block is FlacMetadataBlock.VorbisComment }
         return this
     }
 
     fun removePictures(): FlacMetadataEditSession {
-        blocks.removeAll { block -> block is FlacMetadataBlock.Picture }
+        mutableBlocks.removeAll { block -> block is FlacMetadataBlock.Picture }
         return this
     }
 
     fun addPicture(picture: FlacPicture): FlacMetadataEditSession {
-        blocks.add(FlacMetadataBlock.Picture(picture))
+        mutableBlocks.add(FlacMetadataBlock.Picture(picture))
         return this
     }
 
     internal fun toEncodingMetadata(): FlacEncodingMetadata {
-        return FlacEncodingMetadata(blocks = blocks.toList())
+        return FlacEncodingMetadata(blocks = mutableBlocks.toList())
     }
 }
 
@@ -103,22 +104,14 @@ class FlacMetadataEditor {
     fun edit(path: Path, options: FlacMetadataEditOptions, action: FlacMetadataEditAction) {
         val session = FlacMetadataEditSession(FlacMetadataReader().read(path))
         action.edit(session)
-        write(path, session.toEncodingMetadata(), options)
+        replace(path, session.toEncodingMetadata(), options)
     }
 
-    fun rewrite(path: Path, transform: FlacMetadataTransformer) {
-        rewrite(path, FlacMetadataEditOptions(), transform)
+    fun replace(path: Path, metadata: FlacEncodingMetadata) {
+        replace(path, metadata, FlacMetadataEditOptions())
     }
 
-    fun rewrite(path: Path, options: FlacMetadataEditOptions, transform: FlacMetadataTransformer) {
-        write(path, transform.transform(FlacMetadataReader().read(path)), options)
-    }
-
-    fun write(path: Path, metadata: FlacEncodingMetadata) {
-        write(path, metadata, FlacMetadataEditOptions())
-    }
-
-    fun write(path: Path, metadata: FlacEncodingMetadata, options: FlacMetadataEditOptions) {
+    fun replace(path: Path, metadata: FlacEncodingMetadata, options: FlacMetadataEditOptions) {
         val normalizedPath = validateNativeFlacPath(path)
         validateFlacEncodingMetadata(metadata)
 
@@ -130,19 +123,6 @@ class FlacMetadataEditor {
             options.preserveFileStats
         )
     }
-
-    fun writeBlocks(path: Path, blocks: List<FlacMetadataBlock>) {
-        writeBlocks(path, blocks, FlacMetadataEditOptions())
-    }
-
-    fun writeBlocks(path: Path, blocks: List<FlacMetadataBlock>, options: FlacMetadataEditOptions) {
-        write(path, FlacEncodingMetadata(blocks = blocks), options)
-    }
-}
-
-/** Java-friendly callback for whole-metadata rewrite operations. */
-fun interface FlacMetadataTransformer {
-    fun transform(metadata: FlacMetadata): FlacEncodingMetadata
 }
 
 private fun FlacEncodingMetadata.toNativeEditRequest(): NativeMetadataEditRequest {

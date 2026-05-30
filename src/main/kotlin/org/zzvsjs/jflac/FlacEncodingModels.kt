@@ -70,11 +70,11 @@ fun FlacMetadata.toEncodingMetadata(): FlacEncodingMetadata {
 }
 
 /**
- * Active file encoder session that accepts interleaved signed PCM frames.
+ * Active encoder session that accepts interleaved signed PCM frames.
  *
  * The session owns a native encoder handle. Callers should always finish the
- * session, either explicitly or through `use`, so libFLAC can flush and close
- * the output file deterministically.
+ * session, either explicitly or through `use`, so libFLAC can flush the output
+ * deterministically.
  */
 interface FlacEncodingSession : AutoCloseable {
     /**

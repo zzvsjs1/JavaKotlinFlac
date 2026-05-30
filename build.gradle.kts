@@ -138,6 +138,7 @@ val requiredFlacDllSymbols = listOf(
     "FLAC__stream_decoder_new",
     "FLAC__stream_decoder_delete",
     "FLAC__stream_decoder_init_file",
+    "FLAC__stream_decoder_init_stream",
     "FLAC__stream_decoder_process_until_end_of_metadata",
     "FLAC__stream_decoder_seek_absolute",
     "FLAC__stream_decoder_process_single",
@@ -157,6 +158,7 @@ val requiredFlacDllSymbols = listOf(
     "FLAC__stream_encoder_set_total_samples_estimate",
     "FLAC__stream_encoder_set_metadata",
     "FLAC__stream_encoder_init_file",
+    "FLAC__stream_encoder_init_stream",
     "FLAC__stream_encoder_process_interleaved",
     "FLAC__stream_encoder_finish",
     "FLAC__stream_encoder_get_resolved_state_string",
@@ -513,12 +515,10 @@ val consumerSmokeTest by tasks.registering(Exec::class) {
 
     doFirst {
         val consumerProjectDir = file("consumer-smoke-test")
-        val sampleFile = file("music.flac")
+        val sampleFile = layout.buildDirectory.file("consumer-smoke/music.flac").get().asFile
+        sampleFile.parentFile.mkdirs()
         require(consumerProjectDir.isDirectory) {
             "Missing consumer smoke test project at ${consumerProjectDir.displayPath()}."
-        }
-        require(sampleFile.isFile) {
-            "Missing consumer smoke test fixture at ${sampleFile.displayPath()}."
         }
 
         commandLine(

@@ -4,14 +4,19 @@ import org.zzvsjs.jflac.FlacAudioFormat;
 import org.zzvsjs.jflac.FlacDecodedAudio;
 import org.zzvsjs.jflac.FlacDecoder;
 import org.zzvsjs.jflac.FlacEncoder;
+import org.zzvsjs.jflac.FlacEncodingMetadata;
 import org.zzvsjs.jflac.FlacMetadataEditor;
 import org.zzvsjs.jflac.FlacMetadata;
 import org.zzvsjs.jflac.FlacMetadataReader;
 import org.zzvsjs.jflac.FlacNativeLoader;
 import org.zzvsjs.jflac.FlacStreamInfo;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -27,7 +32,7 @@ public final class ConsumerSmokeTest {
 
         Path sample = Path.of(args[0]).toAbsolutePath().normalize();
         if (!Files.isRegularFile(sample)) {
-            throw new IllegalArgumentException("Sample FLAC file does not exist: " + sample);
+            generateSampleFixture(sample);
         }
 
         Path nativeDir = FlacNativeLoader.INSTANCE.load();
@@ -66,6 +71,29 @@ public final class ConsumerSmokeTest {
         );
     }
 
+    private static void generateSampleFixture(Path sample) throws Exception {
+        Path parent = sample.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+
+        int frames = 44_100;
+        FlacAudioFormat format = new FlacAudioFormat(
+                44_100,
+                2,
+                16,
+                Long.valueOf(frames)
+        );
+        int[] samples = deterministicPcm(frames, format);
+
+        new FlacEncoder().encode(
+                sample,
+                format,
+                samples,
+                new FlacEncodingMetadata(Map.of("TITLE", List.of("Consumer smoke fixture")))
+        );
+    }
+
     private static void verifyEncodeRoundTrip() throws Exception {
         int frames = 32;
         FlacAudioFormat format = new FlacAudioFormat(
@@ -76,11 +104,16 @@ public final class ConsumerSmokeTest {
         );
         int[] samples = deterministicPcm(frames, format);
         Path output = Files.createTempFile("jflac-consumer-encode", ".flac");
+        Path channelOutput = Files.createTempFile("jflac-consumer-channel-encode", ".flac");
 
         try {
             new FlacEncoder().encode(output, format, samples);
             new FlacMetadataEditor().edit(output, session ->
-                    session.setVorbisComments(Map.of("TITLE", List.of("Consumer smoke")))
+                    session.setVorbisComments(Map.of("TITLE", List.of("Consumer edit")))
+            );
+            new FlacMetadataEditor().replace(
+                    output,
+                    new FlacEncodingMetadata(Map.of("TITLE", List.of("Consumer smoke")))
             );
 
             FlacMetadata encodedMetadata = new FlacMetadataReader().read(output);
@@ -113,8 +146,39 @@ public final class ConsumerSmokeTest {
             if (!Arrays.equals(samples, encodedAudio.getInterleavedSamples())) {
                 throw new IllegalStateException("Encoded PCM data did not round-trip exactly.");
             }
+
+            try (SeekableByteChannel inputChannel = Files.newByteChannel(output, StandardOpenOption.READ)) {
+                FlacDecodedAudio channelDecoded = new FlacDecoder().decode(inputChannel, 0L, frames);
+                if (!Arrays.equals(samples, channelDecoded.getInterleavedSamples())) {
+                    throw new IllegalStateException("Seekable channel decode did not round-trip exactly.");
+                }
+            }
+
+            try (SeekableByteChannel outputChannel = Files.newByteChannel(
+                    channelOutput,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE
+            )) {
+                new FlacEncoder().encode(outputChannel, format, samples);
+            }
+            FlacMetadata channelMetadata = new FlacMetadataReader().read(channelOutput);
+            if (channelMetadata.getStreamInfo().getTotalSamples() != frames) {
+                throw new IllegalStateException("Seekable channel encode did not back-patch STREAMINFO.");
+            }
+
+            ByteArrayOutputStream streamOutput = new ByteArrayOutputStream();
+            new FlacEncoder().encode(streamOutput, format, samples);
+            FlacDecodedAudio streamDecoded = new FlacDecoder().decode(
+                    new ByteArrayInputStream(streamOutput.toByteArray())
+            );
+            if (!Arrays.equals(samples, streamDecoded.getInterleavedSamples())) {
+                throw new IllegalStateException("Stream FLAC encode/decode did not round-trip exactly.");
+            }
         } finally {
             Files.deleteIfExists(output);
+            Files.deleteIfExists(channelOutput);
         }
     }
 
