@@ -72,6 +72,52 @@ dependencies {
 }
 ```
 
+## Runnable Examples
+
+The `examples` project contains small programs that demonstrate the public API
+against a FLAC file supplied by the user. They read metadata, decode a bounded
+range, stream-decode through `InputStream`, reuse a seekable-channel decoder,
+encode to file/`OutputStream`/`SeekableByteChannel`, and edit metadata on a
+copy of the input file.
+
+Run the Java example from the repository root:
+
+```powershell
+.\gradlew.bat :examples:run --args="music.flac"
+```
+
+Run the Kotlin example:
+
+```powershell
+.\gradlew.bat :examples:runKotlinFeatureDemo --args="music.flac"
+```
+
+Build an installed command-line program:
+
+```powershell
+.\gradlew.bat :examples:installDist
+.\examples\build\install\jflac-feature-demo\bin\jflac-feature-demo.bat music.flac
+```
+
+The examples write generated FLAC files and edited metadata copies under
+`build/jflac-feature-demo/`. They do not modify the input file directly.
+
+## Choosing an I/O API
+
+Pick the target that matches the operations the caller needs:
+
+| Target | Decode | Encode | Best fit | Notes |
+| --- | --- | --- | --- | --- |
+| `Path` | Whole file, chunked decode, ranged decode, reusable decode sessions | `open(...)` sessions and one-shot `encode(...)` | Normal files | Strongest path for exact final STREAMINFO because libFLAC owns a seekable file target. Metadata reading and editing are file-based. |
+| `InputStream` | Whole stream only | Not applicable | Network responses, classpath resources, existing Java streams | Sequential-only in V1. No range decode, no reusable session, no metadata editor. The stream is not closed by jflac. |
+| `OutputStream` | Not applicable | Sequential `open(...)` sessions and one-shot `encode(...)` | HTTP responses, byte-array streams, caller-managed streams | Produces valid native FLAC, but libFLAC cannot seek back to patch final STREAMINFO statistics. The stream is flushed on finish but not closed. |
+| `SeekableByteChannel` | Whole channel, ranged decode, reusable decode sessions | `open(...)` sessions and one-shot `encode(...)` with seek/tell callbacks | Embedded FLAC data, custom storage, caller-managed seekable targets | The current channel position is treated as byte offset zero. The channel is not closed by jflac. |
+
+`InputStream`, `OutputStream`, and `SeekableByteChannel` overloads are standard
+Java types, so they are usable from both Java and Kotlin. Session objects are
+stateful; do not use the same decode or encode session concurrently from
+multiple threads.
+
 ## Read Metadata
 
 ```kotlin
@@ -144,6 +190,21 @@ val summary = FlacDecoder().decodeInterleaved(
 println(summary.totalFrames)
 ```
 
+Decode model details:
+
+- `decode(...)` returns `FlacDecodedAudio` and buffers all decoded PCM in one
+  JVM `IntArray`. Prefer streaming callbacks for long files.
+- `decodeInterleaved(...)` emits `FlacInterleavedPcmChunk` values. Samples are
+  ordered by frame, then channel. For stereo, the layout is left, right, left,
+  right, and so on.
+- `decodeChannels(...)` emits `FlacChannelPcmChunk` values. Each channel gets
+  its own `IntArray`; this is friendlier for per-channel processing but requires
+  an extra copy from the native interleaved callback layout.
+- `firstSample` is a zero-based PCM frame index in the original FLAC stream.
+  `maxFrames` is a frame count, not an interleaved sample count.
+- A range that starts exactly at end-of-stream completes with zero PCM frames.
+  A range that starts after end-of-stream throws `FlacDecodeException`.
+
 Reuse one native decoder for repeated ranges:
 
 ```kotlin
@@ -181,6 +242,10 @@ fun inspect(input: InputStream) {
 }
 ```
 
+Plain streams are decoded with `FLAC__stream_decoder_init_stream` and only a
+read callback. Because there is no seek/tell/length contract, the stream
+overloads intentionally do not expose range decode or reusable sessions.
+
 Decode seekable native FLAC channels when callers need ranges or reusable
 sessions without passing a file path:
 
@@ -201,6 +266,11 @@ fun inspectRange(input: SeekableByteChannel) {
     }
 }
 ```
+
+Seekable channel decode also uses `FLAC__stream_decoder_init_stream`, but
+provides read, seek, tell, length, and EOF callbacks. The channel position when
+the decode or session is opened becomes the FLAC stream origin, so callers can
+decode FLAC data embedded after a prefix in a larger channel.
 
 ## Encode
 
@@ -228,6 +298,19 @@ FlacEncoder().encode(
     )
 )
 ```
+
+Encode model details:
+
+- PCM input is signed integer PCM in interleaved frame order.
+- `FlacAudioFormat.channels` determines how `samples` is split into frames.
+  The sample array length must equal `frames * channels` for session writes.
+- `totalSamplesEstimate` is optional. It lets libFLAC write a known total when
+  the caller already knows it, but non-seekable `OutputStream` output still
+  cannot receive every final back-patched STREAMINFO statistic.
+- Use `open(...)` when PCM arrives in several chunks. Use one-shot
+  `encode(...)` when the caller already has a complete interleaved buffer.
+- Metadata is attached when the encoder is opened. It cannot be changed after
+  audio frames start because FLAC metadata is written before the frames.
 
 Encode sequential native FLAC streams:
 
@@ -286,6 +369,54 @@ For exact metadata round trips, read `FlacMetadata.blocks` and pass it through
 order; libFLAC still generates STREAMINFO and its own Vorbis vendor string for
 the new encoded audio.
 
+## Java Callers
+
+Kotlin functional handlers are exposed as Java SAM interfaces, and listener
+adapters are provided for callers that prefer subclassing.
+
+```java
+import org.zzvsjs.jflac.FlacDecodeAdapter;
+import org.zzvsjs.jflac.FlacDecodeSummary;
+import org.zzvsjs.jflac.FlacDecoder;
+import org.zzvsjs.jflac.FlacInterleavedPcmChunk;
+
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+try (InputStream input = Files.newInputStream(Path.of("music.flac"))) {
+    FlacDecodeSummary summary = new FlacDecoder().decode(
+        input,
+        new FlacDecodeAdapter() {
+            @Override
+            public void onInterleavedPcm(FlacInterleavedPcmChunk chunk) {
+                System.out.println(chunk.getFrames());
+            }
+        }
+    );
+
+    System.out.println(summary.getTotalFrames());
+}
+```
+
+Java encoder use can stay close to normal `java.io` code:
+
+```java
+import org.zzvsjs.jflac.FlacAudioFormat;
+import org.zzvsjs.jflac.FlacEncoder;
+
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+int[] samples = new int[44100 * 2];
+FlacAudioFormat format = new FlacAudioFormat(44100, 2, 16);
+
+try (OutputStream output = Files.newOutputStream(Path.of("out.flac"))) {
+    new FlacEncoder().encode(output, format, samples);
+}
+```
+
 ## Edit Existing Metadata
 
 Existing-file metadata edits are separate from encoding. The editor updates the
@@ -330,6 +461,11 @@ By default, the editor allows libFLAC to use existing padding so small edits can
 avoid rewriting the whole file. If the new metadata does not fit, libFLAC may
 rewrite the file internally while still preserving the audio stream.
 
+The metadata editor remains file-only. It intentionally does not accept
+`InputStream`, `OutputStream`, or `SeekableByteChannel` because libFLAC's safe
+metadata-chain editing API works on files and can rewrite the file when padding
+is not enough.
+
 ## Native Design
 
 The public Kotlin and Java API does not expose native pointers. Reusable
@@ -350,6 +486,14 @@ Whole-file decode collects all decoded PCM into memory. For large files, prefer
 the streaming decode API or ranged decode API so the JVM only receives bounded
 chunks.
 
+Stream and channel callbacks are synchronous. If Java code throws while reading,
+writing, or consuming PCM, the native callback aborts libFLAC and preserves the
+original Java exception instead of replacing it with a generic native failure.
+
+File and channel decoder sessions keep one libFLAC decoder alive for repeated
+seek operations. Closing the session releases the native handle; using a closed
+or stale handle is treated as an invalid native session.
+
 ## Current Limitations
 
 - Native packaging is currently Windows x64 only. The resource layout is ready
@@ -359,6 +503,9 @@ chunks.
 - `InputStream` and `OutputStream` APIs are sequential-only. File and
   `SeekableByteChannel` decode APIs support ranges and reusable seek sessions.
   Metadata reading and editing remain file-based.
+- Stream and channel overloads do not close caller-provided Java objects.
+  Callers should use try-with-resources or Kotlin `use` for their own streams
+  and channels.
 - Metadata reading exposes STREAMINFO, Vorbis comments, pictures, APPLICATION
   blocks, SEEKTABLE blocks, CUESHEET blocks, PADDING blocks, and raw unknown
   blocks. `FlacMetadata.blocks` preserves the physical order of non-STREAMINFO

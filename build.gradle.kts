@@ -1,3 +1,4 @@
+import org.gradle.external.javadoc.StandardJavadocDocletOptions
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.gradle.api.publish.maven.tasks.PublishToMavenLocal
@@ -10,6 +11,7 @@ import java.util.zip.ZipFile
 
 plugins {
     kotlin("jvm") version "2.0.20"
+    id("org.jetbrains.dokka-javadoc") version "2.2.0"
     `maven-publish`
 }
 
@@ -189,10 +191,22 @@ val requiredPackagedJarEntries = listOf(
     "META-INF/LICENSE",
     "META-INF/THIRD_PARTY_NOTICES.md"
 )
+val requiredJavadocPublicApiNames = listOf(
+    "FlacDecoder",
+    "FlacEncoder",
+    "FlacMetadataEditor",
+    "FlacMetadataReader"
+)
 
 java {
     withSourcesJar()
-    withJavadocJar()
+}
+
+val javadocJar by tasks.registering(Jar::class) {
+    group = "documentation"
+    description = "Builds a Kotlin-aware Javadoc JAR from Dokka output."
+    archiveClassifier.set("javadoc")
+    from(tasks.dokkaGeneratePublicationJavadoc.flatMap { it.outputDirectory })
 }
 
 val downloadFlacSource by tasks.registering {
@@ -466,6 +480,50 @@ val verifyPackagedJar by tasks.registering {
     }
 }
 
+val verifyJavadocJar by tasks.registering {
+    group = "verification"
+    description = "Verifies that the Javadoc JAR contains Kotlin public API documentation encoded as UTF-8 HTML."
+    dependsOn(tasks.named("javadocJar"))
+
+    val javadocJar = tasks.named<Jar>("javadocJar").flatMap { it.archiveFile }
+    inputs.file(javadocJar)
+
+    doLast {
+        ZipFile(javadocJar.get().asFile).use { jar ->
+            val htmlDocuments = jar.entries().asSequence()
+                .filter { entry -> !entry.isDirectory && entry.name.endsWith(".html") }
+                .associate { entry ->
+                    entry.name to jar.getInputStream(entry).reader(Charsets.UTF_8).use { reader -> reader.readText() }
+                }
+
+            check(htmlDocuments.isNotEmpty()) {
+                "Javadoc JAR does not contain any HTML files."
+            }
+
+            val joinedHtml = htmlDocuments.values.joinToString(separator = "\n")
+            val missingApiNames = requiredJavadocPublicApiNames.filterNot(joinedHtml::contains)
+            check(missingApiNames.isEmpty()) {
+                buildString {
+                    appendLine("Javadoc JAR does not include the expected public Kotlin API names.")
+                    appendLine("Missing names:")
+                    missingApiNames.forEach { apiName -> appendLine(" - $apiName") }
+                }
+            }
+
+            val htmlWithoutUtf8 = htmlDocuments
+                .filterValues { html -> !html.contains("charset", ignoreCase = true) || !html.contains("utf-8", ignoreCase = true) }
+                .keys
+                .sorted()
+            check(htmlWithoutUtf8.isEmpty()) {
+                buildString {
+                    appendLine("Javadoc JAR contains HTML files without an explicit UTF-8 charset.")
+                    htmlWithoutUtf8.forEach { entry -> appendLine(" - $entry") }
+                }
+            }
+        }
+    }
+}
+
 tasks.processResources {
     if (isWindows) {
         dependsOn(syncNativeResources)
@@ -480,6 +538,11 @@ tasks.withType<JavaCompile>().configureEach {
 
 tasks.withType<Javadoc>().configureEach {
     options.encoding = "UTF-8"
+    (options as StandardJavadocDocletOptions).apply {
+        charSet = "UTF-8"
+        docEncoding = "UTF-8"
+        locale = "en_US"
+    }
 }
 
 tasks.withType<KotlinJvmCompile>().configureEach {
@@ -495,6 +558,7 @@ tasks.test {
 
 tasks.check {
     dependsOn(verifyPackagedJar)
+    dependsOn(verifyJavadocJar)
 }
 
 tasks.withType<PublishToMavenLocal>().configureEach {
@@ -533,6 +597,7 @@ publishing {
     publications {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
+            artifact(javadocJar)
             artifactId = "jflac"
 
             pom {
