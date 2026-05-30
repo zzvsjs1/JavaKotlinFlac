@@ -14,6 +14,17 @@ data class FlacAudioFormat @JvmOverloads constructor(
 )
 
 /**
+ * Container used by encoder output.
+ *
+ * Native FLAC is the existing `.flac` bitstream. Ogg FLAC wraps the same FLAC
+ * frames in Ogg pages and is selected explicitly instead of by file extension.
+ */
+enum class FlacEncodingContainer(internal val nativeCode: Int) {
+    NATIVE(0),
+    OGG(1)
+}
+
+/**
  * High-level tuning knobs exposed for the first encoder iteration.
  *
  * The wrapper intentionally exposes only the stable options that map cleanly to
@@ -23,7 +34,9 @@ data class FlacEncodingOptions @JvmOverloads constructor(
     val compressionLevel: Int = 5,
     val verify: Boolean = true,
     val streamableSubset: Boolean = true,
-    val blockSize: Int? = null
+    val blockSize: Int? = null,
+    val container: FlacEncodingContainer = FlacEncodingContainer.NATIVE,
+    val oggSerialNumber: Int? = null
 )
 
 /**

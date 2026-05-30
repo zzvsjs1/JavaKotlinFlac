@@ -59,8 +59,11 @@ val jniPlatformIncludeDir = jniIncludeDir.resolve("win32")
 val isWindows = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
 val msvcRuntimeLibrary = "MultiThreaded"
 val msvcRuntimeCmakeOptions = listOf(
-    "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=$msvcRuntimeLibrary"
+)
+val legacyMsvcRuntimeCmakeOptions = listOf(
+    "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+    *msvcRuntimeCmakeOptions.toTypedArray()
 )
 
 fun File.cmdPath(): String = absolutePath.replace("/", "\\")
@@ -170,9 +173,12 @@ val requiredFlacDllSymbols = listOf(
     "FLAC__stream_encoder_set_compression_level",
     "FLAC__stream_encoder_set_blocksize",
     "FLAC__stream_encoder_set_total_samples_estimate",
+    "FLAC__stream_encoder_set_ogg_serial_number",
     "FLAC__stream_encoder_set_metadata",
     "FLAC__stream_encoder_init_file",
+    "FLAC__stream_encoder_init_ogg_file",
     "FLAC__stream_encoder_init_stream",
+    "FLAC__stream_encoder_init_ogg_stream",
     "FLAC__stream_encoder_process_interleaved",
     "FLAC__stream_encoder_finish",
     "FLAC__stream_encoder_get_resolved_state_string",
@@ -326,7 +332,7 @@ val buildOggNative by tasks.registering(Exec::class) {
                     "-G Ninja",
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DCMAKE_MAKE_PROGRAM=\"${resolvedNinjaExe.cmdPath()}\"",
-                    *msvcRuntimeCmakeOptions.toTypedArray(),
+                    *legacyMsvcRuntimeCmakeOptions.toTypedArray(),
                     "-DBUILD_SHARED_LIBS=OFF",
                     "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=\"${oggBuildDir.get().dir("lib").asFile.cmdPath()}\"",
                     "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=\"${oggBuildDir.get().dir("bin").asFile.cmdPath()}\"",

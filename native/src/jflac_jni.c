@@ -130,15 +130,24 @@ typedef struct FlacApi
     FLAC__bool (*stream_encoder_set_compression_level)(FLAC__StreamEncoder *encoder, uint32_t value);
     FLAC__bool (*stream_encoder_set_blocksize)(FLAC__StreamEncoder *encoder, uint32_t value);
     FLAC__bool (*stream_encoder_set_total_samples_estimate)(FLAC__StreamEncoder *encoder, FLAC__uint64 value);
+    FLAC__bool (*stream_encoder_set_ogg_serial_number)(FLAC__StreamEncoder *encoder, long serial_number);
     FLAC__bool (*stream_encoder_set_metadata)(FLAC__StreamEncoder *encoder, FLAC__StreamMetadata **metadata,
                                               uint32_t num_blocks);
     FLAC__StreamEncoderInitStatus (*stream_encoder_init_file)(FLAC__StreamEncoder *encoder, const char *filename,
                                                               FLAC__StreamEncoderProgressCallback progress_callback,
                                                               void *client_data);
+    FLAC__StreamEncoderInitStatus (*stream_encoder_init_ogg_file)(
+        FLAC__StreamEncoder *encoder, const char *filename, FLAC__StreamEncoderProgressCallback progress_callback,
+        void *client_data);
     FLAC__StreamEncoderInitStatus (*stream_encoder_init_stream)(
         FLAC__StreamEncoder *encoder, FLAC__StreamEncoderWriteCallback write_callback,
         FLAC__StreamEncoderSeekCallback seek_callback, FLAC__StreamEncoderTellCallback tell_callback,
         FLAC__StreamEncoderMetadataCallback metadata_callback, void *client_data);
+    FLAC__StreamEncoderInitStatus (*stream_encoder_init_ogg_stream)(
+        FLAC__StreamEncoder *encoder, FLAC__StreamEncoderReadCallback read_callback,
+        FLAC__StreamEncoderWriteCallback write_callback, FLAC__StreamEncoderSeekCallback seek_callback,
+        FLAC__StreamEncoderTellCallback tell_callback, FLAC__StreamEncoderMetadataCallback metadata_callback,
+        void *client_data);
     FLAC__bool (*stream_encoder_process_interleaved)(FLAC__StreamEncoder *encoder, const FLAC__int32 buffer[],
                                                      uint32_t samples);
     FLAC__bool (*stream_encoder_finish)(FLAC__StreamEncoder *encoder);
@@ -284,9 +293,12 @@ static BOOL CALLBACK init_flac_api(PINIT_ONCE init_once, PVOID parameter, PVOID 
     RESOLVE(stream_encoder_set_compression_level, FLAC__stream_encoder_set_compression_level);
     RESOLVE(stream_encoder_set_blocksize, FLAC__stream_encoder_set_blocksize);
     RESOLVE(stream_encoder_set_total_samples_estimate, FLAC__stream_encoder_set_total_samples_estimate);
+    RESOLVE(stream_encoder_set_ogg_serial_number, FLAC__stream_encoder_set_ogg_serial_number);
     RESOLVE(stream_encoder_set_metadata, FLAC__stream_encoder_set_metadata);
     RESOLVE(stream_encoder_init_file, FLAC__stream_encoder_init_file);
+    RESOLVE(stream_encoder_init_ogg_file, FLAC__stream_encoder_init_ogg_file);
     RESOLVE(stream_encoder_init_stream, FLAC__stream_encoder_init_stream);
+    RESOLVE(stream_encoder_init_ogg_stream, FLAC__stream_encoder_init_ogg_stream);
     RESOLVE(stream_encoder_process_interleaved, FLAC__stream_encoder_process_interleaved);
     RESOLVE(stream_encoder_finish, FLAC__stream_encoder_finish);
     RESOLVE(stream_encoder_get_resolved_state_string, FLAC__stream_encoder_get_resolved_state_string);
@@ -442,6 +454,28 @@ static FLAC__StreamDecoderInitStatus init_stream_decoder_for_container(
                : g_flac_api.stream_decoder_init_stream(decoder, read_callback, seek_callback, tell_callback,
                                                        length_callback, eof_callback, write_callback,
                                                        metadata_callback, error_callback, client_data);
+}
+
+static FLAC__StreamEncoderInitStatus init_file_encoder_for_container(
+    FLAC__StreamEncoder *encoder, const char *filename, FLAC__StreamEncoderProgressCallback progress_callback,
+    void *client_data, jint container)
+{
+    return container == JFLAC_CONTAINER_OGG
+               ? g_flac_api.stream_encoder_init_ogg_file(encoder, filename, progress_callback, client_data)
+               : g_flac_api.stream_encoder_init_file(encoder, filename, progress_callback, client_data);
+}
+
+static FLAC__StreamEncoderInitStatus init_stream_encoder_for_container(
+    FLAC__StreamEncoder *encoder, FLAC__StreamEncoderReadCallback read_callback,
+    FLAC__StreamEncoderWriteCallback write_callback, FLAC__StreamEncoderSeekCallback seek_callback,
+    FLAC__StreamEncoderTellCallback tell_callback, FLAC__StreamEncoderMetadataCallback metadata_callback,
+    void *client_data, jint container)
+{
+    return container == JFLAC_CONTAINER_OGG
+               ? g_flac_api.stream_encoder_init_ogg_stream(encoder, read_callback, write_callback, seek_callback,
+                                                           tell_callback, metadata_callback, client_data)
+               : g_flac_api.stream_encoder_init_stream(encoder, write_callback, seek_callback, tell_callback,
+                                                       metadata_callback, client_data);
 }
 
 /*
@@ -3818,6 +3852,7 @@ typedef struct EncodeContext
      * libFLAC can patch final STREAMINFO fields after PCM frames are written.
      */
     jobject output_channel;
+    jmethodID channel_read;
     jmethodID channel_write;
     jmethodID channel_position;
     jmethodID channel_seek;
@@ -5306,18 +5341,21 @@ static int prepare_encode_output_channel(JNIEnv *env, EncodeContext *context, jo
         return 0;
     }
 
+    jclass readable_class = (*env)->FindClass(env, "java/nio/channels/ReadableByteChannel");
     jclass writable_class = (*env)->FindClass(env, "java/nio/channels/WritableByteChannel");
     jclass seekable_class = (*env)->FindClass(env, "java/nio/channels/SeekableByteChannel");
-    if (writable_class == NULL || seekable_class == NULL)
+    if (readable_class == NULL || writable_class == NULL || seekable_class == NULL)
     {
         return 0;
     }
 
+    context->channel_read = (*env)->GetMethodID(env, readable_class, "read", "(Ljava/nio/ByteBuffer;)I");
     context->channel_write = (*env)->GetMethodID(env, writable_class, "write", "(Ljava/nio/ByteBuffer;)I");
     context->channel_position = (*env)->GetMethodID(env, seekable_class, "position", "()J");
     context->channel_seek =
         (*env)->GetMethodID(env, seekable_class, "position", "(J)Ljava/nio/channels/SeekableByteChannel;");
-    if (context->channel_write == NULL || context->channel_position == NULL || context->channel_seek == NULL)
+    if (context->channel_read == NULL || context->channel_write == NULL || context->channel_position == NULL ||
+        context->channel_seek == NULL)
     {
         return 0;
     }
@@ -5346,6 +5384,68 @@ static int prepare_encode_output_channel(JNIEnv *env, EncodeContext *context, jo
     }
 
     return 1;
+}
+
+/*
+ * Ogg FLAC channel encoders need a read-back callback when seek/tell are
+ * available so libFLAC can update Ogg metadata after audio frames are written.
+ */
+static FLAC__StreamEncoderReadStatus encode_channel_read_callback(const FLAC__StreamEncoder *encoder,
+                                                                  FLAC__byte buffer[], size_t *bytes,
+                                                                  void *client_data)
+{
+    (void)encoder;
+    EncodeContext *context = (EncodeContext *)client_data;
+    JNIEnv *env = encode_context_env(context);
+    if (env == NULL || context->output_channel == NULL || context->channel_read == NULL || bytes == NULL ||
+        buffer == NULL)
+    {
+        if (bytes != NULL)
+        {
+            *bytes = 0u;
+        }
+        return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
+    }
+
+    if ((*env)->ExceptionCheck(env))
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
+    }
+
+    if (*bytes == 0u)
+    {
+        return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
+    }
+    if (*bytes > (size_t)INT_MAX)
+    {
+        *bytes = 0u;
+        throw_encode_exception(env, "SeekableByteChannel read-back request is too large for one ByteBuffer.");
+        return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
+    }
+
+    jobject byte_buffer = (*env)->NewDirectByteBuffer(env, buffer, (jlong)*bytes);
+    if (byte_buffer == NULL)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
+    }
+
+    jint read = (*env)->CallIntMethod(env, context->output_channel, context->channel_read, byte_buffer);
+    (*env)->DeleteLocalRef(env, byte_buffer);
+    if ((*env)->ExceptionCheck(env))
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
+    }
+    if (read <= 0)
+    {
+        *bytes = 0u;
+        return FLAC__STREAM_ENCODER_READ_STATUS_END_OF_STREAM;
+    }
+
+    *bytes = (size_t)read;
+    return FLAC__STREAM_ENCODER_READ_STATUS_CONTINUE;
 }
 
 /*
@@ -5559,6 +5659,9 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     jmethodID is_verify = (*env)->GetMethodID(env, request_class, "isVerify", "()Z");
     jmethodID is_streamable_subset = (*env)->GetMethodID(env, request_class, "isStreamableSubset", "()Z");
     jmethodID get_block_size = (*env)->GetMethodID(env, request_class, "getBlockSize", "()Ljava/lang/Integer;");
+    jmethodID get_container = (*env)->GetMethodID(env, request_class, "getContainer", "()I");
+    jmethodID get_ogg_serial_number =
+        (*env)->GetMethodID(env, request_class, "getOggSerialNumber", "()Ljava/lang/Integer;");
     jmethodID get_comment_entries =
         (*env)->GetMethodID(env, request_class, "getCommentEntries", "()[Ljava/lang/String;");
     jmethodID get_pictures =
@@ -5578,7 +5681,8 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         (*env)->GetMethodID(env, request_class, "getMetadataBlockValues", "()[Ljava/lang/Object;");
     if (get_sample_rate == NULL || get_channels == NULL || get_bits_per_sample == NULL ||
         get_total_samples_estimate == NULL || get_compression_level == NULL || is_verify == NULL ||
-        is_streamable_subset == NULL || get_block_size == NULL || get_comment_entries == NULL || get_pictures == NULL ||
+        is_streamable_subset == NULL || get_block_size == NULL || get_container == NULL ||
+        get_ogg_serial_number == NULL || get_comment_entries == NULL || get_pictures == NULL ||
         get_application_blocks == NULL || get_seek_tables == NULL || get_cue_sheets == NULL ||
         get_padding_blocks == NULL || get_unknown_blocks == NULL || get_metadata_block_types == NULL ||
         get_metadata_block_values == NULL)
@@ -5602,8 +5706,10 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     jint compression_level = (*env)->CallIntMethod(env, request, get_compression_level);
     jboolean verify = (*env)->CallBooleanMethod(env, request, is_verify);
     jboolean streamable_subset = (*env)->CallBooleanMethod(env, request, is_streamable_subset);
+    jint container = (*env)->CallIntMethod(env, request, get_container);
     jobject total_samples_object = (*env)->CallObjectMethod(env, request, get_total_samples_estimate);
     jobject block_size_object = (*env)->CallObjectMethod(env, request, get_block_size);
+    jobject ogg_serial_number_object = (*env)->CallObjectMethod(env, request, get_ogg_serial_number);
     jobjectArray comment_entries = (jobjectArray)(*env)->CallObjectMethod(env, request, get_comment_entries);
     jobjectArray pictures = (jobjectArray)(*env)->CallObjectMethod(env, request, get_pictures);
     jobjectArray application_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_application_blocks);
@@ -5619,12 +5725,24 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         free(utf8_path);
         return 0;
     }
+    if (!validate_container(env, container))
+    {
+        free(utf8_path);
+        return 0;
+    }
+    if (container != JFLAC_CONTAINER_OGG && ogg_serial_number_object != NULL)
+    {
+        free(utf8_path);
+        throw_illegal_argument_exception(env, "Ogg serial number can only be set for Ogg FLAC encoding.");
+        return 0;
+    }
 
     jclass long_class = (*env)->FindClass(env, "java/lang/Long");
     jclass integer_class = (*env)->FindClass(env, "java/lang/Integer");
     jmethodID long_value = long_class != NULL ? (*env)->GetMethodID(env, long_class, "longValue", "()J") : NULL;
     jmethodID int_value = integer_class != NULL ? (*env)->GetMethodID(env, integer_class, "intValue", "()I") : NULL;
-    if ((total_samples_object != NULL && long_value == NULL) || (block_size_object != NULL && int_value == NULL))
+    if ((total_samples_object != NULL && long_value == NULL) ||
+        ((block_size_object != NULL || ogg_serial_number_object != NULL) && int_value == NULL))
     {
         /* Preserve NoSuchMethodError/ClassNotFoundException from boxed value lookup. */
         free(utf8_path);
@@ -5637,8 +5755,10 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
      */
     FLAC__uint64 total_samples_estimate = 0;
     uint32_t block_size = 0;
+    long ogg_serial_number = 0;
     FLAC__bool has_total_samples_estimate = total_samples_object != NULL;
     FLAC__bool has_block_size = block_size_object != NULL;
+    FLAC__bool has_ogg_serial_number = ogg_serial_number_object != NULL;
     if (has_total_samples_estimate)
     {
         total_samples_estimate = (FLAC__uint64)(*env)->CallLongMethod(env, total_samples_object, long_value);
@@ -5646,6 +5766,10 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     if (has_block_size)
     {
         block_size = (uint32_t)(*env)->CallIntMethod(env, block_size_object, int_value);
+    }
+    if (has_ogg_serial_number)
+    {
+        ogg_serial_number = (long)(*env)->CallIntMethod(env, ogg_serial_number_object, int_value);
     }
     if ((*env)->ExceptionCheck(env))
     {
@@ -5701,6 +5825,8 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         !g_flac_api.stream_encoder_set_sample_rate(context->encoder, (uint32_t)sample_rate) ||
         !g_flac_api.stream_encoder_set_compression_level(context->encoder, (uint32_t)compression_level) ||
         (has_block_size && !g_flac_api.stream_encoder_set_blocksize(context->encoder, block_size)) ||
+        (has_ogg_serial_number &&
+         !g_flac_api.stream_encoder_set_ogg_serial_number(context->encoder, ogg_serial_number)) ||
         (has_total_samples_estimate &&
          !g_flac_api.stream_encoder_set_total_samples_estimate(context->encoder, total_samples_estimate)))
     {
@@ -5761,22 +5887,24 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
          * Plain OutputStream is sequential. Passing NULL seek/tell callbacks is
          * deliberate and is the source of the documented STREAMINFO caveat.
          */
-        init_status =
-            g_flac_api.stream_encoder_init_stream(context->encoder, encode_write_callback, NULL, NULL, NULL, context);
+        init_status = init_stream_encoder_for_container(context->encoder, NULL, encode_write_callback, NULL, NULL, NULL,
+                                                        context, container);
     }
     else if (output_channel != NULL)
     {
         /*
          * SeekableByteChannel supplies seek/tell, so libFLAC can return to the
-         * header and patch final STREAMINFO fields during finish().
+         * header and patch final STREAMINFO fields during finish(). Ogg FLAC
+         * also needs read-back while patching pages, so the read callback is
+         * registered for both containers and ignored by native FLAC.
          */
-        init_status = g_flac_api.stream_encoder_init_stream(context->encoder, encode_write_callback,
-                                                            encode_channel_seek_callback,
-                                                            encode_channel_tell_callback, NULL, context);
+        init_status = init_stream_encoder_for_container(context->encoder, encode_channel_read_callback,
+                                                        encode_write_callback, encode_channel_seek_callback,
+                                                        encode_channel_tell_callback, NULL, context, container);
     }
     else
     {
-        init_status = g_flac_api.stream_encoder_init_file(context->encoder, utf8_path, NULL, NULL);
+        init_status = init_file_encoder_for_container(context->encoder, utf8_path, NULL, NULL, container);
     }
     free(utf8_path);
     if (init_status != FLAC__STREAM_ENCODER_INIT_STATUS_OK)

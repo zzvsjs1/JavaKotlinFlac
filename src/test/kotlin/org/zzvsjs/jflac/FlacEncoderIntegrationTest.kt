@@ -38,6 +38,53 @@ class FlacEncoderIntegrationTest {
     }
 
     @Test
+    fun oneShotOggEncodeRoundTripsInterleavedPcm() {
+        val frames = 21
+        val format = FlacAudioFormat(
+            sampleRate = 44_100,
+            channels = 2,
+            bitsPerSample = 16,
+            totalSamplesEstimate = frames.toLong()
+        )
+        val samples = deterministicPcm(frames, format)
+        val metadata = FlacEncodingMetadata(
+            comments = mapOf("TITLE" to listOf("Ogg encode"))
+        )
+        val output = Files.createTempFile("jflac-ogg-encode-roundtrip", ".oga")
+
+        try {
+            FlacEncoder().encode(
+                output = output,
+                format = format,
+                samples = samples,
+                metadata = metadata,
+                options = FlacEncodingOptions(
+                    container = FlacEncodingContainer.OGG,
+                    oggSerialNumber = 37
+                )
+            )
+
+            val bytes = Files.readAllBytes(output)
+            assertContentEquals(
+                byteArrayOf('O'.code.toByte(), 'g'.code.toByte(), 'g'.code.toByte(), 'S'.code.toByte()),
+                bytes.copyOf(4)
+            )
+
+            val decoded = FlacDecoder().decode(output)
+            val decodedMetadata = FlacMetadataReader().read(output)
+
+            assertEquals(format.sampleRate, decoded.streamInfo.sampleRate)
+            assertEquals(format.channels, decoded.streamInfo.channels)
+            assertEquals(format.bitsPerSample, decoded.streamInfo.bitsPerSample)
+            assertEquals(frames.toLong(), decoded.totalFrames)
+            assertContentEquals(samples, decoded.interleavedSamples)
+            assertEquals(listOf("Ogg encode"), decodedMetadata.vorbisComment?.comments?.get("TITLE"))
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
     fun streamingEncodeRoundTripsMultipleChunks() {
         val firstChunkFrames = 11
         val secondChunkFrames = 7

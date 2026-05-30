@@ -46,7 +46,7 @@ private const val FLAC_METADATA_TYPE_PICTURE = 6
  */
 class FlacEncoder {
     /**
-     * Opens a streaming encoder session for a native FLAC output file.
+     * Opens a streaming encoder session for a FLAC or Ogg FLAC output file.
      *
      * The returned session accepts multiple PCM chunks. The caller is
      * responsible for finishing the session when all frames have been written.
@@ -77,7 +77,8 @@ class FlacEncoder {
     }
 
     /**
-     * Opens a streaming encoder session for a sequential FLAC output stream.
+     * Opens a streaming encoder session for a sequential FLAC or Ogg FLAC
+     * output stream.
      *
      * The stream is not closed by the returned session. V1 does not provide
      * seek/tell callbacks, so libFLAC cannot back-patch final STREAMINFO
@@ -108,7 +109,8 @@ class FlacEncoder {
     }
 
     /**
-     * Opens a streaming encoder session for a seekable FLAC output channel.
+     * Opens a streaming encoder session for a seekable FLAC or Ogg FLAC output
+     * channel.
      *
      * The channel is not closed by the returned session. libFLAC byte offsets
      * are relative to the channel position at open time, and seek/tell
@@ -139,7 +141,7 @@ class FlacEncoder {
     }
 
     /**
-     * Encodes one interleaved PCM buffer into a complete FLAC file.
+     * Encodes one interleaved PCM buffer into a complete FLAC or Ogg FLAC file.
      *
      * This is a convenience wrapper built on top of [open] so there is only one
      * native encoder lifecycle implementation to maintain.
@@ -159,7 +161,8 @@ class FlacEncoder {
     }
 
     /**
-     * Encodes one interleaved PCM buffer into a sequential FLAC output stream.
+     * Encodes one interleaved PCM buffer into a sequential FLAC or Ogg FLAC
+     * output stream.
      */
     @JvmOverloads
     fun encode(
@@ -176,7 +179,8 @@ class FlacEncoder {
     }
 
     /**
-     * Encodes one interleaved PCM buffer into a seekable FLAC output channel.
+     * Encodes one interleaved PCM buffer into a seekable FLAC or Ogg FLAC
+     * output channel.
      */
     @JvmOverloads
     fun encode(
@@ -295,6 +299,8 @@ private fun FlacEncodingMetadata.toNativeRequest(
         options.verify,
         options.streamableSubset,
         options.blockSize,
+        options.container.nativeCode,
+        options.oggSerialNumber,
         commentEntries,
         pictures.toTypedArray(),
         applicationBlocks.toTypedArray(),
@@ -361,6 +367,9 @@ internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
 internal fun validateFlacEncodingOptions(options: FlacEncodingOptions) {
     require(options.compressionLevel in 0..8) { "Compression level must be between 0 and 8." }
     require(options.blockSize == null || options.blockSize > 0) { "Block size must be positive when provided." }
+    require(options.container == FlacEncodingContainer.OGG || options.oggSerialNumber == null) {
+        "Ogg serial number can only be set for Ogg FLAC encoding."
+    }
 }
 
 /**

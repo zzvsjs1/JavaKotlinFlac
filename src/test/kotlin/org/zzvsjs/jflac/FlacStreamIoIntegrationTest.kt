@@ -240,6 +240,41 @@ class FlacStreamIoIntegrationTest {
     }
 
     @Test
+    fun outputStreamOggEncodeRoundTripsThroughInputStreamDecode() {
+        val frames = 23
+        val format = FlacAudioFormat(
+            sampleRate = 44_100,
+            channels = 1,
+            bitsPerSample = 16,
+            totalSamplesEstimate = frames.toLong()
+        )
+        val samples = deterministicPcm(frames, format)
+        val output = ByteArrayOutputStream()
+
+        FlacEncoder().encode(
+            output = output,
+            format = format,
+            samples = samples,
+            options = FlacEncodingOptions(
+                container = FlacEncodingContainer.OGG,
+                oggSerialNumber = 51
+            )
+        )
+
+        val bytes = output.toByteArray()
+        val decoded = FlacDecoder().decode(ByteArrayInputStream(bytes))
+
+        assertContentEquals(
+            byteArrayOf('O'.code.toByte(), 'g'.code.toByte(), 'g'.code.toByte(), 'S'.code.toByte()),
+            bytes.copyOf(4)
+        )
+        assertEquals(format.sampleRate, decoded.streamInfo.sampleRate)
+        assertEquals(format.channels, decoded.streamInfo.channels)
+        assertEquals(frames.toLong(), decoded.totalFrames)
+        assertContentEquals(samples, decoded.interleavedSamples)
+    }
+
+    @Test
     fun outputStreamOpenWritesMultiplePcmChunks() {
         val firstFrames = 9
         val secondFrames = 13
@@ -290,6 +325,53 @@ class FlacStreamIoIntegrationTest {
             val metadata = FlacMetadataReader().read(output)
             val decoded = FlacDecoder().decode(output)
 
+            assertEquals(frames.toLong(), metadata.streamInfo.totalSamples)
+            assertEquals(frames.toLong(), decoded.totalFrames)
+            assertContentEquals(samples, decoded.interleavedSamples)
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun seekableChannelOggEncodeBackPatchesAndRoundTrips() {
+        val frames = 37
+        val format = FlacAudioFormat(
+            sampleRate = 32_000,
+            channels = 2,
+            bitsPerSample = 16,
+            totalSamplesEstimate = frames.toLong()
+        )
+        val samples = deterministicPcm(frames, format)
+        val output = Files.createTempFile("jflac-seekable-channel-ogg-encode", ".oga")
+
+        try {
+            Files.newByteChannel(
+                output,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE
+            ).use { channel ->
+                FlacEncoder().encode(
+                    output = channel,
+                    format = format,
+                    samples = samples,
+                    options = FlacEncodingOptions(
+                        container = FlacEncodingContainer.OGG,
+                        oggSerialNumber = 73
+                    )
+                )
+            }
+
+            val bytes = Files.readAllBytes(output)
+            val metadata = FlacMetadataReader().read(output)
+            val decoded = FlacDecoder().decode(output)
+
+            assertContentEquals(
+                byteArrayOf('O'.code.toByte(), 'g'.code.toByte(), 'g'.code.toByte(), 'S'.code.toByte()),
+                bytes.copyOf(4)
+            )
             assertEquals(frames.toLong(), metadata.streamInfo.totalSamples)
             assertEquals(frames.toLong(), decoded.totalFrames)
             assertContentEquals(samples, decoded.interleavedSamples)

@@ -12,8 +12,8 @@ stream, and seekable channel APIs for decode and encode workflows.
 - MSVC runtime: statically linked into the bundled Windows DLLs
 - FLAC source: official FLAC 1.5.0 archive, SHA-256 checked during build
 - libogg source: official libogg 1.3.6 archive, SHA-256 checked during build
-- Ogg FLAC: decode and metadata reading supported; encoding and existing-file
-  metadata editing are not supported
+- Ogg FLAC: decode, encode, and metadata reading supported; existing-file
+  metadata editing is not supported
 - Linux and macOS: not built yet; native resources are organised as
   `META-INF/native/<platform>` so more platform bundles can be added later
 
@@ -111,10 +111,10 @@ Pick the target that matches the operations the caller needs:
 
 | Target | Decode | Encode | Best fit | Notes |
 | --- | --- | --- | --- | --- |
-| `Path` | Native FLAC or Ogg FLAC whole file, chunked decode, ranged decode, reusable decode sessions | Native FLAC `open(...)` sessions and one-shot `encode(...)` | Normal files | Strongest encode path for exact final STREAMINFO because libFLAC owns a seekable file target. Metadata reading is file-based for native FLAC and Ogg FLAC; metadata editing is native FLAC only. |
+| `Path` | Native FLAC or Ogg FLAC whole file, chunked decode, ranged decode, reusable decode sessions | Native FLAC or Ogg FLAC `open(...)` sessions and one-shot `encode(...)` | Normal files | Strongest encode path for exact final STREAMINFO because libFLAC owns a seekable file target. Ogg output is selected with `FlacEncodingOptions`, not by extension. Metadata reading is file-based for native FLAC and Ogg FLAC; metadata editing is native FLAC only. |
 | `InputStream` | Native FLAC or Ogg FLAC whole stream only | Not applicable | Network responses, classpath resources, existing Java streams | Sequential-only in V1. No range decode, no reusable session, no metadata editor. The stream is not closed by jflac. |
-| `OutputStream` | Not applicable | Native FLAC sequential `open(...)` sessions and one-shot `encode(...)` | HTTP responses, byte-array streams, caller-managed streams | Produces valid native FLAC, but libFLAC cannot seek back to patch final STREAMINFO statistics. The stream is flushed on finish but not closed. |
-| `SeekableByteChannel` | Native FLAC or Ogg FLAC whole channel, ranged decode, reusable decode sessions | Native FLAC `open(...)` sessions and one-shot `encode(...)` with seek/tell callbacks | Embedded FLAC data, custom storage, caller-managed seekable targets | The current channel position is treated as byte offset zero. The channel is not closed by jflac. |
+| `OutputStream` | Not applicable | Native FLAC or Ogg FLAC sequential `open(...)` sessions and one-shot `encode(...)` | HTTP responses, byte-array streams, caller-managed streams | Produces valid FLAC, but libFLAC cannot seek back to patch final STREAMINFO statistics. The stream is flushed on finish but not closed. |
+| `SeekableByteChannel` | Native FLAC or Ogg FLAC whole channel, ranged decode, reusable decode sessions | Native FLAC or Ogg FLAC `open(...)` sessions and one-shot `encode(...)` with seek/tell callbacks | Embedded FLAC data, custom storage, caller-managed seekable targets | The current channel position is treated as byte offset zero. The channel is not closed by jflac. |
 
 `InputStream`, `OutputStream`, and `SeekableByteChannel` overloads are standard
 Java types, so they are usable from both Java and Kotlin. Session objects are
@@ -245,9 +245,10 @@ fun inspect(input: InputStream) {
 }
 ```
 
-Plain streams are decoded with `FLAC__stream_decoder_init_stream` and only a
-read callback. Because there is no seek/tell/length contract, the stream
-overloads intentionally do not expose range decode or reusable sessions.
+Plain streams use the native or Ogg stream decoder after the wrapper inspects
+the first bytes, and provide only a read callback. Because there is no
+seek/tell/length contract, the stream overloads intentionally do not expose
+range decode or reusable sessions.
 
 Decode seekable native FLAC or Ogg FLAC channels when callers need ranges or reusable
 sessions without passing a file path:
@@ -270,10 +271,10 @@ fun inspectRange(input: SeekableByteChannel) {
 }
 ```
 
-Seekable channel decode also uses `FLAC__stream_decoder_init_stream`, but
-provides read, seek, tell, length, and EOF callbacks. The channel position when
-the decode or session is opened becomes the FLAC stream origin, so callers can
-decode FLAC data embedded after a prefix in a larger channel.
+Seekable channel decode also chooses the matching native or Ogg stream decoder,
+and provides read, seek, tell, length, and EOF callbacks. The channel position
+when the decode or session is opened becomes the FLAC stream origin, so callers
+can decode FLAC data embedded after a prefix in a larger channel.
 
 ## Encode
 
@@ -314,6 +315,28 @@ Encode model details:
   `encode(...)` when the caller already has a complete interleaved buffer.
 - Metadata is attached when the encoder is opened. It cannot be changed after
   audio frames start because FLAC metadata is written before the frames.
+- `FlacEncodingOptions.container` selects native FLAC or Ogg FLAC output.
+  File extensions are not inspected. For Ogg FLAC, set `oggSerialNumber` when
+  the stream may be multiplexed with other Ogg streams.
+
+Encode Ogg FLAC by selecting the Ogg container:
+
+```kotlin
+import org.zzvsjs.jflac.FlacEncoder
+import org.zzvsjs.jflac.FlacEncodingContainer
+import org.zzvsjs.jflac.FlacEncodingOptions
+import java.nio.file.Path
+
+FlacEncoder().encode(
+    output = Path.of("out.oga"),
+    format = format,
+    samples = samples,
+    options = FlacEncodingOptions(
+        container = FlacEncodingContainer.OGG,
+        oggSerialNumber = 1234
+    )
+)
+```
 
 Encode sequential native FLAC streams:
 
@@ -503,8 +526,8 @@ or stale handle is treated as an invalid native session.
 - Native packaging is currently Windows x64 only. The resource layout is ready
   for future platforms, but Linux and macOS DLL/shared-library builds are not
   produced yet.
-- Ogg FLAC decode and metadata reading are supported. Ogg FLAC encoding and
-  existing-file metadata editing are not supported.
+- Ogg FLAC decode, encode, and metadata reading are supported. Existing-file
+  Ogg FLAC metadata editing is not supported.
 - `InputStream` and `OutputStream` APIs are sequential-only. File and
   `SeekableByteChannel` decode APIs support ranges and reusable seek sessions.
   Metadata reading and editing remain file-based.

@@ -1,8 +1,8 @@
 # Third Party Notices
 
 This project builds and bundles `FLAC.dll` from the official FLAC 1.5.0 source
-archive, with libogg 1.3.6 statically linked for Ogg FLAC decoding and metadata
-reading. The wrapper code is licensed separately under the project `LICENSE`.
+archive, with libogg 1.3.6 statically linked for Ogg FLAC support. The wrapper
+code is licensed separately under the project `LICENSE`.
 
 ## FLAC
 

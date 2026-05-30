@@ -25,6 +25,8 @@ public final class NativeEncodingRequest {
     private final boolean verify;
     private final boolean streamableSubset;
     private final Integer blockSize;
+    private final int container;
+    private final Integer oggSerialNumber;
     private final String[] commentEntries;
     private final FlacPicture[] pictures;
     private final FlacApplicationBlock[] applicationBlocks;
@@ -44,6 +46,8 @@ public final class NativeEncodingRequest {
             boolean verify,
             boolean streamableSubset,
             Integer blockSize,
+            int container,
+            Integer oggSerialNumber,
             String[] commentEntries,
             FlacPicture[] pictures,
             FlacApplicationBlock[] applicationBlocks,
@@ -62,6 +66,8 @@ public final class NativeEncodingRequest {
         this.verify = verify;
         this.streamableSubset = streamableSubset;
         this.blockSize = blockSize;
+        this.container = container;
+        this.oggSerialNumber = oggSerialNumber;
         this.commentEntries = commentEntries.clone();
         this.pictures = pictures.clone();
         this.applicationBlocks = applicationBlocks.clone();
@@ -103,6 +109,14 @@ public final class NativeEncodingRequest {
 
     public Integer getBlockSize() {
         return blockSize;
+    }
+
+    public int getContainer() {
+        return container;
+    }
+
+    public Integer getOggSerialNumber() {
+        return oggSerialNumber;
     }
 
     public String[] getCommentEntries() {
