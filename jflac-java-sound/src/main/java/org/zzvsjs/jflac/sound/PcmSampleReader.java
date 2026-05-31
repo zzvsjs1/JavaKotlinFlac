@@ -6,6 +6,16 @@ import javax.sound.sampled.AudioSystem;
 import java.io.IOException;
 import java.util.Objects;
 
+/*
+ * Converts Java Sound PCM bytes into the signed integer sample layout expected
+ * by the core jflac encoder.
+ *
+ * Java Sound exposes several PCM shapes through one AudioFormat model. This
+ * reader accepts only the layouts that can be converted without scaling:
+ * signed 8/16/24/32-bit PCM and unsigned 8-bit PCM. Multi-byte samples honour
+ * the AudioFormat endian flag, then sign extension moves the value into the
+ * equivalent signed Int range.
+ */
 final class PcmSampleReader {
     private static final int BUFFER_FRAMES = 1024;
 
@@ -32,6 +42,12 @@ final class PcmSampleReader {
     }
 
     int readFrames(int[] output, int maxFrames) throws IOException {
+        /*
+         * Public encoder APIs count in frames, but the output array is
+         * interleaved samples. For stereo, maxFrames=1024 needs 2048 Int
+         * slots. Keeping this check here means caller mistakes fail before any
+         * partially-filled buffer can reach libFLAC.
+         */
         if (maxFrames < 0) {
             throw new IllegalArgumentException("maxFrames must not be negative");
         }
@@ -90,6 +106,11 @@ final class PcmSampleReader {
                 return total == 0 ? -1 : total;
             }
             if (read == 0) {
+                /*
+                 * AudioInputStream should either make progress or report EOF
+                 * for a positive read request. Treat zero as an exceptional no
+                 * progress state so the writer cannot spin forever.
+                 */
                 throw new IOException("PCM input returned no bytes for a positive read request.");
             }
             total += read;
@@ -110,6 +131,11 @@ final class PcmSampleReader {
 
     private int decodeSample(int byteIndex) {
         if (encoding.equals(AudioFormat.Encoding.PCM_UNSIGNED)) {
+            /*
+             * The only unsigned format accepted by this reader is 8-bit PCM.
+             * Java Sound stores it as 0..255; FLAC wants signed samples centred
+             * on zero, so subtract the midpoint.
+             */
             return (frameBuffer[byteIndex] & 0xff) - 128;
         }
 
@@ -129,6 +155,11 @@ final class PcmSampleReader {
         }
 
         int shift = Integer.SIZE - bitsPerSample;
+        /*
+         * Left shift moves the sign bit into Int's sign position; arithmetic
+         * right shift then sign-extends back to the original bit depth.
+         * Example for 24-bit -1: 0x00ffffff becomes 0xffffffff.
+         */
         return (sample << shift) >> shift;
     }
 

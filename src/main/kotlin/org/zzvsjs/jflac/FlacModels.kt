@@ -12,6 +12,14 @@ private const val FLAC_UNKNOWN_METADATA_MAX_TYPE = 126
  *
  * The field layout closely mirrors the native structure so the wrapper can
  * remain thin and predictable for both Java and Kotlin callers.
+ *
+ * [totalSamples] is a frame count. For a stereo file with `totalSamples = 10`,
+ * the decoded interleaved PCM array contains 20 integer values. A value of
+ * zero can mean an empty file or an encoder that did not know the total in
+ * advance.
+ *
+ * @property md5Signature 16-byte STREAMINFO MD5 digest. The array is included
+ *   as raw bytes because it is not text.
  */
 data class FlacStreamInfo(
     val sampleRate: Int,
@@ -77,6 +85,11 @@ data class FlacVorbisComment(
  *
  * `type` is kept as the original numeric enum value from libFLAC so the V1 API
  * does not need a second mapping layer.
+ *
+ * The numeric type follows the FLAC picture type registry. For example, `3`
+ * is commonly used for front cover art. Use [FlacFormat.pictureViolation] when
+ * accepting user-supplied pictures and you want libFLAC's exact legality
+ * message before writing metadata.
  */
 data class FlacPicture(
     val type: Int,
@@ -158,6 +171,10 @@ data class FlacApplicationBlock(
  * `sampleNumber` is the target sample frame, `streamOffset` is the byte offset
  * of the target frame from the first frame, and `frameSamples` is the number of
  * sample frames in that target frame.
+ *
+ * A `sampleNumber` of `-1` is the wrapper's Java/Kotlin representation of the
+ * FLAC placeholder seek point. Other sample numbers and stream offsets must be
+ * non-negative when written.
  */
 data class FlacSeekPoint(
     val sampleNumber: Long,
@@ -175,6 +192,9 @@ data class FlacSeekTable(
  *
  * `offset` is relative to the containing track offset and `number` is the
  * original FLAC cue index number.
+ *
+ * FLAC stores cue index numbers in an 8-bit field, so values must fit
+ * `0..255` when encoded.
  */
 data class FlacCueSheetIndex(
     val offset: Long,
@@ -186,6 +206,9 @@ data class FlacCueSheetIndex(
  *
  * `type` is kept as the raw FLAC bit value: 0 means audio, 1 means non-audio.
  * The lead-out track is exposed the same way libFLAC reports it.
+ *
+ * [isrc] is stored by FLAC as a fixed 12-byte printable ASCII field. Longer or
+ * non-ASCII values are rejected by encoder metadata validation.
  */
 data class FlacCueSheetTrack(
     val offset: Long,
@@ -201,6 +224,9 @@ data class FlacCueSheetTrack(
  *
  * The media catalog number and ISRC fields are trimmed at the first native NUL
  * byte because the FLAC structures store fixed-width, NUL-padded ASCII fields.
+ *
+ * [mediaCatalogNumber] is limited to the FLAC fixed 128-byte printable ASCII
+ * field when writing metadata.
  */
 data class FlacCueSheet(
     val mediaCatalogNumber: String,
@@ -292,7 +318,7 @@ sealed interface FlacMetadataBlock {
 /**
  * Aggregated read-only metadata view returned by [FlacMetadataReader].
  *
- * This read model covers the common safe-to-materialize metadata blocks. Raw
+ * This read model covers the common safe-to-materialise metadata blocks. Raw
  * unknown blocks and padding are exposed so re-encode workflows can preserve
  * metadata the wrapper does not otherwise interpret. [blocks] preserves the
  * physical order of non-STREAMINFO metadata blocks for callers that need
@@ -311,10 +337,13 @@ data class FlacMetadata(
 )
 
 /**
- * Fully materialized PCM output produced by [FlacDecoder.decode].
+ * Fully materialised PCM output produced by [FlacDecoder.decode].
  *
  * Audio data is stored as one interleaved signed PCM array because that is the
  * exact layout emitted by the JNI bridge and libFLAC write callback.
+ *
+ * Memory use grows with `totalFrames * channels`. For long files, prefer the
+ * streaming decode APIs so chunks can be processed and released one at a time.
  */
 data class FlacDecodedAudio(
     val streamInfo: FlacStreamInfo,
@@ -400,7 +429,12 @@ interface PcmConsumer {
  * Default collector used by the convenience decode API.
  *
  * The class is public so callers can reuse it when they want streaming decode
- * callbacks first and a materialized PCM result afterwards.
+ * callbacks first and a materialised PCM result afterwards.
+ *
+ * The collector copies every incoming chunk and later merges those copies into
+ * one array. That is simple and safe for small or medium clips, but large files
+ * should normally use a custom [PcmConsumer] to avoid buffering the whole
+ * decoded signal.
  */
 class BufferingPcmConsumer @JvmOverloads constructor(
     private val firstFrameIndex: Long = 0L,

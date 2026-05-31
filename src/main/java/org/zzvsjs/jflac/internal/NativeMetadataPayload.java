@@ -11,7 +11,7 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
 /**
  * Immutable DTO returned directly from JNI.
  * <p>
- * The native layer fully materializes Java values before returning, so callers
+ * The native layer fully materialises Java values before returning, so callers
  * never manage native handles for metadata objects.
  *
  * @hidden

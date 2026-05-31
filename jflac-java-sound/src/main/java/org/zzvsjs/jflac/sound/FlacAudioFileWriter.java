@@ -36,6 +36,24 @@ import java.util.Objects;
  * <p>The writer accepts Java Sound PCM streams and forwards bounded interleaved
  * chunks to the core libFLAC encoder. Supported FLAC metadata can be supplied
  * through the input format properties.</p>
+ *
+ * <p>Supported input audio is PCM signed at 8, 16, 24, or 32 bits per sample,
+ * or PCM unsigned at 8 bits per sample. Other encodings, non-integral sample
+ * rates, unsupported channel counts, and mismatched frame sizes are rejected by
+ * the internal PCM reader before native encoding begins.</p>
+ *
+ * <p>Metadata example for callers that construct an {@link AudioInputStream}
+ * with properties:</p>
+ *
+ * <pre>{@code
+ * Map<String, Object> properties = Map.of(
+ *         JflacAudioFileProperties.VORBIS_COMMENTS,
+ *         Map.of("ARTIST", List.of("Example artist"))
+ * );
+ * }</pre>
+ *
+ * <p>Native encoder failures are reported as {@link IOException} from the
+ * Java Sound API, with the original jflac exception as the cause.</p>
  */
 public final class FlacAudioFileWriter extends AudioFileWriter {
     private static final int BUFFER_FRAMES = 1024;
@@ -43,6 +61,16 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
             JflacAudioFileTypes.FLAC,
             JflacAudioFileTypes.OGG_FLAC
     };
+
+    /**
+     * Creates the Java Sound FLAC writer service provider.
+     *
+     * <p>Java Sound instantiates providers reflectively from
+     * {@code META-INF/services}; application code normally obtains this writer
+     * through {@code AudioSystem} rather than constructing it directly.</p>
+     */
+    public FlacAudioFileWriter() {
+    }
 
     @Override
     public AudioFileFormat.Type[] getAudioFileTypes() {
@@ -69,6 +97,13 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         return isFileTypeSupported(fileType) && isPcmFormatSupported(stream);
     }
 
+    /**
+     * Writes FLAC data to a caller-owned {@link OutputStream}.
+     *
+     * <p>The stream remains open after this method returns or throws. Because
+     * this path is sequential, libFLAC cannot seek back to patch final
+     * STREAMINFO statistics such as total samples and MD5.</p>
+     */
     @Override
     public int write(AudioInputStream stream, AudioFileFormat.Type fileType, OutputStream output)
             throws IOException {
@@ -92,6 +127,13 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         return byteCount(countingOutput.bytesWritten());
     }
 
+    /**
+     * Writes FLAC data to a file path.
+     *
+     * <p>File output lets libFLAC seek during finalisation, so it is the better
+     * choice when callers need final STREAMINFO statistics to be back-patched in
+     * the encoded file.</p>
+     */
     @Override
     public int write(AudioInputStream stream, AudioFileFormat.Type fileType, File output)
             throws IOException {
@@ -127,6 +169,12 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
     }
 
     private static boolean isPcmFormatSupported(AudioInputStream stream) {
+        /*
+         * Constructing PcmSampleReader performs all cheap Java Sound format
+         * validation without consuming audio bytes. ArithmeticException is
+         * included because huge frame-size calculations are invalid for this
+         * bounded chunking path.
+         */
         try {
             new PcmSampleReader(stream);
             return true;
@@ -150,6 +198,12 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
     }
 
     private static FlacEncodingMetadata metadataFromProperties(Map<String, Object> properties) {
+        /*
+         * Ordered blocks are mutually exclusive with grouped convenience
+         * properties. This mirrors the Kotlin encoder contract and avoids an
+         * ambiguous merge rule when both exact order and grouped lists are
+         * supplied.
+         */
         if (properties.containsKey(JflacAudioFileProperties.BLOCKS)) {
             List<FlacMetadataBlock> blocks = listProperty(
                     properties,
@@ -244,6 +298,11 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
     }
 
     private static void writePcm(PcmSampleReader reader, FlacEncodingSession session) throws IOException {
+        /*
+         * The core encoder wants a tightly-sized IntArray for each write. Reuse
+         * the full buffer for complete chunks and copy only the final partial
+         * chunk so the native side sees exactly frames * channels samples.
+         */
         int channels = reader.channels();
         int[] samples = new int[Math.multiplyExact(BUFFER_FRAMES, channels)];
         int framesRead;

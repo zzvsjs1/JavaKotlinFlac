@@ -7,6 +7,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Objects;
 
+/*
+ * InputStream adapter that pulls decoded FLAC frames only when Java Sound asks
+ * for PCM bytes.
+ *
+ * The native pull decoder returns signed Int samples. This stream converts
+ * each chunk to little-endian PCM bytes because FlacAudioFormats advertises
+ * PCM_SIGNED with little-endian byte order. It owns the pull session and may
+ * optionally own the source stream supplied by URL-based reader paths.
+ */
 final class FlacPcmInputStream extends InputStream {
     private static final int DEFAULT_CHUNK_FRAMES = 1024;
 
@@ -90,6 +99,12 @@ final class FlacPcmInputStream extends InputStream {
         }
 
         if (frames == 0) {
+            /*
+             * readInterleaved only returns zero for a zero-frame request, and
+             * this adapter always asks for DEFAULT_CHUNK_FRAMES. A zero here
+             * would make InputStream.read loop forever, so convert it into an
+             * IOException.
+             */
             throw new IOException("Native FLAC decoder returned no PCM frames for a positive read request.");
         }
 

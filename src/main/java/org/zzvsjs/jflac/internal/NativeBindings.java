@@ -12,6 +12,17 @@ import java.nio.channels.SeekableByteChannel;
  * <p>
  * Keeping these signatures in Java makes the native boundary explicit without
  * leaking external declarations into the public Kotlin API.
+ * <p>
+ * Native methods follow two broad patterns:
+ * <ul>
+ *     <li>one-shot calls, which finish before returning to Java; and</li>
+ *     <li>handle calls, which return a small positive {@code long} registered
+ *     in native code instead of exposing a raw libFLAC pointer.</li>
+ * </ul>
+ * Invalid, stale, or zero handles are rejected in native code with a controlled
+ * Java exception. If a Java callback or stream operation already raised an
+ * exception, the native layer preserves that exception instead of replacing it
+ * with a synthetic wrapper error.
  *
  * @hidden
  */
@@ -56,6 +67,11 @@ public final class NativeBindings {
 
     public static native long openDecoderChannel(SeekableByteChannel input, int container);
 
+    /*
+     * Pull decoder open methods return both a native handle and cached
+     * STREAMINFO. The handle remains valid until releasePullDecoder() or until a
+     * read failure makes the Kotlin session release it defensively.
+     */
     public static native NativePullDecoderOpenResult openPullDecoderFile(String path, int container);
 
     public static native NativePullDecoderOpenResult openPullDecoderStream(InputStream input, int container);
@@ -66,12 +82,28 @@ public final class NativeBindings {
 
     public static native void decodeDecoderRange(long handle, long firstSample, long maxFrames, PcmConsumer consumer);
 
+    /*
+     * Reads up to maxFrames frames into samples. The array must have room for
+     * maxFrames * channels values, where channels comes from the open result's
+     * STREAMINFO. Return values are frame counts: positive for decoded data, 0
+     * only for a zero-frame request, and -1 after end-of-stream.
+     */
     public static native int readPullDecoderInterleaved(long handle, int[] samples, int maxFrames);
 
+    /*
+     * Release calls are intentionally tolerant of invalid or already-released
+     * handles so close paths can be defensive after setup failures.
+     */
     public static native void releaseDecoder(long handle);
 
     public static native void releasePullDecoder(long handle);
 
+    /*
+     * Encoder open methods return an opaque native handle. The Java/Kotlin
+     * session must later call finishEncoder() for successful output or
+     * releaseEncoder() to abandon a failed encoder. OutputStream and channel
+     * targets are held as native global references until that close path runs.
+     */
     public static native long openEncoderFile(String path, NativeEncodingRequest request);
 
     public static native long openEncoderStream(OutputStream output, NativeEncodingRequest request);

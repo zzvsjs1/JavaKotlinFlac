@@ -26,6 +26,17 @@ import java.util.Objects;
  * the probing methods before it can expose an {@link AudioInputStream}. This
  * reader performs conservative FLAC/Ogg FLAC format probing before wrapping the
  * pull decoder as Java Sound PCM.</p>
+ *
+ * <p>InputStream format probing has a stricter contract than file or URL
+ * probing: Java Sound may try several providers against the same stream, so the
+ * stream must support mark/reset and must be restored before this provider
+ * returns. Lazy decode methods are allowed to consume the stream after they
+ * successfully return an {@link AudioInputStream}.</p>
+ *
+ * <p>Ogg probing starts with the generic {@code OggS} magic. libFLAC performs
+ * the final check that the Ogg stream really carries FLAC frames; failures are
+ * exposed as {@link UnsupportedAudioFileException} so another Java Sound
+ * provider can try the same source where possible.</p>
  */
 public final class FlacAudioFileReader extends AudioFileReader {
     private static final String NOT_FLAC_CANDIDATE = "Input is not a FLAC or Ogg FLAC stream.";
@@ -33,6 +44,16 @@ public final class FlacAudioFileReader extends AudioFileReader {
     private static final int STREAM_DECODE_SETUP_MARK_LIMIT = 1 << 20;
     private static final byte[] FLAC_MAGIC = new byte[] { 'f', 'L', 'a', 'C' };
     private static final byte[] OGG_MAGIC = new byte[] { 'O', 'g', 'g', 'S' };
+
+    /**
+     * Creates the Java Sound FLAC reader service provider.
+     *
+     * <p>Java Sound instantiates providers reflectively from
+     * {@code META-INF/services}; application code normally obtains this reader
+     * through {@code AudioSystem} rather than constructing it directly.</p>
+     */
+    public FlacAudioFileReader() {
+    }
 
     /**
      * Probes stream headers without consuming data from the caller's perspective.
@@ -94,6 +115,11 @@ public final class FlacAudioFileReader extends AudioFileReader {
      * not take ownership of the supplied stream: closing the returned
      * {@link AudioInputStream} releases the native pull session, while the caller
      * keeps responsibility for the original Java stream.
+     *
+     * If setup fails after marking a caller stream, the method attempts to reset
+     * that stream before throwing so another provider can inspect it. Native
+     * decode setup failures are wrapped as {@link UnsupportedAudioFileException}
+     * to match the Java Sound probing contract.
      */
     @Override
     public AudioInputStream getAudioInputStream(InputStream stream) throws UnsupportedAudioFileException, IOException {
@@ -146,6 +172,9 @@ public final class FlacAudioFileReader extends AudioFileReader {
      * Opens a URL source and transfers ownership to the returned
      * {@link AudioInputStream}. If any validation or native session setup fails
      * before the stream can be returned, the URL stream is closed in this method.
+     *
+     * The returned {@link AudioInputStream} closes both the native pull decoder
+     * and the URL stream when it is closed.
      */
     @Override
     public AudioInputStream getAudioInputStream(URL url) throws UnsupportedAudioFileException, IOException {
@@ -178,6 +207,9 @@ public final class FlacAudioFileReader extends AudioFileReader {
      * Opens a file-backed native pull session. The native decoder owns the file
      * handle internally, so closing the returned PCM stream is enough to release
      * the decode lifecycle.
+     *
+     * File probing reads metadata first so the Java Sound format exposes the
+     * same properties as {@link #getAudioFileFormat(File)}.
      */
     @Override
     public AudioInputStream getAudioInputStream(File file) throws UnsupportedAudioFileException, IOException {

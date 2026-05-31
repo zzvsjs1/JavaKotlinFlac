@@ -50,6 +50,36 @@ private const val FLAC_METADATA_TYPE_PICTURE = 6
  * - JVM code validates caller input before crossing into JNI
  * - the native layer owns all libFLAC objects and file lifecycle details
  * - callers only work with small Kotlin/Java models and a session handle
+ *
+ * Example:
+ *
+ * ```
+ * val format = FlacAudioFormat(sampleRate = 48_000, channels = 2, bitsPerSample = 16)
+ * val samples = IntArray(48_000 * 2) { index -> if (index % 2 == 0) 1_000 else -1_000 }
+ *
+ * FlacEncoder().encode(
+ *     output = Path.of("tone.flac"),
+ *     format = format,
+ *     samples = samples
+ * )
+ * ```
+ *
+ * For streaming writes, keep the returned [FlacEncodingSession] in `use { ... }`
+ * or call [FlacEncodingSession.finish] yourself. The session finalises the
+ * native encoder and is required even when all PCM chunks have already been
+ * submitted.
+ *
+ * Limitations and exceptions:
+ *
+ * - [OutputStream] and [SeekableByteChannel] overloads do not close the caller's
+ *   object. Only the native encoder lifecycle is closed.
+ * - Sequential [OutputStream] output cannot seek back to patch final STREAMINFO
+ *   statistics. File and seekable-channel output can.
+ * - Invalid format, option, metadata, or PCM values throw
+ *   [IllegalArgumentException]. Writing after a terminal session state throws
+ *   [IllegalStateException].
+ * - Native load failures throw [NativeLoadException]; libFLAC configuration,
+ *   write, or finalise failures throw [FlacEncodeException].
  */
 class FlacEncoder {
     /**
@@ -57,6 +87,8 @@ class FlacEncoder {
      *
      * The returned session accepts multiple PCM chunks. The caller is
      * responsible for finishing the session when all frames have been written.
+     * File output is the most complete path because libFLAC owns a seekable
+     * file handle and can write the final STREAMINFO values during finish.
      */
     @JvmOverloads
     fun open(
@@ -90,6 +122,11 @@ class FlacEncoder {
      * The stream is not closed by the returned session. V1 does not provide
      * seek/tell callbacks, so libFLAC cannot back-patch final STREAMINFO
      * statistics on this path.
+     *
+     * Use this overload when the destination is naturally sequential, for
+     * example an HTTP response or archive entry. Use the file or channel
+     * overload when final total-sample and MD5 statistics must be present in
+     * STREAMINFO.
      */
     @JvmOverloads
     fun open(
@@ -122,6 +159,9 @@ class FlacEncoder {
      * The channel is not closed by the returned session. libFLAC byte offsets
      * are relative to the channel position at open time, and seek/tell
      * callbacks let libFLAC back-patch final STREAMINFO statistics.
+     *
+     * This is useful when the caller owns a larger container file and wants to
+     * write FLAC data at the channel's current position.
      */
     @JvmOverloads
     fun open(
@@ -152,6 +192,10 @@ class FlacEncoder {
      *
      * This is a convenience wrapper built on top of [open] so there is only one
      * native encoder lifecycle implementation to maintain.
+     *
+     * `samples.size` must be divisible by `format.channels`. For stereo, six
+     * samples represent three frames: left0, right0, left1, right1, left2,
+     * right2.
      */
     @JvmOverloads
     fun encode(
@@ -170,6 +214,8 @@ class FlacEncoder {
     /**
      * Encodes one interleaved PCM buffer into a sequential FLAC or Ogg FLAC
      * output stream.
+     *
+     * The supplied stream remains open after this method returns or throws.
      */
     @JvmOverloads
     fun encode(
@@ -188,6 +234,8 @@ class FlacEncoder {
     /**
      * Encodes one interleaved PCM buffer into a seekable FLAC or Ogg FLAC
      * output channel.
+     *
+     * The supplied channel remains open after this method returns or throws.
      */
     @JvmOverloads
     fun encode(

@@ -29,7 +29,7 @@ class FlacDecodeException : FlacException {
     constructor(message: String, cause: Throwable?) : super(message, cause)
 }
 
-/** Raised when libFLAC cannot initialize, process, or finalize an encode job. */
+/** Raised when libFLAC cannot initialise, process, or finalise an encode job. */
 class FlacEncodeException : FlacException {
     constructor(message: String) : super(message)
 

@@ -13,6 +13,14 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
  * Boxing the optional numeric fields here keeps the native signatures compact
  * and lets the Kotlin API preserve nullable semantics for "use libFLAC
  * defaults" style options.
+ * <p>
+ * Metadata can be sent in grouped mode or ordered mode. In grouped mode the
+ * typed arrays are converted in the wrapper's normal order. In ordered mode
+ * {@code metadataBlockTypes[i]} describes the native FLAC block type for
+ * {@code metadataBlockValues[i]}, for example type {@code 4} with a
+ * {@link NativeVorbisCommentBlock} value. The constructor copies every array so
+ * JNI sees an immutable snapshot even if caller-owned collections are modified
+ * later.
  *
  * @hidden
  */

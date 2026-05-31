@@ -18,6 +18,16 @@
  *   objects before returning to Java, and JVM objects kept beyond one JNI call
  *   are promoted to global references and released in the matching destroy
  *   helper.
+ *
+ * Example flows:
+ * - FlacDecoder.decode(path, consumer) allocates one decoder, emits callbacks
+ *   synchronously, then destroys the decoder before returning.
+ * - FlacDecoder.openPull(path) registers a decoder handle; each Java read
+ *   advances libFLAC a little and returns a frame count, 0 for a zero-frame
+ *   request, or -1 once end-of-stream has no pending PCM left.
+ * - FlacEncoder.open(stream, ...) registers an encoder handle. finishEncoder()
+ *   is the successful close path; releaseEncoder() is the abandon path and can
+ *   leave incomplete output by design.
  */
 #include <limits.h>
 #include <stdint.h>
@@ -4276,7 +4286,10 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
  * return fewer frames than requested: libFLAC exposes whole compressed-frame
  * boundaries, Java may ask for a small buffer, and end-of-stream can arrive
  * before the request is full. A positive return always means progress; -1
- * means EOF was already reached with no pending PCM left.
+ * means EOF was already reached with no pending PCM left. Zero is reserved for
+ * a zero-frame Java request; if libFLAC or a Java source produces a no-progress
+ * state for a positive request, the callback path turns that into an exception
+ * instead of spinning.
  */
 JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDecoderInterleaved(
     JNIEnv *env, jclass clazz, jlong handle, jintArray samples, jint max_frames)
@@ -5949,6 +5962,11 @@ static FLAC__bool build_ordered_metadata_blocks(JNIEnv *env, jintArray metadata_
  * read chain, verify leading STREAMINFO, delete every later block, build the
  * requested replacement blocks, insert them after STREAMINFO, then ask libFLAC
  * to rewrite the chain with the caller's padding/file-stat policy.
+ *
+ * Kotlin rejects Ogg FLAC before this JNI entry point because this writer uses
+ * FLAC__metadata_chain_read/write, not the Ogg metadata-chain reader. Keeping
+ * that policy in one JVM-side validation path gives callers a stable
+ * UnsupportedFeatureException instead of a lower-level chain status.
  */
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetadata(JNIEnv *env, jclass clazz,
                                                                                    jstring path, jobject request,
@@ -6322,6 +6340,11 @@ static FLAC__StreamEncoderReadStatus encode_channel_read_callback(const FLAC__St
         return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
     }
 
+    /*
+     * The direct ByteBuffer is only a temporary view over libFLAC's read-back
+     * buffer. The Java channel fills it during this call; native code deletes
+     * the local reference immediately afterwards and libFLAC owns the memory.
+     */
     jobject byte_buffer = (*env)->NewDirectByteBuffer(env, buffer, (jlong)*bytes);
     if (byte_buffer == NULL)
     {
@@ -6348,8 +6371,10 @@ static FLAC__StreamEncoderReadStatus encode_channel_read_callback(const FLAC__St
 
 /*
  * libFLAC write callback backed by java.nio.channels.SeekableByteChannel. A
- * direct ByteBuffer wraps libFLAC's encoded byte slice, and a loop handles
- * partial channel writes until the full slice has been consumed.
+ * direct ByteBuffer wraps libFLAC's encoded byte slice for this callback only;
+ * Java must not store it because the pointer is owned by libFLAC and becomes
+ * invalid after the callback returns. A loop handles partial channel writes
+ * until the full slice has been consumed.
  */
 static FLAC__StreamEncoderWriteStatus encode_channel_write_callback(const FLAC__StreamEncoder *encoder,
                                                                     const FLAC__byte buffer[], size_t bytes,
@@ -6470,7 +6495,9 @@ static FLAC__StreamEncoderTellStatus encode_channel_tell_callback(const FLAC__St
  * libFLAC write callback backed by java.io.OutputStream. OutputStream receives
  * a copied JVM byte array because it cannot write from a native pointer.
  * No seek/tell callbacks are registered for OutputStream, so the FLAC file is
- * valid but final STREAMINFO statistics cannot be back-patched by libFLAC.
+ * valid but final STREAMINFO statistics cannot be back-patched by libFLAC. If
+ * OutputStream.write throws, the pending Java exception remains the primary
+ * failure and libFLAC only sees a fatal callback status.
  */
 static FLAC__StreamEncoderWriteStatus encode_write_callback(const FLAC__StreamEncoder *encoder,
                                                             const FLAC__byte buffer[], size_t bytes,

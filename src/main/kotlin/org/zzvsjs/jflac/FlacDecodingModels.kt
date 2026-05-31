@@ -140,7 +140,7 @@ open class FlacDecodeAdapter : FlacDecodeListener {
  * Channel-oriented listener for callers that prefer de-interleaved PCM.
  *
  * This interface trades one extra copy per chunk for a friendlier shape for
- * DSP, visualization, and per-channel analysis pipelines.
+ * DSP, visualisation, and per-channel analysis pipelines.
  */
 interface FlacChannelDecodeListener {
     fun onStreamInfo(info: FlacStreamInfo)
@@ -167,6 +167,22 @@ open class FlacChannelDecodeAdapter : FlacChannelDecodeListener {
  * A session owns one native decoder handle. It is useful when callers need to
  * inspect several ranges from the same source without reopening native state
  * for each request.
+ *
+ * Example:
+ *
+ * ```
+ * FlacDecoder().open(Path.of("song.flac")).use { session ->
+ *     session.decodeInterleaved(firstSample = 0, maxFrames = 4096) { chunk ->
+ *         println(chunk.frames)
+ *     }
+ *     session.decodeChannels(firstSample = 48_000) { chunk ->
+ *         println(chunk.channelSamples.size)
+ *     }
+ * }
+ * ```
+ *
+ * Sessions serialise native decoder use. They are intended for repeated calls
+ * from one owner, not for concurrent decode calls from multiple threads.
  */
 interface FlacDecodingSession : AutoCloseable {
     /** STREAMINFO for the opened FLAC source. */
@@ -174,6 +190,9 @@ interface FlacDecodingSession : AutoCloseable {
 
     /**
      * Seeks to [firstSample] and forwards interleaved PCM chunks to [onChunk].
+     *
+     * [firstSample] is zero-based and counted in frames. Handler callbacks run
+     * synchronously on the calling thread before this method returns.
      */
     fun decodeInterleaved(
         firstSample: Long,
@@ -185,6 +204,9 @@ interface FlacDecodingSession : AutoCloseable {
     /**
      * Seeks to [firstSample] and forwards at most [maxFrames] interleaved PCM
      * frames.
+     *
+     * [maxFrames] is a frame count. For stereo, `maxFrames = 100` permits up to
+     * 200 integer sample values in emitted interleaved chunks.
      */
     fun decodeInterleaved(
         firstSample: Long,
@@ -196,6 +218,10 @@ interface FlacDecodingSession : AutoCloseable {
 
     /**
      * Seeks to [firstSample] and forwards channel-separated PCM chunks.
+     *
+     * Channel separation copies each native interleaved chunk into one array per
+     * channel, which is easier for per-channel processing but uses extra memory
+     * for each chunk.
      */
     fun decodeChannels(
         firstSample: Long,
@@ -207,6 +233,10 @@ interface FlacDecodingSession : AutoCloseable {
     /**
      * Seeks to [firstSample] and forwards at most [maxFrames] channel-separated
      * PCM frames.
+     *
+     * Invalid negative ranges throw [IllegalArgumentException]; native decode
+     * or source failures throw [FlacDecodeException] or the original Java
+     * exception when a callback already raised one.
      */
     fun decodeChannels(
         firstSample: Long,

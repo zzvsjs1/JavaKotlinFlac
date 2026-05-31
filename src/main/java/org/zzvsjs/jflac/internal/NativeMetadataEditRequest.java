@@ -9,6 +9,12 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
 
 /**
  * Immutable JVM-to-JNI transport object for existing-file metadata edits.
+ * <p>
+ * The object mirrors {@link NativeEncodingRequest}'s metadata transport without
+ * audio-format fields. Grouped arrays are used for convenience edits, while
+ * {@code metadataBlockTypes}/{@code metadataBlockValues} carry an exact ordered
+ * non-STREAMINFO block list. The constructor clones arrays and validates that
+ * ordered type/value arrays have matching shapes before native code reads them.
  *
  * @hidden
  */

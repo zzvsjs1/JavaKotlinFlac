@@ -13,6 +13,38 @@ import kotlin.io.path.absolutePathString
  * File paths, sequential streams, and seekable channels share the same public
  * callback models while mapping to the libFLAC entry point that fits each
  * source.
+ *
+ * Choose the API shape by how much audio the caller wants to hold at once:
+ *
+ * - [decode] returns a fully materialised [FlacDecodedAudio] and is the
+ *   simplest option for short files.
+ * - [decodeInterleaved] and [decodeChannels] stream chunks synchronously into
+ *   handlers, so callers can process large files without one huge PCM array.
+ * - [open] creates a reusable seek-capable session for repeated range reads.
+ * - [openPull] advances only when [FlacPullDecodingSession.readInterleaved] is
+ *   called, which is useful for adapters such as Java Sound.
+ *
+ * Example:
+ *
+ * ```
+ * val decoder = FlacDecoder()
+ * decoder.decodeInterleaved(Path.of("song.flac")) { chunk ->
+ *     println("frames from ${chunk.firstFrameIndex}: ${chunk.frames}")
+ * }
+ * ```
+ *
+ * Limitations and exceptions:
+ *
+ * - Plain [InputStream] decode is sequential. Use a file or
+ *   [SeekableByteChannel] when range decoding or repeated seeks are required.
+ * - `firstSample` is a zero-based frame index, not a raw sample-array index.
+ *   `maxFrames` is also counted in frames, where one frame contains one sample
+ *   for every channel.
+ * - Invalid ranges throw [IllegalArgumentException]. A valid range that starts
+ *   after the known end of the stream throws [FlacDecodeException].
+ * - Native loading, malformed FLAC data, read failures, and libFLAC callback
+ *   failures surface as [NativeLoadException], [FlacDecodeException], or the
+ *   original Java I/O/runtime exception where one is already pending.
  */
 class FlacDecoder {
     /**
@@ -75,7 +107,8 @@ class FlacDecoder {
      * Opens a pull-based decoder over a sequential FLAC or Ogg FLAC stream.
      *
      * The stream is not closed by the returned session. The native session
-     * keeps a global reference to the inspected stream wrapper until [close].
+     * keeps a global reference to the inspected stream wrapper until
+     * [FlacPullDecodingSession.close].
      */
     fun openPull(input: InputStream): FlacPullDecodingSession {
         FlacNativeLoader.load()
