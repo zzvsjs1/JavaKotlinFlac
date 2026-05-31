@@ -66,8 +66,8 @@ data class FlacEncodingMetadata @JvmOverloads constructor(
  * Builds encoder metadata from a read metadata snapshot.
  *
  * STREAMINFO is intentionally omitted because libFLAC writes encoder-derived
- * STREAMINFO for the new audio stream. The Vorbis vendor string is also not
- * preserved because libFLAC writes its own encoder vendor value.
+ * STREAMINFO for the new audio stream. Ordered Vorbis comment blocks preserve
+ * their vendor, while grouped comments use libFLAC's encoder vendor.
  */
 fun FlacMetadata.toEncodingMetadata(): FlacEncodingMetadata {
     return FlacEncodingMetadata(

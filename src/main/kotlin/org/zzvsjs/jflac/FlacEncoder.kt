@@ -341,7 +341,7 @@ private fun FlacMetadataBlock.nativeType(): Int {
 private fun FlacMetadataBlock.nativeValue(): Any {
     return when (this) {
         is FlacMetadataBlock.VorbisComment -> NativeVorbisCommentBlock(
-            null,
+            comment.vendor,
             comment.comments.toVorbisCommentEntries().toTypedArray()
         )
         is FlacMetadataBlock.Picture -> picture

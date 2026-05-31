@@ -24,14 +24,15 @@ import java.util.Objects;
  *
  * <p>Java Sound discovers providers through {@code META-INF/services}, then calls
  * the probing methods before it can expose an {@link AudioInputStream}. This
- * task implements conservative native FLAC format probing only; decoded stream
- * creation remains separate until the pull decoder is wrapped as Java Sound
- * PCM.</p>
+ * reader performs conservative FLAC/Ogg FLAC format probing before wrapping the
+ * pull decoder as Java Sound PCM.</p>
  */
 public final class FlacAudioFileReader extends AudioFileReader {
-    private static final String NOT_NATIVE_FLAC = "Input is not a native FLAC stream.";
+    private static final String NOT_FLAC_CANDIDATE = "Input is not a FLAC or Ogg FLAC stream.";
     private static final int FLAC_HEADER_BYTES = 4;
+    private static final int STREAM_DECODE_SETUP_MARK_LIMIT = 1 << 20;
     private static final byte[] FLAC_MAGIC = new byte[] { 'f', 'L', 'a', 'C' };
+    private static final byte[] OGG_MAGIC = new byte[] { 'O', 'g', 'g', 'S' };
 
     /**
      * Probes stream headers without consuming data from the caller's perspective.
@@ -42,7 +43,7 @@ public final class FlacAudioFileReader extends AudioFileReader {
      */
     @Override
     public AudioFileFormat getAudioFileFormat(InputStream stream) throws UnsupportedAudioFileException, IOException {
-        verifyFormatStreamHeader(stream);
+        HeaderDetails header = verifyFormatStreamHeader(stream);
         stream.mark(Integer.MAX_VALUE);
         /*
          * The caller stream owns the Java Sound restore mark. The core decoder
@@ -54,7 +55,7 @@ public final class FlacAudioFileReader extends AudioFileReader {
          */
         InputStream decoderStream = new NonMarkingInputStream(stream);
         try (FlacPullDecodingSession session = new FlacDecoder().openPull(decoderStream)) {
-            return FlacAudioFormats.fileFormat(session.getStreamInfo());
+            return FlacAudioFormats.fileFormat(session.getStreamInfo(), header.type(), header.container());
         } catch (FlacException e) {
             throw unsupported(e);
         } finally {
@@ -79,10 +80,10 @@ public final class FlacAudioFileReader extends AudioFileReader {
      */
     @Override
     public AudioFileFormat getAudioFileFormat(File file) throws UnsupportedAudioFileException, IOException {
-        verifyFileHeader(file);
+        HeaderDetails header = verifyFileHeader(file);
         try {
             FlacMetadata metadata = new FlacMetadataReader().read(file.toPath());
-            return FlacAudioFormats.fileFormat(metadata.getStreamInfo());
+            return FlacAudioFormats.fileFormat(metadata, header.type(), header.container());
         } catch (FlacException e) {
             throw unsupported(e);
         }
@@ -98,23 +99,39 @@ public final class FlacAudioFileReader extends AudioFileReader {
     public AudioInputStream getAudioInputStream(InputStream stream) throws UnsupportedAudioFileException, IOException {
         FlacPullDecodingSession session = null;
         boolean success = false;
+        boolean resetOnFailure = false;
         try {
-            InputStream checked = checkedStream(stream);
-            session = new FlacDecoder().openPull(checked);
+            CheckedStream checked = checkedDecodeStream(stream);
+            resetOnFailure = checked.resetOnFailure();
+            session = new FlacDecoder().openPull(checked.stream());
             AudioInputStream audioInputStream = new AudioInputStream(
                     new FlacPcmInputStream(session),
-                    FlacAudioFormats.pcmFormat(session.getStreamInfo()),
+                    FlacAudioFormats.pcmFormat(
+                            session.getStreamInfo(),
+                            FlacAudioFormats.streamInfoProperties(
+                                    session.getStreamInfo(),
+                                    checked.header().container()
+                            )
+                    ),
                     FlacAudioFormats.frameLength(session.getStreamInfo())
             );
             success = true;
             return audioInputStream;
         } catch (FlacException e) {
             Throwable failure = closeSession(session, unsupported(e));
+            failure = resetStreamOnFailure(stream, resetOnFailure, failure);
+            session = null;
+            throwFailure(failure);
+            throw new AssertionError("unreachable");
+        } catch (UnsupportedAudioFileException | IOException e) {
+            Throwable failure = closeSession(session, e);
+            failure = resetStreamOnFailure(stream, resetOnFailure, failure);
             session = null;
             throwFailure(failure);
             throw new AssertionError("unreachable");
         } catch (RuntimeException | Error e) {
             Throwable failure = closeSession(session, e);
+            failure = resetStreamOnFailure(stream, resetOnFailure, failure);
             session = null;
             throwFailure(failure);
             throw new AssertionError("unreachable");
@@ -135,11 +152,17 @@ public final class FlacAudioFileReader extends AudioFileReader {
         InputStream stream = url.openStream();
         FlacPullDecodingSession session = null;
         try {
-            InputStream checked = checkedStream(stream);
-            session = new FlacDecoder().openPull(checked);
+            CheckedStream checked = checkedStream(stream);
+            session = new FlacDecoder().openPull(checked.stream());
             return new AudioInputStream(
                     new FlacPcmInputStream(session, stream),
-                    FlacAudioFormats.pcmFormat(session.getStreamInfo()),
+                    FlacAudioFormats.pcmFormat(
+                            session.getStreamInfo(),
+                            FlacAudioFormats.streamInfoProperties(
+                                    session.getStreamInfo(),
+                                    checked.header().container()
+                            )
+                    ),
                     FlacAudioFormats.frameLength(session.getStreamInfo())
             );
         } catch (FlacException e) {
@@ -158,14 +181,21 @@ public final class FlacAudioFileReader extends AudioFileReader {
      */
     @Override
     public AudioInputStream getAudioInputStream(File file) throws UnsupportedAudioFileException, IOException {
-        verifyFileHeader(file);
+        HeaderDetails header = verifyFileHeader(file);
+        FlacMetadata metadata;
+        try {
+            metadata = new FlacMetadataReader().read(file.toPath());
+        } catch (FlacException e) {
+            throw unsupported(e);
+        }
+
         FlacPullDecodingSession session = null;
         boolean success = false;
         try {
             session = new FlacDecoder().openPull(file.toPath());
             AudioInputStream audioInputStream = new AudioInputStream(
                     new FlacPcmInputStream(session),
-                    FlacAudioFormats.pcmFormat(session.getStreamInfo()),
+                    FlacAudioFormats.fileFormat(metadata, header.type(), header.container()).getFormat(),
                     FlacAudioFormats.frameLength(session.getStreamInfo())
             );
             success = true;
@@ -187,11 +217,17 @@ public final class FlacAudioFileReader extends AudioFileReader {
         }
     }
 
-    private static boolean isNativeFlacHeader(byte[] header) {
-        return Arrays.equals(header, FLAC_MAGIC);
+    private static HeaderDetails classifyHeader(byte[] header) throws UnsupportedAudioFileException {
+        if (Arrays.equals(header, FLAC_MAGIC)) {
+            return new HeaderDetails(JflacAudioFileTypes.FLAC, FlacAudioFormats.CONTAINER_NATIVE);
+        }
+        if (Arrays.equals(header, OGG_MAGIC)) {
+            return new HeaderDetails(JflacAudioFileTypes.OGG_FLAC, FlacAudioFormats.CONTAINER_OGG);
+        }
+        throw new UnsupportedAudioFileException(NOT_FLAC_CANDIDATE);
     }
 
-    private static InputStream checkedStream(InputStream stream) throws IOException, UnsupportedAudioFileException {
+    private static CheckedStream checkedStream(InputStream stream) throws IOException, UnsupportedAudioFileException {
         Objects.requireNonNull(stream, "stream");
         if (stream.markSupported()) {
             /*
@@ -203,20 +239,35 @@ public final class FlacAudioFileReader extends AudioFileReader {
             stream.mark(FLAC_HEADER_BYTES);
             byte[] header = stream.readNBytes(FLAC_HEADER_BYTES);
             stream.reset();
-            if (!isNativeFlacHeader(header)) {
-                throw new UnsupportedAudioFileException(NOT_NATIVE_FLAC);
-            }
-            return stream;
+            return new CheckedStream(stream, classifyHeader(header));
         }
 
         byte[] header = stream.readNBytes(FLAC_HEADER_BYTES);
-        if (!isNativeFlacHeader(header)) {
-            throw new UnsupportedAudioFileException(NOT_NATIVE_FLAC);
-        }
-        return new ReplayPrefixInputStream(header, stream);
+        HeaderDetails details = classifyHeader(header);
+        return new CheckedStream(new ReplayPrefixInputStream(header, stream), details);
     }
 
-    private static void verifyFormatStreamHeader(InputStream stream) throws IOException, UnsupportedAudioFileException {
+    private static CheckedStream checkedDecodeStream(InputStream stream) throws IOException, UnsupportedAudioFileException {
+        Objects.requireNonNull(stream, "stream");
+        if (!stream.markSupported()) {
+            return checkedStream(stream);
+        }
+
+        /*
+         * Ogg containers share the same OggS magic. Keep a setup-wide restore
+         * point for mark-capable caller streams so Ogg Vorbis/Opus can still be
+         * offered to later Java Sound providers if libFLAC rejects the stream.
+         * The non-marking wrapper prevents core FLAC inspection from replacing
+         * this restore point with its own four-byte mark.
+         */
+        stream.mark(STREAM_DECODE_SETUP_MARK_LIMIT);
+        byte[] header = stream.readNBytes(FLAC_HEADER_BYTES);
+        stream.reset();
+        return new CheckedStream(new NonMarkingInputStream(stream), classifyHeader(header), true);
+    }
+
+    private static HeaderDetails verifyFormatStreamHeader(InputStream stream)
+            throws IOException, UnsupportedAudioFileException {
         Objects.requireNonNull(stream, "stream");
         if (!stream.markSupported()) {
             throw new IOException("FLAC format probing requires an InputStream with mark/reset support.");
@@ -225,18 +276,14 @@ public final class FlacAudioFileReader extends AudioFileReader {
         stream.mark(FLAC_HEADER_BYTES);
         byte[] header = stream.readNBytes(FLAC_HEADER_BYTES);
         stream.reset();
-        if (!isNativeFlacHeader(header)) {
-            throw new UnsupportedAudioFileException(NOT_NATIVE_FLAC);
-        }
+        return classifyHeader(header);
     }
 
-    private static void verifyFileHeader(File file) throws IOException, UnsupportedAudioFileException {
+    private static HeaderDetails verifyFileHeader(File file) throws IOException, UnsupportedAudioFileException {
         Objects.requireNonNull(file, "file");
         try (InputStream stream = Files.newInputStream(file.toPath())) {
             byte[] header = stream.readNBytes(FLAC_HEADER_BYTES);
-            if (!isNativeFlacHeader(header)) {
-                throw new UnsupportedAudioFileException(NOT_NATIVE_FLAC);
-            }
+            return classifyHeader(header);
         }
     }
 
@@ -271,6 +318,18 @@ public final class FlacAudioFileReader extends AudioFileReader {
     private static Throwable closeStream(InputStream stream, Throwable primary) {
         try {
             stream.close();
+            return primary;
+        } catch (IOException e) {
+            return addSuppressedOrPrimary(primary, e);
+        }
+    }
+
+    private static Throwable resetStreamOnFailure(InputStream stream, boolean reset, Throwable primary) {
+        if (!reset) {
+            return primary;
+        }
+        try {
+            stream.reset();
             return primary;
         } catch (IOException e) {
             return addSuppressedOrPrimary(primary, e);
@@ -315,6 +374,15 @@ public final class FlacAudioFileReader extends AudioFileReader {
             throw e;
         }
         throw new IOException("Failed to create FLAC PCM stream.", failure);
+    }
+
+    private record HeaderDetails(AudioFileFormat.Type type, String container) {
+    }
+
+    private record CheckedStream(InputStream stream, HeaderDetails header, boolean resetOnFailure) {
+        private CheckedStream(InputStream stream, HeaderDetails header) {
+            this(stream, header, false);
+        }
     }
 
     private static final class NonMarkingInputStream extends InputStream {

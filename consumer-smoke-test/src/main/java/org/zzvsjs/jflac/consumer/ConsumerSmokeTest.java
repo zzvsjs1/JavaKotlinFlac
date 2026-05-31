@@ -10,6 +10,7 @@ import org.zzvsjs.jflac.FlacMetadata;
 import org.zzvsjs.jflac.FlacMetadataReader;
 import org.zzvsjs.jflac.FlacNativeLoader;
 import org.zzvsjs.jflac.FlacStreamInfo;
+import org.zzvsjs.jflac.sound.JflacAudioFileTypes;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -20,6 +21,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import javax.sound.sampled.AudioFileFormat;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.AudioSystem;
@@ -81,6 +83,7 @@ public final class ConsumerSmokeTest {
             }
         }
 
+        verifyJavaSoundWriteRoundTrip();
         verifyEncodeRoundTrip();
 
         System.out.printf(
@@ -89,6 +92,99 @@ public final class ConsumerSmokeTest {
                 info.getChannels(),
                 decoded.getTotalFrames()
         );
+    }
+
+    private static void verifyJavaSoundWriteRoundTrip() throws Exception {
+        int frames = 16;
+        int channels = 2;
+        byte[] pcm = new byte[frames * channels * 2];
+        int[] samples = new int[frames * channels];
+        for (int sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+            int sample = ((sampleIndex * 37) % 65_536) - 32_768;
+            samples[sampleIndex] = sample;
+            pcm[sampleIndex * 2] = (byte) sample;
+            pcm[sampleIndex * 2 + 1] = (byte) (sample >> 8);
+        }
+
+        AudioFormat pcmFormat = new AudioFormat(
+                AudioFormat.Encoding.PCM_SIGNED,
+                22_050f,
+                16,
+                channels,
+                channels * 2,
+                22_050f,
+                false
+        );
+        Path nativeOutput = Files.createTempFile("jflac-consumer-java-sound", ".flac");
+        Path oggOutput = Files.createTempFile("jflac-consumer-java-sound", ".oga");
+        try {
+            AudioSystem.write(
+                    new AudioInputStream(new ByteArrayInputStream(pcm), pcmFormat, frames),
+                    JflacAudioFileTypes.FLAC,
+                    nativeOutput.toFile()
+            );
+            AudioSystem.write(
+                    new AudioInputStream(new ByteArrayInputStream(pcm), pcmFormat, frames),
+                    JflacAudioFileTypes.OGG_FLAC,
+                    oggOutput.toFile()
+            );
+
+            if (!Arrays.equals(samples, new FlacDecoder().decode(nativeOutput).getInterleavedSamples())) {
+                throw new IllegalStateException("Java Sound native FLAC write did not round-trip PCM.");
+            }
+            if (!Arrays.equals(samples, new FlacDecoder().decode(oggOutput).getInterleavedSamples())) {
+                throw new IllegalStateException("Java Sound Ogg FLAC write did not round-trip PCM.");
+            }
+            if (!Arrays.equals(samples, readJavaSoundPcmSamples(nativeOutput, frames, channels))) {
+                throw new IllegalStateException("Java Sound native FLAC write/read did not round-trip PCM.");
+            }
+            if (!Arrays.equals(samples, readJavaSoundPcmSamples(oggOutput, frames, channels))) {
+                throw new IllegalStateException("Java Sound Ogg FLAC write/read did not round-trip PCM.");
+            }
+
+            AudioFileFormat oggFormat = AudioSystem.getAudioFileFormat(oggOutput.toFile());
+            if (!JflacAudioFileTypes.OGG_FLAC.equals(oggFormat.getType())) {
+                throw new IllegalStateException("Java Sound Ogg FLAC read did not report OGG_FLAC type.");
+            }
+        } finally {
+            Files.deleteIfExists(nativeOutput);
+            Files.deleteIfExists(oggOutput);
+        }
+    }
+
+    private static int[] readJavaSoundPcmSamples(Path input, int frames, int channels) throws Exception {
+        try (AudioInputStream javaSoundInput = AudioSystem.getAudioInputStream(input.toFile())) {
+            AudioFormat format = javaSoundInput.getFormat();
+            if (!AudioFormat.Encoding.PCM_SIGNED.equals(format.getEncoding())) {
+                throw new IllegalStateException("Java Sound FLAC read did not return signed PCM.");
+            }
+            if (format.getSampleSizeInBits() != 16) {
+                throw new IllegalStateException("Java Sound FLAC read did not return 16-bit PCM.");
+            }
+            if (format.getChannels() != channels) {
+                throw new IllegalStateException("Java Sound FLAC read channel count did not match input PCM.");
+            }
+            if (format.getFrameSize() != channels * 2) {
+                throw new IllegalStateException("Java Sound FLAC read frame size did not match 16-bit stereo PCM.");
+            }
+            if (format.isBigEndian()) {
+                throw new IllegalStateException("Java Sound FLAC read did not return little-endian PCM.");
+            }
+
+            byte[] pcm = javaSoundInput.readAllBytes();
+            int sampleCount = Math.multiplyExact(frames, channels);
+            int expectedBytes = Math.multiplyExact(sampleCount, 2);
+            if (pcm.length != expectedBytes) {
+                throw new IllegalStateException("Java Sound FLAC read PCM byte count did not match input PCM.");
+            }
+
+            int[] samples = new int[sampleCount];
+            for (int sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
+                int byteIndex = sampleIndex * 2;
+                samples[sampleIndex] = (short) ((pcm[byteIndex] & 0xff) | (pcm[byteIndex + 1] << 8));
+            }
+            return samples;
+        }
     }
 
     private static void generateSampleFixture(Path sample) throws Exception {

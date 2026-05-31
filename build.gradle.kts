@@ -252,9 +252,10 @@ val downloadFlacSource by tasks.registering {
 
 val extractFlacSource by tasks.registering(Exec::class) {
     group = "build setup"
-    description = "Extracts the FLAC $flacVersion source archive."
+    description = "Extracts and patches the FLAC $flacVersion source archive."
     dependsOn(downloadFlacSource)
     inputs.file(flacArchive)
+    inputs.property("jflacFlacVendorPatch", "preserve-user-vorbis-vendors-v1")
     outputs.dir(flacSourceDir)
 
     doFirst {
@@ -263,6 +264,27 @@ val extractFlacSource by tasks.registering(Exec::class) {
         sourceRoot.deleteRecursively()
         sourceParent.mkdirs()
         commandLine("tar", "-xf", flacArchive.get().asFile.absolutePath, "-C", sourceParent.absolutePath)
+    }
+
+    doLast {
+        val source = flacSourceDir.get().file("src/libFLAC/stream_encoder.c").asFile
+        val original = "FLAC__add_metadata_block(encoder->protected_->metadata[i], encoder->private_->threadtask[0]->frame, true)"
+        val patched = "FLAC__add_metadata_block(encoder->protected_->metadata[i], encoder->private_->threadtask[0]->frame, false)"
+        val text = source.readText()
+
+        /*
+         * libFLAC normally replaces supplied Vorbis vendors during encode.
+         * jflac's ordered metadata mode promises exact non-STREAMINFO block
+         * preservation, so only the user metadata loop is patched; the
+         * auto-created empty Vorbis comment still uses libFLAC's vendor path.
+         */
+        require(text.contains(original) || text.contains(patched)) {
+            "Unable to locate FLAC metadata vendor update call in ${source.displayPath()}."
+        }
+
+        if (text.contains(original)) {
+            source.writeText(text.replace(original, patched))
+        }
     }
 }
 

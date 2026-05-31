@@ -1,18 +1,29 @@
 package org.zzvsjs.jflac.sound;
 
+import org.zzvsjs.jflac.FlacMetadata;
 import org.zzvsjs.jflac.FlacStreamInfo;
+import org.zzvsjs.jflac.FlacVorbisComment;
 
 import javax.sound.sampled.AudioFileFormat;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioSystem;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 final class FlacAudioFormats {
+    static final String CONTAINER_NATIVE = "native";
+    static final String CONTAINER_OGG = "ogg";
+
     private FlacAudioFormats() {
     }
 
     static AudioFormat pcmFormat(FlacStreamInfo info) {
+        return pcmFormat(info, Map.of());
+    }
+
+    static AudioFormat pcmFormat(FlacStreamInfo info, Map<String, Object> properties) {
         int bytesPerSample = (info.getBitsPerSample() + 7) / 8;
         /*
          * Java Sound frame size is measured in whole bytes for one sample frame
@@ -27,18 +38,35 @@ final class FlacAudioFormats {
                 info.getChannels(),
                 frameSize,
                 info.getSampleRate(),
-                false
+                false,
+                Map.copyOf(properties)
         );
     }
 
     static AudioFileFormat fileFormat(FlacStreamInfo info) {
-        AudioFormat format = pcmFormat(info);
+        return fileFormat(info, JflacAudioFileTypes.FLAC, CONTAINER_NATIVE);
+    }
+
+    static AudioFileFormat fileFormat(FlacStreamInfo info, AudioFileFormat.Type type, String container) {
+        Map<String, Object> properties = streamInfoProperties(info, container);
+        AudioFormat format = pcmFormat(info, properties);
+        return new AudioFileFormat(type, format, frameLength(info), properties);
+    }
+
+    static AudioFileFormat fileFormat(FlacMetadata metadata, AudioFileFormat.Type type, String container) {
+        Map<String, Object> properties = metadataProperties(metadata, container);
+        AudioFormat format = pcmFormat(metadata.getStreamInfo(), properties);
+        return new AudioFileFormat(type, format, frameLength(metadata.getStreamInfo()), properties);
+    }
+
+    static Map<String, Object> streamInfoProperties(FlacStreamInfo info, String container) {
         Map<String, Object> properties = new HashMap<>();
-        properties.put("flac.sampleRate", info.getSampleRate());
-        properties.put("flac.channels", info.getChannels());
-        properties.put("flac.bitsPerSample", info.getBitsPerSample());
-        properties.put("flac.totalSamples", info.getTotalSamples());
-        properties.put("flac.md5", info.getMd5Signature().clone());
+        properties.put(JflacAudioFileProperties.CONTAINER, container);
+        properties.put(JflacAudioFileProperties.SAMPLE_RATE, info.getSampleRate());
+        properties.put(JflacAudioFileProperties.CHANNELS, info.getChannels());
+        properties.put(JflacAudioFileProperties.BITS_PER_SAMPLE, info.getBitsPerSample());
+        properties.put(JflacAudioFileProperties.TOTAL_SAMPLES, info.getTotalSamples());
+        properties.put(JflacAudioFileProperties.MD5, info.getMd5Signature().clone());
         if (info.getTotalSamples() > 0 && info.getSampleRate() > 0) {
             /*
              * Java Sound represents duration in microseconds. Compute with Long
@@ -48,7 +76,38 @@ final class FlacAudioFormats {
             long duration = Math.multiplyExact(info.getTotalSamples(), 1_000_000L) / info.getSampleRate();
             properties.put("duration", duration);
         }
-        return new AudioFileFormat(JflacAudioFileTypes.FLAC, format, frameLength(info), properties);
+        return Map.copyOf(properties);
+    }
+
+    private static Map<String, Object> metadataProperties(FlacMetadata metadata, String container) {
+        Map<String, Object> properties = new HashMap<>(streamInfoProperties(metadata.getStreamInfo(), container));
+        FlacVorbisComment vorbisComment = metadata.getVorbisComment();
+        if (vorbisComment != null) {
+            properties.put(JflacAudioFileProperties.VORBIS_VENDOR, vorbisComment.getVendor());
+            properties.put(JflacAudioFileProperties.VORBIS_COMMENTS, copyComments(vorbisComment.getComments()));
+        }
+        putIfNotEmpty(properties, JflacAudioFileProperties.PICTURES, metadata.getPictures());
+        putIfNotEmpty(properties, JflacAudioFileProperties.APPLICATION_BLOCKS, metadata.getApplicationBlocks());
+        putIfNotEmpty(properties, JflacAudioFileProperties.SEEK_TABLES, metadata.getSeekTables());
+        putIfNotEmpty(properties, JflacAudioFileProperties.CUE_SHEETS, metadata.getCueSheets());
+        putIfNotEmpty(properties, JflacAudioFileProperties.PADDING_BLOCKS, metadata.getPaddingBlocks());
+        putIfNotEmpty(properties, JflacAudioFileProperties.UNKNOWN_BLOCKS, metadata.getUnknownBlocks());
+        putIfNotEmpty(properties, JflacAudioFileProperties.BLOCKS, metadata.getBlocks());
+        return Map.copyOf(properties);
+    }
+
+    private static Map<String, List<String>> copyComments(Map<String, List<String>> comments) {
+        Map<String, List<String>> copied = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> entry : comments.entrySet()) {
+            copied.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
+        return Map.copyOf(copied);
+    }
+
+    private static void putIfNotEmpty(Map<String, Object> properties, String key, List<?> values) {
+        if (!values.isEmpty()) {
+            properties.put(key, List.copyOf(values));
+        }
     }
 
     static int frameLength(FlacStreamInfo info) {

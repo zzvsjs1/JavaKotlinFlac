@@ -64,10 +64,10 @@ To verify the published artefact from a separate Java consumer project:
 The smoke test resolves `org.zzvsjs:jflac` and
 `org.zzvsjs:jflac-java-sound` from `mavenLocal()`, verifies that the bundled
 Windows DLLs load from the core JAR, decodes a small range from a generated
-FLAC fixture under `build/consumer-smoke/`, and checks Java Sound SPI decode.
-It also encodes a deterministic PCM buffer, reads and edits metadata, and
-decodes the output again to verify direct jflac behaviours from the published
-artefacts.
+FLAC fixture under `build/consumer-smoke/`, and checks Java Sound SPI decode
+and native/Ogg FLAC write round trips. It also encodes a deterministic PCM
+buffer, reads and edits metadata, and decodes the output again to verify direct
+jflac behaviours from the published artefacts.
 
 Consumer dependency after local publication:
 
@@ -79,9 +79,9 @@ dependencies {
 
 ## Java Sound SPI
 
-The optional `jflac-java-sound` artefact registers a Java Sound
-service-provider for native FLAC decode. It is decode-only and intentionally
-does not add Java Sound support for Ogg FLAC.
+The optional `jflac-java-sound` artefact registers Java Sound service providers
+for native FLAC and Ogg FLAC. It can decode files as signed PCM and encode
+Java Sound PCM streams back to native FLAC or Ogg FLAC.
 
 ```kotlin
 dependencies {
@@ -89,7 +89,8 @@ dependencies {
 }
 ```
 
-Existing Java Sound callers can then read a native FLAC file as signed PCM:
+Existing Java Sound callers can read a native FLAC or Ogg FLAC file as signed
+PCM:
 
 ```java
 import javax.sound.sampled.AudioInputStream;
@@ -102,7 +103,38 @@ try (AudioInputStream input = AudioSystem.getAudioInputStream(new File("music.fl
 }
 ```
 
-The returned format uses `PCM_SIGNED` little-endian bytes. A Java Sound frame
+Java Sound callers can also write PCM to FLAC by selecting a jflac file type:
+
+```java
+import org.zzvsjs.jflac.sound.JflacAudioFileTypes;
+
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+
+byte[] pcm = new byte[44100 * 2 * 2];
+AudioFormat format = new AudioFormat(
+    AudioFormat.Encoding.PCM_SIGNED,
+    44100f,
+    16,
+    2,
+    4,
+    44100f,
+    false
+);
+
+try (AudioInputStream input = new AudioInputStream(
+        new ByteArrayInputStream(pcm),
+        format,
+        44100
+)) {
+    AudioSystem.write(input, JflacAudioFileTypes.FLAC, new File("out.flac"));
+}
+```
+
+The reader returns `PCM_SIGNED` little-endian bytes. A Java Sound frame
 contains one sample for each channel:
 
 ```text
@@ -112,14 +144,41 @@ frameSize = bytesPerSample * channels
 
 For 16-bit stereo, `bytesPerSample` is two and one frame is four bytes.
 
+The writer accepts these Java Sound PCM formats:
+
+| Encoding | Bits | Endian | Writer support |
+| --- | --- | --- | --- |
+| `PCM_SIGNED` | 8 | not applicable | Yes |
+| `PCM_SIGNED` | 16, 24, 32 | little or big | Yes |
+| `PCM_UNSIGNED` | 8 | not applicable | Yes |
+| `PCM_UNSIGNED` | 16, 24, 32 | little or big | No |
+| `PCM_FLOAT`, `ALAW`, `ULAW` | any | any | No |
+
 | Capability | Java Sound SPI | Direct jflac API |
 | --- | --- | --- |
 | Decode native FLAC as PCM bytes | Yes | Yes |
+| Decode Ogg FLAC as PCM bytes | Yes | Yes |
+| Encode native FLAC from PCM bytes | Yes | Yes |
+| Encode Ogg FLAC from PCM bytes | Yes | Yes |
 | Read basic sample rate/channel/bit-depth | Yes | Yes |
+| File-backed metadata properties | Yes | Yes |
 | Ranged decode/reusable seek sessions | No | Yes |
-| Metadata reading/editing | No | Yes |
-| Encoding | No | Yes |
-| Exact metadata block preservation | No | Yes |
+| Direct encoder options | No | Yes |
+| Existing-file metadata editing | No | Yes |
+| Exact metadata block workflows | Via format properties | Yes |
+
+File-backed `AudioSystem.getAudioFileFormat(File)` and
+`AudioSystem.getAudioInputStream(File)` calls attach richer properties for
+STREAMINFO, Vorbis comments, pictures, APPLICATION blocks, SEEKTABLE blocks,
+CUESHEET blocks, PADDING blocks, unknown blocks, and the ordered `flac.blocks`
+list. Stream and URL format probes only expose STREAMINFO-derived properties
+because those sources are read sequentially and are not suitable for full
+metadata-chain inspection.
+
+For Java Sound metadata preservation during encode, pass metadata through
+`AudioInputStream.getFormat().properties()`. The grouped property keys are
+useful for typed metadata, while ordered `flac.blocks` is the exact preservation
+path for Vorbis vendor strings and non-STREAMINFO block order.
 
 If Java Sound reports the file as unsupported, verify that both
 `jflac-java-sound` and `jflac` are on the runtime classpath. The SPI module does

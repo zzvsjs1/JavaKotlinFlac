@@ -363,7 +363,7 @@ class FlacEncoderIntegrationTest {
         )
         val unknown = FlacUnknownMetadataBlock(type = 42, data = byteArrayOf(0x11, 0x22))
         val comment = FlacVorbisComment(
-            vendor = "ignored",
+            vendor = "ordered-vendor",
             comments = mapOf("TITLE" to listOf("Ordered"))
         )
         val output = Files.createTempFile("jflac-ordered-metadata-encode", ".flac")
@@ -394,6 +394,7 @@ class FlacEncoderIntegrationTest {
             assertEquals(unknown.type, (blocks[2] as FlacMetadataBlock.Unknown).unknown.type)
             assertContentEquals(unknown.data, (blocks[2] as FlacMetadataBlock.Unknown).unknown.data)
             assertIs<FlacMetadataBlock.VorbisComment>(blocks[3])
+            assertEquals("ordered-vendor", (blocks[3] as FlacMetadataBlock.VorbisComment).comment.vendor)
             assertEquals(listOf("Ordered"), (blocks[3] as FlacMetadataBlock.VorbisComment).comment.comments["TITLE"])
         } finally {
             Files.deleteIfExists(output)
