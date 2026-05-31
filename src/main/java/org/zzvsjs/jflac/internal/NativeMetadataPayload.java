@@ -10,7 +10,7 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
 
 /**
  * Immutable DTO returned directly from JNI.
- *
+ * <p>
  * The native layer fully materializes Java values before returning, so callers
  * never manage native handles for metadata objects.
  *
@@ -44,17 +44,23 @@ public final class NativeMetadataPayload {
     ) {
         // After construction completes, no native ownership remains for these
         // values; the JVM object graph is completely self-contained.
-        this.streamInfo = streamInfo;
+        this.streamInfo = java.util.Objects.requireNonNull(streamInfo, "streamInfo");
         this.vendor = vendor;
-        this.commentEntries = commentEntries.clone();
-        this.pictures = pictures.clone();
-        this.applicationBlocks = applicationBlocks.clone();
-        this.seekTables = seekTables.clone();
-        this.cueSheets = cueSheets.clone();
-        this.paddingBlocks = paddingBlocks.clone();
-        this.unknownBlocks = unknownBlocks.clone();
-        this.metadataBlockTypes = metadataBlockTypes.clone();
-        this.metadataBlockIndices = metadataBlockIndices.clone();
+        this.commentEntries = NativeTransportChecks.copyOf(commentEntries, "commentEntries");
+        this.pictures = NativeTransportChecks.copyOf(pictures, "pictures");
+        this.applicationBlocks = NativeTransportChecks.copyOf(applicationBlocks, "applicationBlocks");
+        this.seekTables = NativeTransportChecks.copyOf(seekTables, "seekTables");
+        this.cueSheets = NativeTransportChecks.copyOf(cueSheets, "cueSheets");
+        this.paddingBlocks = NativeTransportChecks.copyOf(paddingBlocks, "paddingBlocks");
+        this.unknownBlocks = NativeTransportChecks.copyOf(unknownBlocks, "unknownBlocks");
+        this.metadataBlockTypes = NativeTransportChecks.copyOf(metadataBlockTypes, "metadataBlockTypes");
+        this.metadataBlockIndices = NativeTransportChecks.copyOf(metadataBlockIndices, "metadataBlockIndices");
+        NativeTransportChecks.requireSameLength(
+                "metadataBlockTypes",
+                this.metadataBlockTypes.length,
+                "metadataBlockIndices",
+                this.metadataBlockIndices.length
+        );
     }
 
     public FlacStreamInfo getStreamInfo() {

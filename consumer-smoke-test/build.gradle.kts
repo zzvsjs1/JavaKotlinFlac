@@ -14,6 +14,7 @@ val samplePath = providers.gradleProperty("jflacSamplePath")
 
 dependencies {
     implementation("org.zzvsjs:jflac:$jflacVersion")
+    implementation("org.zzvsjs:jflac-java-sound:$jflacVersion")
 }
 
 java {

@@ -48,3 +48,5 @@ bin/
 music.flac
 /.gradle-user-home
 .idea/
+docs/superpowers/specs/
+docs/superpowers/plans/

@@ -55,6 +55,49 @@ class FlacDecoder {
     }
 
     /**
+     * Opens a pull-based file decoder.
+     *
+     * The returned session advances libFLAC only when [FlacPullDecodingSession.readInterleaved]
+     * is called. This is intended for adapters that need back-pressure from a
+     * consumer API instead of eager whole-file decoding.
+     */
+    fun openPull(path: Path): FlacPullDecodingSession {
+        val inspected = inspectNativeFlacPath(path)
+        FlacNativeLoader.load()
+        val result = NativeBindings.openPullDecoderFile(
+            inspected.path.absolutePathString(),
+            inspected.container.nativeCode
+        )
+        return NativeFlacPullDecodingSession(result.handle, result.streamInfo)
+    }
+
+    /**
+     * Opens a pull-based decoder over a sequential FLAC or Ogg FLAC stream.
+     *
+     * The stream is not closed by the returned session. The native session
+     * keeps a global reference to the inspected stream wrapper until [close].
+     */
+    fun openPull(input: InputStream): FlacPullDecodingSession {
+        FlacNativeLoader.load()
+        val inspected = inspectNativeFlacStream(input)
+        val result = NativeBindings.openPullDecoderStream(inspected.input, inspected.container.nativeCode)
+        return NativeFlacPullDecodingSession(result.handle, result.streamInfo)
+    }
+
+    /**
+     * Opens a pull-based decoder over a seekable FLAC or Ogg FLAC channel.
+     *
+     * The channel is not closed by the returned session. libFLAC byte offsets
+     * remain relative to the channel position captured at open time.
+     */
+    fun openPull(input: SeekableByteChannel): FlacPullDecodingSession {
+        FlacNativeLoader.load()
+        val container = inspectNativeFlacChannel(input)
+        val result = NativeBindings.openPullDecoderChannel(input, container.nativeCode)
+        return NativeFlacPullDecodingSession(result.handle, result.streamInfo)
+    }
+
+    /**
      * Decodes the whole FLAC file into one JVM-owned PCM buffer.
      *
      * This overload is the simplest entry point for callers that want the
@@ -948,6 +991,73 @@ internal class NativeFlacDecodingSession(
         DECODING,
         CLOSED,
         FAILED
+    }
+}
+
+/**
+ * JVM lifecycle wrapper for one native pull decoder handle.
+ *
+ * The native side owns libFLAC state and any long-lived stream/channel global
+ * references. This wrapper serialises reads and close so Java never asks the
+ * native decoder to advance while another thread is releasing the same handle.
+ */
+internal class NativeFlacPullDecodingSession(
+    initialHandle: Long,
+    override val streamInfo: FlacStreamInfo
+) : FlacPullDecodingSession {
+    private val lock = Any()
+    private var handle: Long = initialHandle
+
+    override fun readInterleaved(interleavedSamples: IntArray, maxFrames: Int): Int {
+        return synchronized(lock) {
+            val currentHandle = handle
+            check(currentHandle != 0L) { "The FLAC pull decoding session is no longer active." }
+
+            require(maxFrames >= 0) { "Max frames must be non-negative." }
+
+            val requiredSamples = maxFrames.toLong() * streamInfo.channels.toLong()
+            require(requiredSamples <= Int.MAX_VALUE.toLong()) {
+                "Interleaved sample buffer must fit maxFrames * channels."
+            }
+            require(interleavedSamples.size >= requiredSamples.toInt()) {
+                "Interleaved sample buffer must fit maxFrames * channels."
+            }
+
+            if (maxFrames == 0) {
+                return@synchronized 0
+            }
+
+            try {
+                NativeBindings.readPullDecoderInterleaved(currentHandle, interleavedSamples, maxFrames)
+            } catch (t: Throwable) {
+                /*
+                 * A native/source failure can leave libFLAC in an aborted or
+                 * otherwise unreusable decoder state. Treat that the same way
+                 * reusable callback decode does: remove the Java-visible handle
+                 * immediately so later reads fail at the session boundary, and
+                 * release the native owner while preserving the original error.
+                 */
+                handle = 0L
+                try {
+                    NativeBindings.releasePullDecoder(currentHandle)
+                } catch (releaseFailure: Throwable) {
+                    t.addSuppressed(releaseFailure)
+                }
+                throw t
+            }
+        }
+    }
+
+    override fun close() {
+        val currentHandle = synchronized(lock) {
+            val activeHandle = handle
+            handle = 0L
+            activeHandle
+        }
+
+        if (currentHandle != 0L) {
+            NativeBindings.releasePullDecoder(currentHandle)
+        }
     }
 }
 

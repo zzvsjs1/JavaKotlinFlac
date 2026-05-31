@@ -185,6 +185,7 @@ val requiredFlacDllSymbols = listOf(
     "FLAC__metadata_object_new",
     "FLAC__metadata_object_delete",
     "FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair",
+    "FLAC__metadata_object_vorbiscomment_set_vendor_string",
     "FLAC__metadata_object_vorbiscomment_append_comment",
     "FLAC__metadata_object_picture_set_mime_type",
     "FLAC__metadata_object_picture_set_description",
@@ -676,6 +677,7 @@ val consumerSmokeTest by tasks.registering(Exec::class) {
     group = "verification"
     description = "Publishes jflac to Maven local, then verifies a standalone Java consumer can load it."
     dependsOn("publishToMavenLocal")
+    dependsOn(":jflac-java-sound:publishToMavenLocal")
     onlyIf { isWindows }
 
     doFirst {

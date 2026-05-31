@@ -1,6 +1,7 @@
 package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeBindings
+import org.zzvsjs.jflac.internal.NativeEncodingRequest
 import org.junit.AfterClass
 import org.junit.BeforeClass
 import java.io.ByteArrayOutputStream
@@ -714,6 +715,111 @@ class FlacIntegrationTest {
     }
 
     @Test
+    fun metadataReaderRejectsMultipleVorbisCommentBlocks() {
+        val fixture = Files.createTempFile("jflac-duplicate-vorbis-fixture", ".flac")
+        try {
+            Files.write(fixture, duplicateVorbisCommentFixture())
+
+            val error = assertFailsWith<FlacDecodeException> {
+                FlacMetadataReader().read(fixture)
+            }
+            assertTrue(error.message.orEmpty().contains("multiple VORBIS_COMMENT"))
+        } finally {
+            Files.deleteIfExists(fixture)
+        }
+    }
+
+    @Test
+    fun nativeEncoderReturnsRegistryHandle() {
+        FlacNativeLoader.load()
+        val output = Files.createTempFile("jflac-native-encoder-handle", ".flac")
+        val request = NativeEncodingRequest(
+            44_100,
+            1,
+            16,
+            1L,
+            5,
+            true,
+            true,
+            null,
+            NativeFlacContainer.NATIVE.nativeCode,
+            null,
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            intArrayOf(),
+            emptyArray()
+        )
+        val handle = NativeBindings.openEncoderFile(output.toString(), request)
+        var finished = false
+
+        try {
+            assertTrue(handle in 1L..Int.MAX_VALUE.toLong())
+            NativeBindings.writeEncoderInterleaved(handle, intArrayOf(0), 1)
+            NativeBindings.finishEncoder(handle)
+            finished = true
+        } finally {
+            if (!finished) {
+                NativeBindings.releaseEncoder(handle)
+            }
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun nativeEncoderRejectsInvalidAndStaleHandles() {
+        FlacNativeLoader.load()
+        val output = Files.createTempFile("jflac-native-encoder-stale-handle", ".flac")
+        val request = NativeEncodingRequest(
+            44_100,
+            1,
+            16,
+            1L,
+            5,
+            true,
+            true,
+            null,
+            NativeFlacContainer.NATIVE.nativeCode,
+            null,
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            intArrayOf(),
+            emptyArray()
+        )
+
+        try {
+            assertFailsWith<IllegalStateException> {
+                NativeBindings.writeEncoderInterleaved(Long.MAX_VALUE, intArrayOf(0), 1)
+            }
+            assertFailsWith<IllegalStateException> {
+                NativeBindings.finishEncoder(Long.MAX_VALUE)
+            }
+            NativeBindings.releaseEncoder(Long.MAX_VALUE)
+
+            val handle = NativeBindings.openEncoderFile(output.toString(), request)
+            NativeBindings.releaseEncoder(handle)
+            assertFailsWith<IllegalStateException> {
+                NativeBindings.writeEncoderInterleaved(handle, intArrayOf(0), 1)
+            }
+            assertFailsWith<IllegalStateException> {
+                NativeBindings.finishEncoder(handle)
+            }
+            NativeBindings.releaseEncoder(handle)
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
     fun nativeSessionRangeDecodeRejectsInvalidArguments() {
         FlacNativeLoader.load()
         val handle = NativeBindings.openDecoderFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode)
@@ -1004,6 +1110,27 @@ class FlacIntegrationTest {
             type = FLAC_METADATA_TYPE_UNKNOWN_FIXTURE,
             isLast = false,
             payload = byteArrayOf(0x01, 0x02, 0x03)
+        )
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_VORBIS_COMMENT,
+            isLast = true,
+            payload = vorbisCommentBlock()
+        )
+        return output.toByteArray()
+    }
+
+    private fun duplicateVorbisCommentFixture(): ByteArray {
+        val output = ByteArrayOutputStream()
+        output.write("fLaC".toByteArray(Charsets.US_ASCII))
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_STREAMINFO,
+            isLast = false,
+            payload = streamInfoBlock()
+        )
+        output.writeMetadataBlock(
+            type = FLAC_METADATA_TYPE_VORBIS_COMMENT,
+            isLast = false,
+            payload = vorbisCommentBlock()
         )
         output.writeMetadataBlock(
             type = FLAC_METADATA_TYPE_VORBIS_COMMENT,

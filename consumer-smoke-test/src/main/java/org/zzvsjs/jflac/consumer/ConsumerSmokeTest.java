@@ -20,6 +20,9 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
 
 public final class ConsumerSmokeTest {
     private ConsumerSmokeTest() {
@@ -59,6 +62,23 @@ public final class ConsumerSmokeTest {
         int expectedSamples = Math.toIntExact(framesToDecode * info.getChannels());
         if (decoded.getInterleavedSamples().length != expectedSamples) {
             throw new IllegalStateException("Decoded PCM length does not match frames * channels.");
+        }
+
+        try (AudioInputStream javaSoundInput = AudioSystem.getAudioInputStream(sample.toFile())) {
+            AudioFormat javaSoundFormat = javaSoundInput.getFormat();
+            if (!AudioFormat.Encoding.PCM_SIGNED.equals(javaSoundFormat.getEncoding())) {
+                throw new IllegalStateException("Java Sound FLAC provider did not return signed PCM.");
+            }
+            if ((int) javaSoundFormat.getSampleRate() != info.getSampleRate()) {
+                throw new IllegalStateException("Java Sound sample rate does not match jflac metadata.");
+            }
+            if (javaSoundFormat.getChannels() != info.getChannels()) {
+                throw new IllegalStateException("Java Sound channel count does not match jflac metadata.");
+            }
+            byte[] javaSoundBuffer = new byte[Math.max(1, javaSoundFormat.getFrameSize())];
+            if (javaSoundInput.read(javaSoundBuffer) <= 0) {
+                throw new IllegalStateException("Java Sound FLAC provider did not produce PCM bytes.");
+            }
         }
 
         verifyEncodeRoundTrip();

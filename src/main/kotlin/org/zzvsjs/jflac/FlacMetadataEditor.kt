@@ -2,6 +2,7 @@ package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeBindings
 import org.zzvsjs.jflac.internal.NativeMetadataEditRequest
+import org.zzvsjs.jflac.internal.NativeVorbisCommentBlock
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 
@@ -163,7 +164,10 @@ private fun FlacMetadataBlock.editNativeType(): Int {
 
 private fun FlacMetadataBlock.editNativeValue(): Any {
     return when (this) {
-        is FlacMetadataBlock.VorbisComment -> comment.comments.toEditVorbisCommentEntries().toTypedArray()
+        is FlacMetadataBlock.VorbisComment -> NativeVorbisCommentBlock(
+            comment.vendor,
+            comment.comments.toEditVorbisCommentEntries().toTypedArray()
+        )
         is FlacMetadataBlock.Picture -> picture
         is FlacMetadataBlock.Application -> application
         is FlacMetadataBlock.SeekTable -> seekTable

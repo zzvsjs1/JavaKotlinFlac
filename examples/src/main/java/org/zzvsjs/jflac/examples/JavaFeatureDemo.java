@@ -1,5 +1,6 @@
 package org.zzvsjs.jflac.examples;
 
+import org.jetbrains.annotations.NotNull;
 import org.zzvsjs.jflac.FlacAudioFormat;
 import org.zzvsjs.jflac.FlacDecodeAdapter;
 import org.zzvsjs.jflac.FlacDecodeSummary;
@@ -65,7 +66,7 @@ public final class JavaFeatureDemo {
                         private int printedChunks;
 
                         @Override
-                        public void onInterleavedPcm(FlacInterleavedPcmChunk chunk) {
+                        public void onInterleavedPcm(@NotNull FlacInterleavedPcmChunk chunk) {
                             if (printedChunks < 3) {
                                 System.out.printf(
                                         "InputStream chunk %d: first frame %,d, %,d frame(s)%n",
@@ -97,8 +98,8 @@ public final class JavaFeatureDemo {
             System.out.printf("Seekable channel session summary: %,d frame(s)%n", channelSummary.getTotalFrames());
         }
 
-        FlacAudioFormat demoFormat = new FlacAudioFormat(44_100, 2, 16, Long.valueOf(DEMO_FRAMES));
-        int[] demoSamples = deterministicPcm(DEMO_FRAMES, demoFormat);
+        FlacAudioFormat demoFormat = new FlacAudioFormat(44_100, 2, 16, (long) DEMO_FRAMES);
+        int[] demoSamples = deterministicPcm(demoFormat);
 
         Path fileOutput = outputDir.resolve("java-file-session.flac");
         try (FlacEncodingSession session = new FlacEncoder().open(
@@ -183,8 +184,8 @@ public final class JavaFeatureDemo {
         );
     }
 
-    private static int[] deterministicPcm(int frames, FlacAudioFormat format) {
-        int[] samples = new int[Math.multiplyExact(frames, format.getChannels())];
+    private static int[] deterministicPcm(FlacAudioFormat format) {
+        int[] samples = new int[Math.multiplyExact(JavaFeatureDemo.DEMO_FRAMES, format.getChannels())];
         int minSample = -(1 << (format.getBitsPerSample() - 1));
         int range = 1 << format.getBitsPerSample();
 

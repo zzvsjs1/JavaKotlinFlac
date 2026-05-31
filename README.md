@@ -61,11 +61,13 @@ To verify the published artefact from a separate Java consumer project:
 .\gradlew.bat consumerSmokeTest
 ```
 
-The smoke test resolves `org.zzvsjs:jflac` from `mavenLocal()`, loads the
-bundled Windows DLLs from the JAR, and decodes a small range from a generated
-FLAC fixture under `build/consumer-smoke/`. It also encodes a deterministic PCM
-buffer, reads the metadata back, and decodes the output again to verify the
-published artefact.
+The smoke test resolves `org.zzvsjs:jflac` and
+`org.zzvsjs:jflac-java-sound` from `mavenLocal()`, verifies that the bundled
+Windows DLLs load from the core JAR, decodes a small range from a generated
+FLAC fixture under `build/consumer-smoke/`, and checks Java Sound SPI decode.
+It also encodes a deterministic PCM buffer, reads and edits metadata, and
+decodes the output again to verify direct jflac behaviours from the published
+artefacts.
 
 Consumer dependency after local publication:
 
@@ -74,6 +76,54 @@ dependencies {
     implementation("org.zzvsjs:jflac:0.1.0-SNAPSHOT")
 }
 ```
+
+## Java Sound SPI
+
+The optional `jflac-java-sound` artefact registers a Java Sound
+service-provider for native FLAC decode. It is decode-only and intentionally
+does not add Java Sound support for Ogg FLAC.
+
+```kotlin
+dependencies {
+    implementation("org.zzvsjs:jflac-java-sound:0.1.0-SNAPSHOT")
+}
+```
+
+Existing Java Sound callers can then read a native FLAC file as signed PCM:
+
+```java
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import java.io.File;
+
+try (AudioInputStream input = AudioSystem.getAudioInputStream(new File("music.flac"))) {
+    byte[] buffer = new byte[Math.max(1, input.getFormat().getFrameSize())];
+    int bytesRead = input.read(buffer);
+}
+```
+
+The returned format uses `PCM_SIGNED` little-endian bytes. A Java Sound frame
+contains one sample for each channel:
+
+```text
+bytesPerSample = ceil(bitsPerSample / 8)
+frameSize = bytesPerSample * channels
+```
+
+For 16-bit stereo, `bytesPerSample` is two and one frame is four bytes.
+
+| Capability | Java Sound SPI | Direct jflac API |
+| --- | --- | --- |
+| Decode native FLAC as PCM bytes | Yes | Yes |
+| Read basic sample rate/channel/bit-depth | Yes | Yes |
+| Ranged decode/reusable seek sessions | No | Yes |
+| Metadata reading/editing | No | Yes |
+| Encoding | No | Yes |
+| Exact metadata block preservation | No | Yes |
+
+If Java Sound reports the file as unsupported, verify that both
+`jflac-java-sound` and `jflac` are on the runtime classpath. The SPI module does
+not bundle native libraries itself; native loading remains owned by `jflac`.
 
 ## Runnable Examples
 
@@ -93,6 +143,12 @@ Run the Kotlin example:
 
 ```powershell
 .\gradlew.bat :examples:runKotlinFeatureDemo --args="music.flac"
+```
+
+Play a native FLAC file through Java Sound and your default sound output:
+
+```powershell
+.\gradlew.bat :examples:runJavaSoundPlayback --args="music.flac"
 ```
 
 Build an installed command-line program:

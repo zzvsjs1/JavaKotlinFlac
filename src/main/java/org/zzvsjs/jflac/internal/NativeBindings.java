@@ -9,7 +9,7 @@ import java.nio.channels.SeekableByteChannel;
 
 /**
  * Java declaration layer for JNI entry points.
- *
+ * <p>
  * Keeping these signatures in Java makes the native boundary explicit without
  * leaking external declarations into the public Kotlin API.
  *
@@ -56,11 +56,21 @@ public final class NativeBindings {
 
     public static native long openDecoderChannel(SeekableByteChannel input, int container);
 
+    public static native NativePullDecoderOpenResult openPullDecoderFile(String path, int container);
+
+    public static native NativePullDecoderOpenResult openPullDecoderStream(InputStream input, int container);
+
+    public static native NativePullDecoderOpenResult openPullDecoderChannel(SeekableByteChannel input, int container);
+
     public static native void decodeDecoderFrom(long handle, long firstSample, PcmConsumer consumer);
 
     public static native void decodeDecoderRange(long handle, long firstSample, long maxFrames, PcmConsumer consumer);
 
+    public static native int readPullDecoderInterleaved(long handle, int[] samples, int maxFrames);
+
     public static native void releaseDecoder(long handle);
+
+    public static native void releasePullDecoder(long handle);
 
     public static native long openEncoderFile(String path, NativeEncodingRequest request);
 

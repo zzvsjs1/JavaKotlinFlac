@@ -122,6 +122,34 @@ class FlacMetadataEditorIntegrationTest {
     }
 
     @Test
+    fun replacePreservesOrderedVorbisVendor() {
+        val output = createSmallFlac("jflac-vorbis-vendor-edit")
+        val requestedVendor = "metadata-editor-vendor"
+
+        try {
+            FlacMetadataEditor().replace(
+                output,
+                FlacEncodingMetadata(
+                    blocks = listOf(
+                        FlacMetadataBlock.VorbisComment(
+                            FlacVorbisComment(
+                                vendor = requestedVendor,
+                                comments = mapOf("TITLE" to listOf("Vendor preserved"))
+                            )
+                        )
+                    )
+                )
+            )
+
+            val metadata = FlacMetadataReader().read(output)
+            assertEquals(requestedVendor, metadata.vorbisComment?.vendor)
+            assertEquals(listOf("Vendor preserved"), metadata.vorbisComment?.comments?.get("TITLE"))
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
     fun replaceRejectsMalformedFlac() {
         val malformed = Files.createTempFile("jflac-malformed-metadata-edit", ".flac")
 

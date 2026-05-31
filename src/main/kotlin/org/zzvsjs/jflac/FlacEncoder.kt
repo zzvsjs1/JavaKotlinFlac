@@ -2,6 +2,7 @@ package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeBindings
 import org.zzvsjs.jflac.internal.NativeEncodingRequest
+import org.zzvsjs.jflac.internal.NativeVorbisCommentBlock
 import java.io.OutputStream
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.Files
@@ -23,6 +24,12 @@ private const val FLAC_CUESHEET_MAX_ISRC_BYTES = 12
 
 /* FLAC CUESHEET track and index counts are stored in unsigned 8-bit fields. */
 private const val FLAC_CUESHEET_MAX_LIST_ITEMS = 255
+
+/* Every FLAC metadata block body length is stored in a 24-bit unsigned field. */
+private const val FLAC_METADATA_MAX_BLOCK_LENGTH = 0xFF_FFFF
+
+/* PICTURE has eight 32-bit scalar fields around its MIME, description and image bytes. */
+private const val FLAC_PICTURE_FIXED_FIELD_BYTES = 32
 
 /*
  * FLAC metadata block type codes from the bitstream specification. STREAMINFO
@@ -333,7 +340,10 @@ private fun FlacMetadataBlock.nativeType(): Int {
 
 private fun FlacMetadataBlock.nativeValue(): Any {
     return when (this) {
-        is FlacMetadataBlock.VorbisComment -> comment.comments.toVorbisCommentEntries().toTypedArray()
+        is FlacMetadataBlock.VorbisComment -> NativeVorbisCommentBlock(
+            null,
+            comment.comments.toVorbisCommentEntries().toTypedArray()
+        )
         is FlacMetadataBlock.Picture -> picture
         is FlacMetadataBlock.Application -> application
         is FlacMetadataBlock.SeekTable -> seekTable
@@ -386,6 +396,7 @@ internal fun validateFlacEncodingMetadata(metadata: FlacEncodingMetadata) {
 
     validateVorbisComments(metadata.comments)
     metadata.pictures.forEach(::validatePictureMetadata)
+    metadata.applicationBlocks.forEach(::validateApplicationMetadata)
 
     require(metadata.seekTables.size <= 1) {
         "At most one SEEKTABLE metadata block can be encoded."
@@ -404,31 +415,74 @@ private fun validateOrderedMetadataBlocks(blocks: List<FlacMetadataBlock>) {
 
     blocks.forEach { block ->
         when (block) {
-            is FlacMetadataBlock.VorbisComment -> validateVorbisComments(block.comment.comments)
+            is FlacMetadataBlock.VorbisComment -> validateVorbisComments(block.comment.comments, block.comment.vendor)
             is FlacMetadataBlock.Picture -> validatePictureMetadata(block.picture)
+            is FlacMetadataBlock.Application -> validateApplicationMetadata(block.application)
             is FlacMetadataBlock.SeekTable -> validateSeekTableMetadata(block.seekTable)
             is FlacMetadataBlock.CueSheet -> validateCueSheetMetadata(block.cueSheet)
-            is FlacMetadataBlock.Application,
             is FlacMetadataBlock.Padding,
             is FlacMetadataBlock.Unknown -> Unit
         }
     }
 }
 
-private fun validateVorbisComments(comments: Map<String, List<String>>) {
-    comments.forEach { (key, _) ->
+private fun validateVorbisComments(comments: Map<String, List<String>>, vendor: String? = null) {
+    vendor?.let { nonNullVendor ->
+        require('\u0000' !in nonNullVendor) { "Vorbis vendor must not contain embedded NUL characters." }
+    }
+
+    comments.forEach { (key, values) ->
         require(key.isNotBlank()) { "Vorbis comment keys must not be blank." }
         require('=' !in key) { "Vorbis comment keys must not contain '='." }
+        require('\u0000' !in key) { "Vorbis comment keys must not contain embedded NUL characters." }
+        values.forEach { value ->
+            require('\u0000' !in value) { "Vorbis comment values must not contain embedded NUL characters." }
+        }
+    }
+    validateVorbisCommentBlockLength(vendor, comments)
+}
+
+private fun validateVorbisCommentBlockLength(vendor: String?, comments: Map<String, List<String>>) {
+    /*
+     * Vorbis-comment block layout:
+     * 4 bytes vendor length + vendor bytes + 4 bytes entry count, then each
+     * entry as 4 bytes length + UTF-8 "KEY=value" bytes.
+     */
+    var totalBytes = 8L + (vendor?.utf8ByteCount()?.toLong() ?: 0L)
+    comments.forEach { (key, values) ->
+        values.forEach { value ->
+            totalBytes += 4L + "$key=$value".utf8ByteCount().toLong()
+        }
+    }
+    require(totalBytes <= FLAC_METADATA_MAX_BLOCK_LENGTH) {
+        "VORBIS_COMMENT metadata length must fit the FLAC 24-bit metadata length field."
     }
 }
 
 private fun validatePictureMetadata(picture: FlacPicture) {
     require(picture.type >= 0) { "Picture type must be non-negative." }
     require(picture.mimeType.isNotBlank()) { "Picture MIME type must not be blank." }
+    require('\u0000' !in picture.mimeType) { "Picture MIME type must not contain embedded NUL characters." }
+    require('\u0000' !in picture.description) { "Picture description must not contain embedded NUL characters." }
     require(picture.width >= 0) { "Picture width must be non-negative." }
     require(picture.height >= 0) { "Picture height must be non-negative." }
     require(picture.depth >= 0) { "Picture depth must be non-negative." }
     require(picture.colors >= 0) { "Picture colour count must be non-negative." }
+
+    val blockBytes = FLAC_PICTURE_FIXED_FIELD_BYTES.toLong() +
+            picture.mimeType.utf8ByteCount().toLong() +
+            picture.description.utf8ByteCount().toLong() +
+            picture.data.size.toLong()
+    require(blockBytes <= FLAC_METADATA_MAX_BLOCK_LENGTH) {
+        "PICTURE metadata length must fit the FLAC 24-bit metadata length field."
+    }
+}
+
+private fun validateApplicationMetadata(application: FlacApplicationBlock) {
+    val blockBytes = 4L + application.data.size.toLong()
+    require(blockBytes <= FLAC_METADATA_MAX_BLOCK_LENGTH) {
+        "APPLICATION metadata length must fit the FLAC 24-bit metadata length field."
+    }
 }
 
 private fun validateSeekTableMetadata(seekTable: FlacSeekTable) {
@@ -473,6 +527,10 @@ private fun String.isFixedAsciiField(maxBytes: Int): Boolean {
         return false
     }
     return all { char -> char.code in 0x20..0x7e }
+}
+
+private fun String.utf8ByteCount(): Int {
+    return toByteArray(Charsets.UTF_8).size
 }
 
 /**

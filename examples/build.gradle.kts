@@ -12,6 +12,9 @@ repositories {
 
 dependencies {
     implementation(project(":"))
+    implementation(project(":jflac-java-sound"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.14.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.4")
 }
 
 java {
@@ -38,9 +41,20 @@ tasks.withType<JavaExec>().configureEach {
     )
 }
 
+tasks.test {
+    useJUnitPlatform()
+}
+
 tasks.register<JavaExec>("runKotlinFeatureDemo") {
     group = ApplicationPlugin.APPLICATION_GROUP
     description = "Runs the Kotlin jflac feature demo. Pass the FLAC path with --args."
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("org.zzvsjs.jflac.examples.KotlinFeatureDemoKt")
+}
+
+tasks.register<JavaExec>("runJavaSoundPlayback") {
+    group = ApplicationPlugin.APPLICATION_GROUP
+    description = "Plays a native FLAC file through Java Sound. Pass the FLAC path with --args."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("org.zzvsjs.jflac.examples.JavaSoundPlaybackDemo")
 }

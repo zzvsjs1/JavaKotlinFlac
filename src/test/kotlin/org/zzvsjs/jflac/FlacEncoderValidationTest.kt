@@ -5,6 +5,35 @@ import kotlin.test.assertFailsWith
 
 class FlacEncoderValidationTest {
     @Test
+    fun rejectsOversizedApplicationMetadataBlocks() {
+        val largestInvalidPayload = ByteArray(0xFF_FFFF - 4 + 1)
+
+        assertFailsWith<IllegalArgumentException> {
+            validateFlacEncodingMetadata(
+                FlacEncodingMetadata(
+                    applicationBlocks = listOf(
+                        FlacApplicationBlock(
+                            id = byteArrayOf('J'.code.toByte(), 'F'.code.toByte(), 'L'.code.toByte(), 'C'.code.toByte()),
+                            data = largestInvalidPayload
+                        )
+                    )
+                )
+            )
+        }
+    }
+
+    @Test
+    fun rejectsVorbisCommentsWithEmbeddedNulCharacters() {
+        assertFailsWith<IllegalArgumentException> {
+            validateFlacEncodingMetadata(
+                FlacEncodingMetadata(
+                    comments = mapOf("TITLE" to listOf("Bad\u0000Value"))
+                )
+            )
+        }
+    }
+
+    @Test
     fun rejectsMultipleEncodedSeekTables() {
         val metadata = FlacEncodingMetadata(
             seekTables = listOf(

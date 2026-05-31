@@ -43,7 +43,7 @@ fun main(args: Array<String>) {
         var printedChunks = 0
         val summary = FlacDecoder().decodeInterleaved(
             input = stream,
-            onChunk = FlacInterleavedPcmHandler { chunk ->
+            onChunk = { chunk ->
                 if (printedChunks < 3) {
                     println(
                         "InputStream chunk ${printedChunks + 1}: first frame ${chunk.firstFrameIndex}, " +
@@ -61,7 +61,7 @@ fun main(args: Array<String>) {
             val summary = session.decodeInterleaved(
                 firstSample = 0,
                 maxFrames = framesToRead,
-                onChunk = FlacInterleavedPcmHandler { chunk ->
+                onChunk = { chunk ->
                     println("Seekable channel session chunk: first frame ${chunk.firstFrameIndex}, ${chunk.frames} frame(s)")
                 }
             )
