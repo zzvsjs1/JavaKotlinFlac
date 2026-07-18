@@ -4,6 +4,40 @@ This project builds and bundles `FLAC.dll` from the official FLAC 1.5.0 source
 archive, with libogg 1.3.6 statically linked for Ogg FLAC support. The wrapper
 code is licensed separately under the project `LICENSE`.
 
+The bundled FLAC library contains a small downstream patch maintained in
+`native/patches`. It preserves a caller-supplied Vorbis comment vendor string
+when the ordered metadata encoding API is used and updates the corresponding
+public FLAC header documentation. Upstream libFLAC 1.5.0 normally replaces that
+vendor string with its own encoder identifier.
+
+The `examples` project uses Lanterna 3.1.5 for terminal widgets and JLine 4.3.1
+for native system-terminal access. They are unmodified runtime dependencies and
+are not part of the core `jflac` or `jflac-java-sound` API artefacts.
+
+## Lanterna (examples only)
+
+Copyright (C) 2010-2024 Martin Berglund
+
+Lanterna is free software licensed under the GNU Lesser General Public License,
+version 3 or (at your option) any later version. Its source code and licence
+terms are available from <https://github.com/mabe02/lanterna> and
+<https://www.gnu.org/licenses/lgpl-3.0.html>.
+
+The Lanterna JAR is linked as a separate Gradle dependency. Recipients may
+replace it with a compatible modified build under the terms of the LGPL.
+
+## JLine (examples only)
+
+Copyright (c) 2002-2026, the original author(s)
+
+JLine is licensed under the BSD 3-Clause License. Its source code and licence
+terms are available from <https://github.com/jline/jline3> and
+<https://opensource.org/licenses/BSD-3-Clause>.
+
+The examples use the separate `jline-terminal` and `jline-terminal-jni`
+modules. The JNI module supplies native terminal access for supported systems;
+recipients may replace these JARs in accordance with the BSD licence.
+
 ## FLAC
 
 Copyright (C) 2000-2009 Josh Coalson

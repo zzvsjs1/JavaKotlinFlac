@@ -92,7 +92,8 @@ class NativeTransportValidationTest {
             emptyArray(),
             emptyArray(),
             metadataBlockTypes,
-            metadataBlockValues
+            metadataBlockValues,
+            1
         )
     }
 

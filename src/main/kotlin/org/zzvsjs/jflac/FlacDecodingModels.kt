@@ -1,6 +1,26 @@
 package org.zzvsjs.jflac
 
 /**
+ * Optional checks applied by [FlacDecoder].
+ *
+ * @property checkMd5 asks libFLAC to compare the PCM decoded from a complete
+ *   stream with the non-zero MD5 signature stored in STREAMINFO. libFLAC
+ *   cannot perform this check after seeking, and a pull session may be closed
+ *   before physical end-of-stream, so this option is deliberately limited to
+ *   whole-stream `decode` calls. Streams without a stored MD5 signature still
+ *   decode successfully because there is no signature to compare.
+ * @property decodeChainedOgg decodes every link in a chained Ogg FLAC source.
+ *   This first wrapper iteration accepts whole-stream decode only and requires
+ *   every link to use the same sample rate, channel count, and bit depth. The
+ *   single reported [FlacStreamInfo] keeps those common format fields but uses
+ *   unknown aggregate sizes and an all-zero MD5 signature.
+ */
+data class FlacDecodingOptions @JvmOverloads constructor(
+    val checkMd5: Boolean = false,
+    val decodeChainedOgg: Boolean = false
+)
+
+/**
  * Lightweight summary returned by streaming decode entry points.
  *
  * The summary gives callers the final stream description and decoded frame

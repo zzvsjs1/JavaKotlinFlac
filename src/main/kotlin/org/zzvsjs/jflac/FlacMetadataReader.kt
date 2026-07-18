@@ -1,7 +1,6 @@
 package org.zzvsjs.jflac
 
-import org.zzvsjs.jflac.internal.NativeBindings
-import org.zzvsjs.jflac.internal.toPublicMetadata
+import org.zzvsjs.jflac.internal.NativeAccess
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 
@@ -38,9 +37,9 @@ class FlacMetadataReader {
     fun read(path: Path): FlacMetadata {
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        return NativeBindings.readMetadata(
+        return NativeAccess.readMetadata(
             inspected.path.absolutePathString(),
             inspected.container.nativeCode
-        ).toPublicMetadata()
+        )
     }
 }

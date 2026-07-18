@@ -1,8 +1,6 @@
 package org.zzvsjs.jflac
 
-import org.zzvsjs.jflac.internal.NativeBindings
-import org.zzvsjs.jflac.internal.NativeEncodingRequest
-import org.zzvsjs.jflac.internal.NativeVorbisCommentBlock
+import org.zzvsjs.jflac.internal.NativeAccess
 import java.io.OutputStream
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.Files
@@ -30,18 +28,6 @@ private const val FLAC_METADATA_MAX_BLOCK_LENGTH = 0xFF_FFFF
 
 /* PICTURE has eight 32-bit scalar fields around its MIME, description and image bytes. */
 private const val FLAC_PICTURE_FIXED_FIELD_BYTES = 32
-
-/*
- * FLAC metadata block type codes from the bitstream specification. STREAMINFO
- * uses type 0 and is intentionally absent here because libFLAC owns it for new
- * encoder streams.
- */
-private const val FLAC_METADATA_TYPE_PADDING = 1
-private const val FLAC_METADATA_TYPE_APPLICATION = 2
-private const val FLAC_METADATA_TYPE_SEEKTABLE = 3
-private const val FLAC_METADATA_TYPE_VORBIS_COMMENT = 4
-private const val FLAC_METADATA_TYPE_CUESHEET = 5
-private const val FLAC_METADATA_TYPE_PICTURE = 6
 
 /**
  * FLAC encoder backed by libFLAC.
@@ -103,9 +89,11 @@ class FlacEncoder {
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
-        val handle = NativeBindings.openEncoderFile(
+        val handle = NativeAccess.openEncoderFile(
             normalizedOutput.absolutePathString(),
-            metadata.toNativeRequest(format, options)
+            format,
+            metadata,
+            options
         )
         if (handle == 0L) {
             throw FlacEncodeException(
@@ -140,9 +128,11 @@ class FlacEncoder {
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
-        val handle = NativeBindings.openEncoderStream(
+        val handle = NativeAccess.openEncoderStream(
             output,
-            metadata.toNativeRequest(format, options)
+            format,
+            metadata,
+            options
         )
         if (handle == 0L) {
             throw FlacEncodeException(
@@ -175,9 +165,11 @@ class FlacEncoder {
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
-        val handle = NativeBindings.openEncoderChannel(
+        val handle = NativeAccess.openEncoderChannel(
             output,
-            metadata.toNativeRequest(format, options)
+            format,
+            metadata,
+            options
         )
         if (handle == 0L) {
             throw FlacEncodeException(
@@ -258,7 +250,7 @@ class FlacEncoder {
  * The session becomes terminal after either a successful finish or a native
  * failure. Further writes are rejected to keep lifecycle bugs obvious.
  */
-internal class NativeFlacEncodingSession(
+private class NativeFlacEncodingSession(
     initialHandle: Long,
     private val format: FlacAudioFormat
 ) : FlacEncodingSession {
@@ -273,7 +265,7 @@ internal class NativeFlacEncodingSession(
         }
 
         try {
-            NativeBindings.writeEncoderInterleaved(handle, samples, frames)
+            NativeAccess.writeEncoderInterleaved(handle, samples, frames)
         } catch (t: Throwable) {
             releaseAfterFailure()
             throw t
@@ -290,7 +282,7 @@ internal class NativeFlacEncodingSession(
         val currentHandle = handle
         handle = 0L
         try {
-            NativeBindings.finishEncoder(currentHandle)
+            NativeAccess.finishEncoder(currentHandle)
             state = SessionState.FINISHED
         } catch (t: Throwable) {
             state = SessionState.FAILED
@@ -319,7 +311,7 @@ internal class NativeFlacEncodingSession(
         handle = 0L
         state = SessionState.FAILED
         if (currentHandle != 0L) {
-            NativeBindings.releaseEncoder(currentHandle)
+            NativeAccess.releaseEncoder(currentHandle)
         }
     }
 
@@ -327,77 +319,6 @@ internal class NativeFlacEncodingSession(
         ACTIVE,
         FINISHED,
         FAILED
-    }
-}
-
-/**
- * Converts the high-level Kotlin models into the Java DTO used at the JNI
- * boundary.
- *
- * Flattening comment entries on the JVM keeps the native layer focused on
- * libFLAC object creation instead of wrapper-specific collection handling.
- */
-private fun FlacEncodingMetadata.toNativeRequest(
-    format: FlacAudioFormat,
-    options: FlacEncodingOptions
-): NativeEncodingRequest {
-    val commentEntries = comments.toVorbisCommentEntries().toTypedArray()
-    val metadataBlockTypes = blocks.map { block -> block.nativeType() }.toIntArray()
-    val metadataBlockValues = blocks.map { block -> block.nativeValue() }.toTypedArray()
-
-    return NativeEncodingRequest(
-        format.sampleRate,
-        format.channels,
-        format.bitsPerSample,
-        format.totalSamplesEstimate,
-        options.compressionLevel,
-        options.verify,
-        options.streamableSubset,
-        options.blockSize,
-        options.container.nativeCode,
-        options.oggSerialNumber,
-        commentEntries,
-        pictures.toTypedArray(),
-        applicationBlocks.toTypedArray(),
-        seekTables.toTypedArray(),
-        cueSheets.toTypedArray(),
-        paddingBlocks.toTypedArray(),
-        unknownBlocks.toTypedArray(),
-        metadataBlockTypes,
-        metadataBlockValues
-    )
-}
-
-private fun Map<String, List<String>>.toVorbisCommentEntries(): List<String> {
-    return entries.flatMap { (key, values) ->
-        values.map { value -> "$key=$value" }
-    }
-}
-
-private fun FlacMetadataBlock.nativeType(): Int {
-    return when (this) {
-        is FlacMetadataBlock.VorbisComment -> FLAC_METADATA_TYPE_VORBIS_COMMENT
-        is FlacMetadataBlock.Picture -> FLAC_METADATA_TYPE_PICTURE
-        is FlacMetadataBlock.Application -> FLAC_METADATA_TYPE_APPLICATION
-        is FlacMetadataBlock.SeekTable -> FLAC_METADATA_TYPE_SEEKTABLE
-        is FlacMetadataBlock.CueSheet -> FLAC_METADATA_TYPE_CUESHEET
-        is FlacMetadataBlock.Padding -> FLAC_METADATA_TYPE_PADDING
-        is FlacMetadataBlock.Unknown -> unknown.type
-    }
-}
-
-private fun FlacMetadataBlock.nativeValue(): Any {
-    return when (this) {
-        is FlacMetadataBlock.VorbisComment -> NativeVorbisCommentBlock(
-            comment.vendor,
-            comment.comments.toVorbisCommentEntries().toTypedArray()
-        )
-        is FlacMetadataBlock.Picture -> picture
-        is FlacMetadataBlock.Application -> application
-        is FlacMetadataBlock.SeekTable -> seekTable
-        is FlacMetadataBlock.CueSheet -> cueSheet
-        is FlacMetadataBlock.Padding -> padding
-        is FlacMetadataBlock.Unknown -> unknown
     }
 }
 
@@ -425,6 +346,7 @@ internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
 internal fun validateFlacEncodingOptions(options: FlacEncodingOptions) {
     require(options.compressionLevel in 0..8) { "Compression level must be between 0 and 8." }
     require(options.blockSize == null || options.blockSize > 0) { "Block size must be positive when provided." }
+    require(options.numThreads in 1..128) { "Encoder thread count must be between 1 and 128." }
     require(options.container == FlacEncodingContainer.OGG || options.oggSerialNumber == null) {
         "Ogg serial number can only be set for Ogg FLAC encoding."
     }

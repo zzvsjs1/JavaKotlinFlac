@@ -1,7 +1,6 @@
-package org.zzvsjs.jflac
+package org.zzvsjs.jflac.internal
 
-import org.zzvsjs.jflac.internal.NativeBindings
-import org.zzvsjs.jflac.internal.NativeEncodingRequest
+import org.zzvsjs.jflac.*
 import org.junit.AfterClass
 import org.junit.BeforeClass
 import java.io.ByteArrayOutputStream
@@ -26,6 +25,7 @@ private const val FLAC_METADATA_TYPE_APPLICATION = 2
 private const val FLAC_METADATA_TYPE_VORBIS_COMMENT = 4
 private const val FLAC_METADATA_TYPE_UNKNOWN_FIXTURE = 42
 private const val FLAC_STREAMINFO_LENGTH = 34
+private const val FLAC_STREAMINFO_MD5_OFFSET = 26
 private const val FLAC_METADATA_MAX_PAYLOAD_LENGTH = 0xFF_FFFF
 
 /**
@@ -116,6 +116,110 @@ class FlacIntegrationTest {
         assertTrue(consumer.totalFrames > 0)
         assertEquals(0L, consumer.invalidChunkCount)
         assertEquals(consumer.streamInfo!!.totalSamples, consumer.totalFrames)
+    }
+
+    @Test
+    fun md5CheckingAcceptsValidWholeStreamSources() {
+        val decoder = FlacDecoder(FlacDecodingOptions(checkMd5 = true))
+        val fromFile = decoder.decode(sampleFile)
+
+        val fromStream = Files.newInputStream(sampleFile).use { input ->
+            decoder.decode(input)
+        }
+        val fromChannel = Files.newByteChannel(sampleFile).use { channel ->
+            decoder.decode(channel)
+        }
+
+        assertContentEquals(fromFile.interleavedSamples, fromStream.interleavedSamples)
+        assertContentEquals(fromFile.interleavedSamples, fromChannel.interleavedSamples)
+    }
+
+    @Test
+    fun md5CheckingRejectsMismatchedStreamInfoSignature() {
+        val corrupted = Files.createTempFile("jflac-md5-mismatch", ".flac")
+        try {
+            val bytes = Files.readAllBytes(sampleFile)
+            assertEquals(FLAC_METADATA_TYPE_STREAMINFO, bytes[4].toInt() and 0x7F)
+
+            /*
+             * STREAMINFO starts immediately after the four-byte FLAC marker
+             * and its four-byte metadata header. The 16-byte MD5 signature
+             * begins at absolute byte 26, so changing one signature byte keeps
+             * the encoded frames valid while making the checksum disagree.
+             */
+            bytes[FLAC_STREAMINFO_MD5_OFFSET] =
+                (bytes[FLAC_STREAMINFO_MD5_OFFSET].toInt() xor 0x01).toByte()
+            Files.write(corrupted, bytes)
+
+            val unchecked = FlacDecoder().decode(corrupted)
+            assertTrue(unchecked.totalFrames > 0L)
+
+            val decoder = FlacDecoder(FlacDecodingOptions(checkMd5 = true))
+            val failures = listOf(
+                assertFailsWith<FlacDecodeException> { decoder.decode(corrupted) },
+                assertFailsWith<FlacDecodeException> {
+                    Files.newInputStream(corrupted).use(decoder::decode)
+                },
+                assertFailsWith<FlacDecodeException> {
+                    Files.newByteChannel(corrupted).use(decoder::decode)
+                }
+            )
+            failures.forEach { failure -> assertTrue(failure.message.orEmpty().contains("MD5")) }
+        } finally {
+            Files.deleteIfExists(corrupted)
+        }
+    }
+
+    @Test
+    fun md5CheckingAcceptsAnUnavailableZeroSignature() {
+        val withoutSignature = Files.createTempFile("jflac-md5-unavailable", ".flac")
+        try {
+            val bytes = Files.readAllBytes(sampleFile)
+            bytes.fill(
+                element = 0,
+                fromIndex = FLAC_STREAMINFO_MD5_OFFSET,
+                toIndex = FLAC_STREAMINFO_MD5_OFFSET + 16
+            )
+            Files.write(withoutSignature, bytes)
+
+            val decoded = FlacDecoder(FlacDecodingOptions(checkMd5 = true)).decode(withoutSignature)
+            assertTrue(decoded.totalFrames > 0L)
+            assertContentEquals(ByteArray(16), decoded.streamInfo.md5Signature)
+        } finally {
+            Files.deleteIfExists(withoutSignature)
+        }
+    }
+
+    @Test
+    fun md5CheckingRejectsPartialAndSessionDecodeShapes() {
+        val decoder = FlacDecoder(FlacDecodingOptions(checkMd5 = true))
+
+        val rangeFailure = assertFailsWith<IllegalArgumentException> {
+            decoder.decode(sampleFile, firstSample = 0, maxFrames = 1)
+        }
+        assertTrue(rangeFailure.message.orEmpty().contains("whole-stream"))
+
+        val sessionFailure = assertFailsWith<IllegalArgumentException> {
+            decoder.open(sampleFile)
+        }
+        assertTrue(sessionFailure.message.orEmpty().contains("whole-stream"))
+
+        val pullFailure = assertFailsWith<IllegalArgumentException> {
+            decoder.openPull(sampleFile)
+        }
+        assertTrue(pullFailure.message.orEmpty().contains("whole-stream"))
+
+        val seekFailure = assertFailsWith<IllegalArgumentException> {
+            decoder.decode(sampleFile, firstSample = 0, consumer = CollectingConsumer())
+        }
+        assertTrue(seekFailure.message.orEmpty().contains("whole-stream"))
+
+        Files.newByteChannel(sampleFile).use { channel ->
+            val channelSessionFailure = assertFailsWith<IllegalArgumentException> {
+                decoder.open(channel)
+            }
+            assertTrue(channelSessionFailure.message.orEmpty().contains("whole-stream"))
+        }
     }
 
     @Test
@@ -752,7 +856,8 @@ class FlacIntegrationTest {
             emptyArray(),
             emptyArray(),
             intArrayOf(),
-            emptyArray()
+            emptyArray(),
+            1
         )
         val handle = NativeBindings.openEncoderFile(output.toString(), request)
         var finished = false
@@ -793,7 +898,8 @@ class FlacIntegrationTest {
             emptyArray(),
             emptyArray(),
             intArrayOf(),
-            emptyArray()
+            emptyArray(),
+            1
         )
 
         try {
@@ -1004,7 +1110,7 @@ class FlacIntegrationTest {
         FlacNativeLoader.load()
 
         assertFailsWith<IllegalArgumentException> {
-            NativeBindings.decodeFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode, null)
+            NativeBindings.decodeFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode, false, false, null)
         }
     }
 

@@ -5,17 +5,20 @@ import java.io.InputStream
 import java.io.PushbackInputStream
 import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.Locale
+import org.zzvsjs.jflac.internal.NativeAccess
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.isRegularFile
 
 /**
- * Extracts and loads bundled Windows x64 native runtime dependencies.
+ * Extracts and loads the bundled native runtime for the current platform.
  *
  * The loader is deterministic:
  * - resources are loaded from the JAR in dependency order
@@ -31,8 +34,9 @@ object FlacNativeLoader {
     /**
      * Ensures the native runtime is available and returns the extraction path.
      *
-     * Loading order matters on Windows because `jflac-jni.dll` depends on
-     * `FLAC.dll`.
+     * The dependency runtime is loaded before the JNI shim on every platform.
+     * The shim then resolves the exact sibling libFLAC path as a second defence
+     * against an unrelated system library satisfying only part of the API.
      */
     @Synchronized
     fun load(): Path {
@@ -50,6 +54,12 @@ object FlacNativeLoader {
             platform.libraries.forEach { library ->
                 System.load(extractedLibraries.getValue(library).toAbsolutePath().toString())
             }
+            /*
+             * Loading a DLL only proves that the operating-system loader could
+             * map it. Resolve the complete libFLAC contract now so version,
+             * Ogg capability, and missing-symbol errors are reported by load().
+             */
+            NativeAccess.verifyRuntime()
         } catch (e: UnsatisfiedLinkError) {
             throw NativeLoadException("Failed to load native libraries.", e)
         }
@@ -65,7 +75,7 @@ object FlacNativeLoader {
      * Computes the stable directory where native files are extracted.
      *
      * The hash is based on the embedded binary contents so a new build cannot
-     * accidentally reuse stale DLLs from a previous version.
+     * accidentally reuse stale native libraries from a previous version.
      */
     private fun extractionDirectory(platform: NativePlatform): Path {
         val version = javaClass.`package`?.implementationVersion ?: VERSION_FALLBACK
@@ -87,17 +97,41 @@ object FlacNativeLoader {
     }
 
     /**
-     * Copies a bundled resource to disk if it is not already present.
-     *
-     * V1 keeps extraction simple: overwrite semantics are allowed and the hash
-     * in the directory name is relied on for cache invalidation.
+     * Copies a bundled resource through a same-directory temporary file and an
+     * atomic move. Existing files are accepted only after their content digest
+     * matches the resource, which repairs interrupted or externally corrupted
+     * extractions instead of attempting to load them.
      */
     private fun extractResource(resourcePath: String, targetDirectory: Path): Path {
         val targetFile = targetDirectory.resolve(resourcePath.substringAfterLast('/'))
-        openResource(resourcePath).use { input ->
-            if (!targetFile.exists()) {
-                Files.copy(input, targetFile, StandardCopyOption.REPLACE_EXISTING)
+        val resourceBytes = openResource(resourcePath).use(InputStream::readBytes)
+        val expectedDigest = MessageDigest.getInstance("SHA-256").digest(resourceBytes)
+        if (Files.isRegularFile(targetFile, LinkOption.NOFOLLOW_LINKS) &&
+            MessageDigest.isEqual(expectedDigest, MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(targetFile)))
+        ) {
+            return targetFile
+        }
+
+        val temporaryFile = Files.createTempFile(targetDirectory, "${targetFile.fileName}.", ".tmp")
+        try {
+            Files.write(temporaryFile, resourceBytes)
+            try {
+                Files.move(
+                    temporaryFile,
+                    targetFile,
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temporaryFile, targetFile, StandardCopyOption.REPLACE_EXISTING)
             }
+        } finally {
+            Files.deleteIfExists(temporaryFile)
+        }
+
+        val extractedDigest = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(targetFile))
+        if (!MessageDigest.isEqual(expectedDigest, extractedDigest)) {
+            throw NativeLoadException("Extracted native resource failed verification: $resourcePath")
         }
         return targetFile
     }
@@ -121,6 +155,31 @@ internal data class NativePlatform(
                 NativeLibrary("jflac-jni.dll")
             )
         )
+        private val LINUX_X64 = NativePlatform(
+            id = "linux-x86_64",
+            resourceRoot = "META-INF/native/linux-x86_64",
+            libraries = listOf(
+                NativeLibrary("libFLAC.so.14"),
+                NativeLibrary("libjflac-jni.so")
+            )
+        )
+        private val MACOS_X64 = NativePlatform(
+            id = "macos-x86_64",
+            resourceRoot = "META-INF/native/macos-x86_64",
+            libraries = listOf(
+                NativeLibrary("libFLAC.14.dylib"),
+                NativeLibrary("libjflac-jni.dylib")
+            )
+        )
+        private val MACOS_ARM64 = NativePlatform(
+            id = "macos-aarch64",
+            resourceRoot = "META-INF/native/macos-aarch64",
+            libraries = listOf(
+                NativeLibrary("libFLAC.14.dylib"),
+                NativeLibrary("libjflac-jni.dylib")
+            )
+        )
+        private val SUPPORTED_PLATFORMS = listOf(WINDOWS_X64, LINUX_X64, MACOS_X64, MACOS_ARM64)
 
         fun current(): NativePlatform = detect(
             osName = System.getProperty("os.name"),
@@ -128,19 +187,15 @@ internal data class NativePlatform(
         )
 
         fun detect(osName: String, osArch: String): NativePlatform {
-            val detectedOs = normaliseOperatingSystem(osName)
-            val detectedArch = normaliseArchitecture(osArch)
-            val platformId = listOf(detectedOs, detectedArch)
-                .filterNotNull()
-                .joinToString("-")
-                .ifEmpty { "${osName.lowercase(Locale.ROOT)}-${osArch.lowercase(Locale.ROOT)}" }
+            val detectedOs = normaliseOperatingSystem(osName) ?: diagnosticComponent(osName)
+            val detectedArch = normaliseArchitecture(osArch) ?: diagnosticComponent(osArch)
+            val platformId = "$detectedOs-$detectedArch"
 
-            if (platformId == WINDOWS_X64.id) {
-                return WINDOWS_X64
-            }
+            SUPPORTED_PLATFORMS.firstOrNull { platform -> platform.id == platformId }?.let { return it }
 
             throw UnsupportedFeatureException(
-                "Native FLAC runtime is not available for $platformId. This build bundles ${WINDOWS_X64.id} only."
+                "Native FLAC runtime is not available for $platformId. Supported resource targets: " +
+                    SUPPORTED_PLATFORMS.joinToString { platform -> platform.id } + "."
             )
         }
 
@@ -156,11 +211,17 @@ internal data class NativePlatform(
 
         private fun normaliseArchitecture(osArch: String): String? {
             return when (osArch.lowercase(Locale.ROOT)) {
-                "amd64", "x86_64" -> "x86_64"
+                "amd64", "x86_64", "x64" -> "x86_64"
                 "aarch64", "arm64" -> "aarch64"
                 else -> null
             }
         }
+
+        private fun diagnosticComponent(value: String): String = value
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[^a-z0-9]+"), "-")
+            .trim('-')
+            .ifEmpty { "unknown" }
     }
 }
 

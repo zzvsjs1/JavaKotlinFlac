@@ -149,13 +149,7 @@ public final class FlacAudioFileReader extends AudioFileReader {
             session = null;
             throwFailure(failure);
             throw new AssertionError("unreachable");
-        } catch (UnsupportedAudioFileException | IOException e) {
-            Throwable failure = closeSession(session, e);
-            failure = resetStreamOnFailure(stream, resetOnFailure, failure);
-            session = null;
-            throwFailure(failure);
-            throw new AssertionError("unreachable");
-        } catch (RuntimeException | Error e) {
+        } catch (UnsupportedAudioFileException | IOException | RuntimeException | Error e) {
             Throwable failure = closeSession(session, e);
             failure = resetStreamOnFailure(stream, resetOnFailure, failure);
             session = null;

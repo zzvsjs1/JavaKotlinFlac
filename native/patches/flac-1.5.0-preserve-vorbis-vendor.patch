@@ -1,0 +1,32 @@
+diff --git a/include/FLAC/stream_encoder.h b/include/FLAC/stream_encoder.h
+--- a/include/FLAC/stream_encoder.h
++++ b/include/FLAC/stream_encoder.h
+@@ -1237,11 +1237,11 @@ FLAC_API FLAC__bool FLAC__stream_encoder_set_metadata(FLAC__StreamEncoder *encod
+  *
+  * \note
+  * A VORBIS_COMMENT block may be supplied.  The vendor string in it
+- * will be ignored.  libFLAC will use it's own vendor string. libFLAC
+- * will not modify the passed-in VORBIS_COMMENT's vendor string, it
+- * will simply write it's own into the stream.  If no VORBIS_COMMENT
+- * block is present in the \a metadata array, libFLAC will write an
+- * empty one, containing only the vendor string.
++ * is preserved by the jflac bundled build.  This differs from the
++ * upstream libFLAC behaviour, which ignores the supplied vendor and
++ * writes its own string instead.  If no VORBIS_COMMENT block is
++ * present in the \a metadata array, libFLAC still writes an empty one
++ * containing its own vendor string.
+  *
+  * \note The Ogg FLAC mapping requires that the VORBIS_COMMENT block be
+  * the second metadata block of the stream.  The encoder already supplies
+diff --git a/src/libFLAC/stream_encoder.c b/src/libFLAC/stream_encoder.c
+--- a/src/libFLAC/stream_encoder.c
++++ b/src/libFLAC/stream_encoder.c
+@@ -1417,7 +1417,7 @@ static FLAC__StreamEncoderInitStatus init_stream_internal_(
+ 	 */
+ 	for(i = 0; i < encoder->protected_->num_metadata_blocks; i++) {
+ 		encoder->protected_->metadata[i]->is_last = (i == encoder->protected_->num_metadata_blocks - 1);
+-		if(!FLAC__add_metadata_block(encoder->protected_->metadata[i], encoder->private_->threadtask[0]->frame, true)) {
++		if(!FLAC__add_metadata_block(encoder->protected_->metadata[i], encoder->private_->threadtask[0]->frame, false)) {
+ 			encoder->protected_->state = FLAC__STREAM_ENCODER_FRAMING_ERROR;
+ 			return FLAC__STREAM_ENCODER_INIT_STATUS_ENCODER_ERROR;
+ 		}

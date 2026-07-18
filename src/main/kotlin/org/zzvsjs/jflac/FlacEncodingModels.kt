@@ -54,6 +54,9 @@ enum class FlacEncodingContainer(internal val nativeCode: Int) {
  *   inspected by the encoder.
  * @property oggSerialNumber optional Ogg stream serial number. It is only valid
  *   when [container] is [FlacEncodingContainer.OGG].
+ * @property numThreads maximum encoder thread count. `1` uses the traditional
+ *   single-threaded path; values `2..128` request FLAC 1.5 parallel encoding
+ *   and require a bundled libFLAC built with pthread support.
  */
 data class FlacEncodingOptions @JvmOverloads constructor(
     val compressionLevel: Int = 5,
@@ -61,7 +64,8 @@ data class FlacEncodingOptions @JvmOverloads constructor(
     val streamableSubset: Boolean = true,
     val blockSize: Int? = null,
     val container: FlacEncodingContainer = FlacEncodingContainer.NATIVE,
-    val oggSerialNumber: Int? = null
+    val oggSerialNumber: Int? = null,
+    val numThreads: Int = 1
 )
 
 /**

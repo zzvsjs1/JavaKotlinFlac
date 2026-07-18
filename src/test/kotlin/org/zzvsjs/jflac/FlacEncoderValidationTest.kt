@@ -5,6 +5,16 @@ import kotlin.test.assertFailsWith
 
 class FlacEncoderValidationTest {
     @Test
+    fun rejectsEncoderThreadCountsOutsideFlacLimits() {
+        assertFailsWith<IllegalArgumentException> {
+            validateFlacEncodingOptions(FlacEncodingOptions(numThreads = 0))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            validateFlacEncodingOptions(FlacEncodingOptions(numThreads = 129))
+        }
+    }
+
+    @Test
     fun rejectsOversizedApplicationMetadataBlocks() {
         val largestInvalidPayload = ByteArray(0xFF_FFFF - 4 + 1)
 

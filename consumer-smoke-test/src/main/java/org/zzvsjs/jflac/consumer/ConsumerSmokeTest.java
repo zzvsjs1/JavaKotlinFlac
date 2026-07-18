@@ -41,9 +41,8 @@ public final class ConsumerSmokeTest {
         }
 
         Path nativeDir = FlacNativeLoader.INSTANCE.load();
-        if (!Files.isRegularFile(nativeDir.resolve("FLAC.dll"))
-                || !Files.isRegularFile(nativeDir.resolve("jflac-jni.dll"))) {
-            throw new IllegalStateException("Published jflac artefact did not extract the bundled Windows DLLs.");
+        if (!Files.isDirectory(nativeDir)) {
+            throw new IllegalStateException("Published jflac artefact did not extract its native runtime.");
         }
 
         FlacMetadata metadata = new FlacMetadataReader().read(sample);

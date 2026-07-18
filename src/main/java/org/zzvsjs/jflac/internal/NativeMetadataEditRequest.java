@@ -18,7 +18,7 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
  *
  * @hidden
  */
-public final class NativeMetadataEditRequest {
+final class NativeMetadataEditRequest {
     private final String[] commentEntries;
     private final FlacPicture[] pictures;
     private final FlacApplicationBlock[] applicationBlocks;

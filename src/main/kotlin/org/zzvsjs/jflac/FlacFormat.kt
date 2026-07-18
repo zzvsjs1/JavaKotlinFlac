@@ -1,6 +1,6 @@
 package org.zzvsjs.jflac
 
-import org.zzvsjs.jflac.internal.NativeBindings
+import org.zzvsjs.jflac.internal.NativeAccess
 
 /**
  * Small public wrapper around libFLAC's format legality helpers.
@@ -26,14 +26,14 @@ object FlacFormat {
     @JvmStatic
     fun isSampleRateValid(sampleRate: Int): Boolean {
         FlacNativeLoader.load()
-        return NativeBindings.isSampleRateValid(sampleRate)
+        return NativeAccess.isSampleRateValid(sampleRate)
     }
 
     /** Returns whether [sampleRate] fits the FLAC streamable subset. */
     @JvmStatic
     fun isSampleRateSubset(sampleRate: Int): Boolean {
         FlacNativeLoader.load()
-        return NativeBindings.isSampleRateSubset(sampleRate)
+        return NativeAccess.isSampleRateSubset(sampleRate)
     }
 
     /**
@@ -45,7 +45,7 @@ object FlacFormat {
     @JvmStatic
     fun isBlockSizeSubset(blockSize: Int, sampleRate: Int): Boolean {
         FlacNativeLoader.load()
-        return NativeBindings.isBlockSizeSubset(blockSize, sampleRate)
+        return NativeAccess.isBlockSizeSubset(blockSize, sampleRate)
     }
 
     /**
@@ -56,21 +56,21 @@ object FlacFormat {
     @JvmStatic
     fun isVorbisCommentNameLegal(name: String): Boolean {
         FlacNativeLoader.load()
-        return NativeBindings.isVorbisCommentNameLegal(name)
+        return NativeAccess.isVorbisCommentNameLegal(name)
     }
 
     /** Returns whether a Vorbis comment value is legal UTF-8 text for FLAC. */
     @JvmStatic
     fun isVorbisCommentValueLegal(value: String): Boolean {
         FlacNativeLoader.load()
-        return NativeBindings.isVorbisCommentValueLegal(value)
+        return NativeAccess.isVorbisCommentValueLegal(value)
     }
 
     /** Returns whether a full `KEY=value` Vorbis comment entry is legal. */
     @JvmStatic
     fun isVorbisCommentEntryLegal(entry: String): Boolean {
         FlacNativeLoader.load()
-        return NativeBindings.isVorbisCommentEntryLegal(entry)
+        return NativeAccess.isVorbisCommentEntryLegal(entry)
     }
 
     /**
@@ -80,6 +80,6 @@ object FlacFormat {
     @JvmStatic
     fun pictureViolation(picture: FlacPicture): String? {
         FlacNativeLoader.load()
-        return NativeBindings.pictureViolation(picture)
+        return NativeAccess.pictureViolation(picture)
     }
 }

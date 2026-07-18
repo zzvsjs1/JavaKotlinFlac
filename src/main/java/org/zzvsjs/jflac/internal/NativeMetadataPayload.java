@@ -16,7 +16,7 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
  *
  * @hidden
  */
-public final class NativeMetadataPayload {
+final class NativeMetadataPayload {
     private final FlacStreamInfo streamInfo;
     private final String vendor;
     private final String[] commentEntries;

@@ -10,7 +10,7 @@ package org.zzvsjs.jflac.internal;
  *
  * @hidden
  */
-public final class NativeVorbisCommentBlock {
+final class NativeVorbisCommentBlock {
     private final String vendor;
     private final String[] entries;
 

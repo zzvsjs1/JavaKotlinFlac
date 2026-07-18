@@ -26,17 +26,38 @@ import java.nio.channels.SeekableByteChannel;
  *
  * @hidden
  */
-public final class NativeBindings {
+final class NativeBindings {
     private NativeBindings() {
     }
 
+    /** Forces native symbol, version, and feature validation during loader initialisation. */
+    public static native void verifyRuntime();
+
     public static native NativeMetadataPayload readMetadata(String path, int container);
 
-    public static native void decodeFile(String path, int container, PcmConsumer consumer);
+    public static native void decodeFile(
+            String path,
+            int container,
+            boolean checkMd5,
+            boolean decodeChainedOgg,
+            PcmConsumer consumer
+    );
 
-    public static native void decodeStream(InputStream input, int container, PcmConsumer consumer);
+    public static native void decodeStream(
+            InputStream input,
+            int container,
+            boolean checkMd5,
+            boolean decodeChainedOgg,
+            PcmConsumer consumer
+    );
 
-    public static native void decodeChannel(SeekableByteChannel input, int container, PcmConsumer consumer);
+    public static native void decodeChannel(
+            SeekableByteChannel input,
+            int container,
+            boolean checkMd5,
+            boolean decodeChainedOgg,
+            PcmConsumer consumer
+    );
 
     public static native void decodeFileFrom(String path, int container, long firstSample, PcmConsumer consumer);
 

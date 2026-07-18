@@ -1,0 +1,159 @@
+name: Cross-platform native build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Build and test ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            runner: windows-2025
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+          - target: macos-x86_64
+            runner: macos-15-intel
+          - target: macos-aarch64
+            runner: macos-15
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build, test, and run the host consumer smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\gradlew.bat build publishToMavenLocal consumerSmokeTest --no-daemon --stacktrace
+
+      - name: Build, test, and run the host consumer smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash ./gradlew build publishToMavenLocal consumerSmokeTest --no-daemon --stacktrace
+
+      - name: Upload the host native bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: build/generated-resources/main/META-INF/native
+          if-no-files-found: error
+          retention-days: 7
+
+  universal:
+    name: Assemble and verify the universal JAR
+    needs: native
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download all native bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: build/ci-native-bundles/META-INF/native
+          merge-multiple: true
+
+      - name: Build and verify one cross-platform artefact
+        shell: bash
+        run: >-
+          bash ./gradlew build --no-daemon --stacktrace
+          -Pjflac.nativeBundleDirectory=build/ci-native-bundles
+
+      - name: Upload universal consumer artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: universal-jars
+          path: |
+            build/libs/jflac-*.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-javadoc.jar
+            jflac-java-sound/build/libs/jflac-java-sound-*.jar
+            !jflac-java-sound/build/libs/*-sources.jar
+            !jflac-java-sound/build/libs/*-javadoc.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  universal-smoke:
+    name: Test the universal JAR on ${{ matrix.target }}
+    needs: universal
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            runner: windows-2025
+          - target: linux-x86_64
+            runner: ubuntu-22.04
+          - target: macos-x86_64
+            runner: macos-15-intel
+          - target: macos-aarch64
+            runner: macos-15
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download the universal JARs
+        uses: actions/download-artifact@v4
+        with:
+          name: universal-jars
+          path: .
+
+      - name: Run the universal consumer smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          .\gradlew.bat -p consumer-smoke-test run --no-daemon --stacktrace
+          "-PjflacJar=$env:GITHUB_WORKSPACE\build\libs\jflac-0.1.0-SNAPSHOT.jar"
+          "-PjflacJavaSoundJar=$env:GITHUB_WORKSPACE\jflac-java-sound\build\libs\jflac-java-sound-0.1.0-SNAPSHOT.jar"
+          "-PjflacSamplePath=$env:GITHUB_WORKSPACE\build\consumer-smoke\universal.flac"
+
+      - name: Run the universal consumer smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash ./gradlew -p consumer-smoke-test run --no-daemon --stacktrace
+          "-PjflacJar=$GITHUB_WORKSPACE/build/libs/jflac-0.1.0-SNAPSHOT.jar"
+          "-PjflacJavaSoundJar=$GITHUB_WORKSPACE/jflac-java-sound/build/libs/jflac-java-sound-0.1.0-SNAPSHOT.jar"
+          "-PjflacSamplePath=$GITHUB_WORKSPACE/build/consumer-smoke/universal.flac"

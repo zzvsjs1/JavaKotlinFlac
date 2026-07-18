@@ -1,7 +1,6 @@
 package org.zzvsjs.jflac
 
-import org.zzvsjs.jflac.internal.NativeBindings
-import org.zzvsjs.jflac.internal.toPublicMetadata
+import org.zzvsjs.jflac.internal.NativeAccess
 import java.io.InputStream
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.Path
@@ -45,8 +44,13 @@ import kotlin.io.path.absolutePathString
  * - Native loading, malformed FLAC data, read failures, and libFLAC callback
  *   failures surface as [NativeLoadException], [FlacDecodeException], or the
  *   original Java I/O/runtime exception where one is already pending.
+ * - [FlacDecodingOptions.checkMd5] applies only to whole-stream decode calls.
+ *   Seek, range, reusable, and pull sessions reject that option because they
+ *   cannot guarantee that libFLAC sees every PCM frame through physical EOF.
  */
-class FlacDecoder {
+class FlacDecoder @JvmOverloads constructor(
+    private val options: FlacDecodingOptions = FlacDecodingOptions()
+) {
     /**
      * Opens a reusable file-based decode session.
      *
@@ -54,15 +58,15 @@ class FlacDecoder {
      * caller. Use Kotlin `use { ... }` or Java try-with-resources.
      */
     fun open(path: Path): FlacDecodingSession {
+        requireWholeStreamOptionsDisabled("reusable decoder sessions")
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        val streamInfo = NativeBindings.readMetadata(
+        val streamInfo = NativeAccess.readMetadata(
             inspected.path.absolutePathString(),
             inspected.container.nativeCode
         )
-            .toPublicMetadata()
             .streamInfo
-        val handle = NativeBindings.openDecoderFile(inspected.path.absolutePathString(), inspected.container.nativeCode)
+        val handle = NativeAccess.openDecoderFile(inspected.path.absolutePathString(), inspected.container.nativeCode)
         if (handle == 0L) {
             throw FlacDecodeException("Native decoder initialization returned an invalid handle without throwing an exception.")
         }
@@ -76,10 +80,11 @@ class FlacDecoder {
      * are relative to the channel position at open time.
      */
     fun open(input: SeekableByteChannel): FlacDecodingSession {
+        requireWholeStreamOptionsDisabled("reusable decoder sessions")
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
         val streamInfo = readChannelStreamInfo(input, container)
-        val handle = NativeBindings.openDecoderChannel(input, container.nativeCode)
+        val handle = NativeAccess.openDecoderChannel(input, container.nativeCode)
         if (handle == 0L) {
             throw FlacDecodeException("Native channel decoder initialization returned an invalid handle without throwing an exception.")
         }
@@ -94,13 +99,14 @@ class FlacDecoder {
      * consumer API instead of eager whole-file decoding.
      */
     fun openPull(path: Path): FlacPullDecodingSession {
+        requireWholeStreamOptionsDisabled("pull decoder sessions")
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        val result = NativeBindings.openPullDecoderFile(
+        val result = NativeAccess.openPullDecoderFile(
             inspected.path.absolutePathString(),
             inspected.container.nativeCode
         )
-        return NativeFlacPullDecodingSession(result.handle, result.streamInfo)
+        return NativeFlacPullDecodingSession(result.first, result.second)
     }
 
     /**
@@ -111,10 +117,11 @@ class FlacDecoder {
      * [FlacPullDecodingSession.close].
      */
     fun openPull(input: InputStream): FlacPullDecodingSession {
+        requireWholeStreamOptionsDisabled("pull decoder sessions")
         FlacNativeLoader.load()
         val inspected = inspectNativeFlacStream(input)
-        val result = NativeBindings.openPullDecoderStream(inspected.input, inspected.container.nativeCode)
-        return NativeFlacPullDecodingSession(result.handle, result.streamInfo)
+        val result = NativeAccess.openPullDecoderStream(inspected.input, inspected.container.nativeCode)
+        return NativeFlacPullDecodingSession(result.first, result.second)
     }
 
     /**
@@ -124,10 +131,11 @@ class FlacDecoder {
      * remain relative to the channel position captured at open time.
      */
     fun openPull(input: SeekableByteChannel): FlacPullDecodingSession {
+        requireWholeStreamOptionsDisabled("pull decoder sessions")
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
-        val result = NativeBindings.openPullDecoderChannel(input, container.nativeCode)
-        return NativeFlacPullDecodingSession(result.handle, result.streamInfo)
+        val result = NativeAccess.openPullDecoderChannel(input, container.nativeCode)
+        return NativeFlacPullDecodingSession(result.first, result.second)
     }
 
     /**
@@ -718,8 +726,15 @@ class FlacDecoder {
      */
     fun decode(path: Path, consumer: PcmConsumer) {
         val inspected = inspectNativeFlacPath(path)
+        requireChainedOggContainer(inspected.container)
         FlacNativeLoader.load()
-        NativeBindings.decodeFile(inspected.path.absolutePathString(), inspected.container.nativeCode, consumer)
+        NativeAccess.decodeFile(
+            inspected.path.absolutePathString(),
+            inspected.container.nativeCode,
+            options.checkMd5,
+            options.decodeChainedOgg,
+            consumer
+        )
     }
 
     /**
@@ -730,7 +745,14 @@ class FlacDecoder {
     fun decode(input: InputStream, consumer: PcmConsumer) {
         FlacNativeLoader.load()
         val inspected = inspectNativeFlacStream(input)
-        NativeBindings.decodeStream(inspected.input, inspected.container.nativeCode, consumer)
+        requireChainedOggContainer(inspected.container)
+        NativeAccess.decodeStream(
+            inspected.input,
+            inspected.container.nativeCode,
+            options.checkMd5,
+            options.decodeChainedOgg,
+            consumer
+        )
     }
 
     /**
@@ -743,17 +765,19 @@ class FlacDecoder {
     fun decode(input: SeekableByteChannel, consumer: PcmConsumer) {
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
-        NativeBindings.decodeChannel(input, container.nativeCode, consumer)
+        requireChainedOggContainer(container)
+        NativeAccess.decodeChannel(input, container.nativeCode, options.checkMd5, options.decodeChainedOgg, consumer)
     }
 
     /**
      * Seeks to [firstSample], then streams PCM data into [consumer].
      */
     fun decode(path: Path, firstSample: Long, consumer: PcmConsumer) {
+        requireWholeStreamOptionsDisabled("seeked decode")
         require(firstSample >= 0L) { "First sample must be non-negative." }
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        NativeBindings.decodeFileFrom(
+        NativeAccess.decodeFileFrom(
             inspected.path.absolutePathString(),
             inspected.container.nativeCode,
             firstSample,
@@ -766,10 +790,11 @@ class FlacDecoder {
      * [consumer].
      */
     fun decode(input: SeekableByteChannel, firstSample: Long, consumer: PcmConsumer) {
+        requireWholeStreamOptionsDisabled("seeked decode")
         require(firstSample >= 0L) { "First sample must be non-negative." }
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
-        NativeBindings.decodeChannelFrom(input, container.nativeCode, firstSample, consumer)
+        NativeAccess.decodeChannelFrom(input, container.nativeCode, firstSample, consumer)
     }
 
     /**
@@ -777,10 +802,11 @@ class FlacDecoder {
      * [consumer].
      */
     fun decode(path: Path, firstSample: Long, maxFrames: Long, consumer: PcmConsumer) {
+        requireWholeStreamOptionsDisabled("range decode")
         validateDecodeRange(firstSample, maxFrames)
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        NativeBindings.decodeFileRange(
+        NativeAccess.decodeFileRange(
             inspected.path.absolutePathString(),
             inspected.container.nativeCode,
             firstSample,
@@ -794,17 +820,33 @@ class FlacDecoder {
      * [maxFrames] PCM frames into [consumer].
      */
     fun decode(input: SeekableByteChannel, firstSample: Long, maxFrames: Long, consumer: PcmConsumer) {
+        requireWholeStreamOptionsDisabled("range decode")
         validateDecodeRange(firstSample, maxFrames)
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
-        NativeBindings.decodeChannelRange(input, container.nativeCode, firstSample, maxFrames, consumer)
+        NativeAccess.decodeChannelRange(input, container.nativeCode, firstSample, maxFrames, consumer)
+    }
+
+    private fun requireWholeStreamOptionsDisabled(operation: String) {
+        require(!options.checkMd5) {
+            "MD5 checking is only available for whole-stream decode and cannot be used with $operation."
+        }
+        require(!options.decodeChainedOgg) {
+            "Chained Ogg decoding is only available for whole-stream decode and cannot be used with $operation."
+        }
+    }
+
+    private fun requireChainedOggContainer(container: NativeFlacContainer) {
+        require(!options.decodeChainedOgg || container == NativeFlacContainer.OGG) {
+            "Chained decoding requires an Ogg FLAC source."
+        }
     }
 
     private fun readChannelStreamInfo(input: SeekableByteChannel, container: NativeFlacContainer): FlacStreamInfo {
         val originalPosition = input.position()
         val consumer = BufferingPcmConsumer(firstFrameIndex = 0, maxFrames = 0)
         try {
-            NativeBindings.decodeChannelRange(input, container.nativeCode, 0, 0, consumer)
+            NativeAccess.decodeChannelRange(input, container.nativeCode, 0, 0, consumer)
             return consumer.toDecodedAudio().streamInfo
         } finally {
             input.position(originalPosition)
@@ -815,7 +857,7 @@ class FlacDecoder {
 /**
  * JVM-owned wrapper around one reusable native decoder handle.
  */
-internal class NativeFlacDecodingSession(
+private class NativeFlacDecodingSession(
     initialHandle: Long,
     override val streamInfo: FlacStreamInfo
 ) : FlacDecodingSession {
@@ -941,7 +983,7 @@ internal class NativeFlacDecodingSession(
         }
 
         if (currentHandle != 0L) {
-            NativeBindings.releaseDecoder(currentHandle)
+            NativeAccess.releaseDecoder(currentHandle)
         }
     }
 
@@ -953,9 +995,9 @@ internal class NativeFlacDecodingSession(
         try {
             consumer.onStreamInfo(streamInfo)
             if (maxFrames == null) {
-                NativeBindings.decodeDecoderFrom(currentHandle, firstSample, consumer)
+                NativeAccess.decodeDecoderFrom(currentHandle, firstSample, consumer)
             } else {
-                NativeBindings.decodeDecoderRange(currentHandle, firstSample, maxFrames, consumer)
+                NativeAccess.decodeDecoderRange(currentHandle, firstSample, maxFrames, consumer)
             }
             succeeded = true
         } catch (t: Throwable) {
@@ -996,7 +1038,7 @@ internal class NativeFlacDecodingSession(
         }
 
         if (currentHandle != 0L) {
-            NativeBindings.releaseDecoder(currentHandle)
+            NativeAccess.releaseDecoder(currentHandle)
         }
     }
 
@@ -1015,7 +1057,7 @@ internal class NativeFlacDecodingSession(
         }
 
         if (currentHandle != 0L) {
-            NativeBindings.releaseDecoder(currentHandle)
+            NativeAccess.releaseDecoder(currentHandle)
         }
     }
 
@@ -1034,7 +1076,7 @@ internal class NativeFlacDecodingSession(
  * references. This wrapper serialises reads and close so Java never asks the
  * native decoder to advance while another thread is releasing the same handle.
  */
-internal class NativeFlacPullDecodingSession(
+private class NativeFlacPullDecodingSession(
     initialHandle: Long,
     override val streamInfo: FlacStreamInfo
 ) : FlacPullDecodingSession {
@@ -1061,7 +1103,7 @@ internal class NativeFlacPullDecodingSession(
             }
 
             try {
-                NativeBindings.readPullDecoderInterleaved(currentHandle, interleavedSamples, maxFrames)
+                NativeAccess.readPullDecoderInterleaved(currentHandle, interleavedSamples, maxFrames)
             } catch (t: Throwable) {
                 /*
                  * A native/source failure can leave libFLAC in an aborted or
@@ -1072,7 +1114,7 @@ internal class NativeFlacPullDecodingSession(
                  */
                 handle = 0L
                 try {
-                    NativeBindings.releasePullDecoder(currentHandle)
+                    NativeAccess.releasePullDecoder(currentHandle)
                 } catch (releaseFailure: Throwable) {
                     t.addSuppressed(releaseFailure)
                 }
@@ -1089,7 +1131,7 @@ internal class NativeFlacPullDecodingSession(
         }
 
         if (currentHandle != 0L) {
-            NativeBindings.releasePullDecoder(currentHandle)
+            NativeAccess.releasePullDecoder(currentHandle)
         }
     }
 }

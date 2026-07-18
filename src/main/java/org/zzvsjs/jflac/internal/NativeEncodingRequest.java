@@ -24,7 +24,7 @@ import org.zzvsjs.jflac.FlacUnknownMetadataBlock;
  *
  * @hidden
  */
-public final class NativeEncodingRequest {
+final class NativeEncodingRequest {
     private final int sampleRate;
     private final int channels;
     private final int bitsPerSample;
@@ -33,6 +33,7 @@ public final class NativeEncodingRequest {
     private final boolean verify;
     private final boolean streamableSubset;
     private final Integer blockSize;
+    private final int numThreads;
     private final int container;
     private final Integer oggSerialNumber;
     private final String[] commentEntries;
@@ -64,7 +65,8 @@ public final class NativeEncodingRequest {
             FlacPaddingBlock[] paddingBlocks,
             FlacUnknownMetadataBlock[] unknownBlocks,
             int[] metadataBlockTypes,
-            Object[] metadataBlockValues
+            Object[] metadataBlockValues,
+            int numThreads
     ) {
         this.sampleRate = sampleRate;
         this.channels = channels;
@@ -85,6 +87,7 @@ public final class NativeEncodingRequest {
         this.unknownBlocks = NativeTransportChecks.copyOf(unknownBlocks, "unknownBlocks");
         this.metadataBlockTypes = NativeTransportChecks.copyOf(metadataBlockTypes, "metadataBlockTypes");
         this.metadataBlockValues = NativeTransportChecks.copyOf(metadataBlockValues, "metadataBlockValues");
+        this.numThreads = numThreads;
         NativeTransportChecks.requireOrderedMetadataValues(this.metadataBlockTypes, this.metadataBlockValues);
     }
 
@@ -118,6 +121,10 @@ public final class NativeEncodingRequest {
 
     public Integer getBlockSize() {
         return blockSize;
+    }
+
+    public int getNumThreads() {
+        return numThreads;
     }
 
     public int getContainer() {

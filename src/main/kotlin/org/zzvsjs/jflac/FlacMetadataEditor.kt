@@ -1,17 +1,8 @@
 package org.zzvsjs.jflac
 
-import org.zzvsjs.jflac.internal.NativeBindings
-import org.zzvsjs.jflac.internal.NativeMetadataEditRequest
-import org.zzvsjs.jflac.internal.NativeVorbisCommentBlock
+import org.zzvsjs.jflac.internal.NativeAccess
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
-
-private const val EDIT_METADATA_TYPE_PADDING = 1
-private const val EDIT_METADATA_TYPE_APPLICATION = 2
-private const val EDIT_METADATA_TYPE_SEEKTABLE = 3
-private const val EDIT_METADATA_TYPE_VORBIS_COMMENT = 4
-private const val EDIT_METADATA_TYPE_CUESHEET = 5
-private const val EDIT_METADATA_TYPE_PICTURE = 6
 
 /**
  * Options used when committing metadata edits to an existing FLAC file.
@@ -188,62 +179,11 @@ class FlacMetadataEditor {
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
-        NativeBindings.writeMetadata(
+        NativeAccess.writeMetadata(
             normalizedPath.absolutePathString(),
-            metadata.toNativeEditRequest(),
+            metadata,
             options.usePadding,
             options.preserveFileStats
         )
-    }
-}
-
-private fun FlacEncodingMetadata.toNativeEditRequest(): NativeMetadataEditRequest {
-    val commentEntries = comments.toEditVorbisCommentEntries().toTypedArray()
-    val metadataBlockTypes = blocks.map { block -> block.editNativeType() }.toIntArray()
-    val metadataBlockValues = blocks.map { block -> block.editNativeValue() }.toTypedArray()
-
-    return NativeMetadataEditRequest(
-        commentEntries,
-        pictures.toTypedArray(),
-        applicationBlocks.toTypedArray(),
-        seekTables.toTypedArray(),
-        cueSheets.toTypedArray(),
-        paddingBlocks.toTypedArray(),
-        unknownBlocks.toTypedArray(),
-        metadataBlockTypes,
-        metadataBlockValues
-    )
-}
-
-private fun Map<String, List<String>>.toEditVorbisCommentEntries(): List<String> {
-    return entries.flatMap { (key, values) ->
-        values.map { value -> "$key=$value" }
-    }
-}
-
-private fun FlacMetadataBlock.editNativeType(): Int {
-    return when (this) {
-        is FlacMetadataBlock.VorbisComment -> EDIT_METADATA_TYPE_VORBIS_COMMENT
-        is FlacMetadataBlock.Picture -> EDIT_METADATA_TYPE_PICTURE
-        is FlacMetadataBlock.Application -> EDIT_METADATA_TYPE_APPLICATION
-        is FlacMetadataBlock.SeekTable -> EDIT_METADATA_TYPE_SEEKTABLE
-        is FlacMetadataBlock.CueSheet -> EDIT_METADATA_TYPE_CUESHEET
-        is FlacMetadataBlock.Padding -> EDIT_METADATA_TYPE_PADDING
-        is FlacMetadataBlock.Unknown -> unknown.type
-    }
-}
-
-private fun FlacMetadataBlock.editNativeValue(): Any {
-    return when (this) {
-        is FlacMetadataBlock.VorbisComment -> NativeVorbisCommentBlock(
-            comment.vendor,
-            comment.comments.toEditVorbisCommentEntries().toTypedArray()
-        )
-        is FlacMetadataBlock.Picture -> picture
-        is FlacMetadataBlock.Application -> application
-        is FlacMetadataBlock.SeekTable -> seekTable
-        is FlacMetadataBlock.CueSheet -> cueSheet
-        is FlacMetadataBlock.Padding -> padding
-        is FlacMetadataBlock.Unknown -> unknown
     }
 }

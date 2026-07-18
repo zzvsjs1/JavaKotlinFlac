@@ -6,9 +6,30 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class FlacEncoderIntegrationTest {
+    @Test
+    fun parallelEncodingReportsMissingPthreadCapabilityOnWindowsBuild() {
+        val format = FlacAudioFormat(sampleRate = 44_100, channels = 1, bitsPerSample = 16)
+        val output = Files.createTempFile("jflac-parallel-unavailable", ".flac")
+
+        try {
+            val failure = assertFailsWith<UnsupportedFeatureException> {
+                FlacEncoder().encode(
+                    output = output,
+                    format = format,
+                    samples = deterministicPcm(frames = 4, format = format),
+                    options = FlacEncodingOptions(numThreads = 2)
+                )
+            }
+            assertTrue(failure.message.orEmpty().contains("pthread"))
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
     @Test
     fun oneShotEncodeRoundTripsInterleavedPcm() {
         val frames = 17

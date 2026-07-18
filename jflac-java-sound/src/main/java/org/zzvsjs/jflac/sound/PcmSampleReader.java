@@ -12,7 +12,7 @@ import java.util.Objects;
  *
  * Java Sound exposes several PCM shapes through one AudioFormat model. This
  * reader accepts only the layouts that can be converted without scaling:
- * signed 8/16/24/32-bit PCM and unsigned 8-bit PCM. Multi-byte samples honour
+ * signed 8/16/24/32-bit PCM and unsigned 8-bit PCM. Multibyte samples honor
  * the AudioFormat endian flag, then sign extension moves the value into the
  * equivalent signed Int range.
  */
@@ -91,7 +91,8 @@ final class PcmSampleReader {
         if (frameLength == AudioSystem.NOT_SPECIFIED) {
             return null;
         }
-        return Long.valueOf(frameLength);
+
+        return frameLength;
     }
 
     AudioFormat format() {
@@ -165,8 +166,8 @@ final class PcmSampleReader {
 
     private static int validatedSampleRate(AudioFormat format) {
         float sampleRate = format.getSampleRate();
-        if (!Float.isFinite(sampleRate) || sampleRate <= 0.0f
-                || sampleRate > Integer.MAX_VALUE || sampleRate != Math.rint(sampleRate)) {
+        if (!Float.isFinite(sampleRate) || sampleRate <= 0.0f || sampleRate > Integer.MAX_VALUE
+                || sampleRate != Math.rint(sampleRate)) {
             throw new IllegalArgumentException("sample rate must be a positive whole number");
         }
         return Math.toIntExact((long) sampleRate);

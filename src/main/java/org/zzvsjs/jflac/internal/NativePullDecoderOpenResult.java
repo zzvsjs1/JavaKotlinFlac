@@ -11,7 +11,7 @@ import org.zzvsjs.jflac.FlacStreamInfo;
  *
  * @hidden
  */
-public final class NativePullDecoderOpenResult {
+final class NativePullDecoderOpenResult {
     private final long handle;
     private final FlacStreamInfo streamInfo;
 
