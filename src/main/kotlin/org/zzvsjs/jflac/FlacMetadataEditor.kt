@@ -74,6 +74,7 @@ class FlacMetadataEditSession internal constructor(
             originalMetadata.vorbisComment != null -> originalMetadata.vorbisComment.vendor
             else -> ""
         }
+
         val block = FlacMetadataBlock.VorbisComment(
             FlacVorbisComment(
                 vendor = vendor,
@@ -86,6 +87,7 @@ class FlacMetadataEditSession internal constructor(
         } else {
             mutableBlocks.add(0, block)
         }
+
         return this
     }
 

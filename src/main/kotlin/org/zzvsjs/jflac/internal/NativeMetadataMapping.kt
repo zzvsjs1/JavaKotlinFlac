@@ -33,6 +33,7 @@ internal fun NativeMetadataPayload.toPublicMetadata(): FlacMetadata {
             comments = groupedComments.mapValues { (_, values) -> values.toList() }
         )
     }
+
     val blocks = metadataBlockTypes.zip(metadataBlockIndices).mapNotNull { (type, index) ->
         when (type) {
             FLAC_METADATA_TYPE_PADDING -> paddingBlocks.getOrNull(index)?.let(FlacMetadataBlock::Padding)

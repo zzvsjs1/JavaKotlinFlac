@@ -50,6 +50,7 @@ public final class ConsumerSmokeTest {
         if (info.getSampleRate() <= 0 || info.getChannels() <= 0 || info.getBitsPerSample() <= 0) {
             throw new IllegalStateException("Invalid STREAMINFO returned by published jflac artefact.");
         }
+
         if (info.getTotalSamples() <= 0) {
             throw new IllegalStateException("Consumer smoke fixture must contain at least one frame.");
         }
@@ -70,12 +71,15 @@ public final class ConsumerSmokeTest {
             if (!AudioFormat.Encoding.PCM_SIGNED.equals(javaSoundFormat.getEncoding())) {
                 throw new IllegalStateException("Java Sound FLAC provider did not return signed PCM.");
             }
+
             if ((int) javaSoundFormat.getSampleRate() != info.getSampleRate()) {
                 throw new IllegalStateException("Java Sound sample rate does not match jflac metadata.");
             }
+
             if (javaSoundFormat.getChannels() != info.getChannels()) {
                 throw new IllegalStateException("Java Sound channel count does not match jflac metadata.");
             }
+
             byte[] javaSoundBuffer = new byte[Math.max(1, javaSoundFormat.getFrameSize())];
             if (javaSoundInput.read(javaSoundBuffer) <= 0) {
                 throw new IllegalStateException("Java Sound FLAC provider did not produce PCM bytes.");
@@ -131,12 +135,15 @@ public final class ConsumerSmokeTest {
             if (!Arrays.equals(samples, new FlacDecoder().decode(nativeOutput).getInterleavedSamples())) {
                 throw new IllegalStateException("Java Sound native FLAC write did not round-trip PCM.");
             }
+
             if (!Arrays.equals(samples, new FlacDecoder().decode(oggOutput).getInterleavedSamples())) {
                 throw new IllegalStateException("Java Sound Ogg FLAC write did not round-trip PCM.");
             }
+
             if (!Arrays.equals(samples, readJavaSoundPcmSamples(nativeOutput, frames, channels))) {
                 throw new IllegalStateException("Java Sound native FLAC write/read did not round-trip PCM.");
             }
+
             if (!Arrays.equals(samples, readJavaSoundPcmSamples(oggOutput, frames, channels))) {
                 throw new IllegalStateException("Java Sound Ogg FLAC write/read did not round-trip PCM.");
             }
@@ -157,15 +164,19 @@ public final class ConsumerSmokeTest {
             if (!AudioFormat.Encoding.PCM_SIGNED.equals(format.getEncoding())) {
                 throw new IllegalStateException("Java Sound FLAC read did not return signed PCM.");
             }
+
             if (format.getSampleSizeInBits() != 16) {
                 throw new IllegalStateException("Java Sound FLAC read did not return 16-bit PCM.");
             }
+
             if (format.getChannels() != channels) {
                 throw new IllegalStateException("Java Sound FLAC read channel count did not match input PCM.");
             }
+
             if (format.getFrameSize() != channels * 2) {
                 throw new IllegalStateException("Java Sound FLAC read frame size did not match 16-bit stereo PCM.");
             }
+
             if (format.isBigEndian()) {
                 throw new IllegalStateException("Java Sound FLAC read did not return little-endian PCM.");
             }
@@ -182,6 +193,7 @@ public final class ConsumerSmokeTest {
                 int byteIndex = sampleIndex * 2;
                 samples[sampleIndex] = (short) ((pcm[byteIndex] & 0xff) | (pcm[byteIndex + 1] << 8));
             }
+
             return samples;
         }
     }
@@ -236,15 +248,19 @@ public final class ConsumerSmokeTest {
             if (encodedInfo.getSampleRate() != format.getSampleRate()) {
                 throw new IllegalStateException("Encoded sample rate did not round-trip through metadata.");
             }
+
             if (encodedInfo.getChannels() != format.getChannels()) {
                 throw new IllegalStateException("Encoded channel count did not round-trip through metadata.");
             }
+
             if (encodedInfo.getBitsPerSample() != format.getBitsPerSample()) {
                 throw new IllegalStateException("Encoded bits-per-sample value did not round-trip through metadata.");
             }
+
             if (encodedInfo.getTotalSamples() != frames) {
                 throw new IllegalStateException("Encoded frame count did not round-trip through metadata.");
             }
+
             if (!List.of("Consumer smoke").equals(encodedMetadata.getVorbisComment().getComments().get("TITLE"))) {
                 throw new IllegalStateException("Edited Vorbis comments did not round-trip through metadata.");
             }
@@ -258,6 +274,7 @@ public final class ConsumerSmokeTest {
             if (encodedAudio.getInterleavedSamples().length != expectedSamples) {
                 throw new IllegalStateException("Encoded PCM length does not match frames * channels.");
             }
+
             if (!Arrays.equals(samples, encodedAudio.getInterleavedSamples())) {
                 throw new IllegalStateException("Encoded PCM data did not round-trip exactly.");
             }
@@ -278,6 +295,7 @@ public final class ConsumerSmokeTest {
             )) {
                 new FlacEncoder().encode(outputChannel, format, samples);
             }
+
             FlacMetadata channelMetadata = new FlacMetadataReader().read(channelOutput);
             if (channelMetadata.getStreamInfo().getTotalSamples() != frames) {
                 throw new IllegalStateException("Seekable channel encode did not back-patch STREAMINFO.");

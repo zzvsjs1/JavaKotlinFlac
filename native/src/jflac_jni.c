@@ -231,9 +231,15 @@ typedef struct FlacApi
  * point before it calls through the function table.
  */
 static FlacApi g_flac_api;
+/* Keeps any owned loader reference alive for every resolved function call. */
+static JflacModule g_flac_module;
 static JflacOnce g_flac_init_once = JFLAC_ONCE_INITIALIZER;
 static char g_flac_init_error[JFLAC_MESSAGE_BUFFER_SIZE] = "";
 static int g_flac_api_initialized = 0;
+
+/* Implemented beside the corresponding registries later in this file. */
+static void destroy_all_decode_sessions(void);
+static void destroy_all_encode_contexts(void);
 
 /* Stores the native initialisation failure for the later Java exception. */
 static void set_last_init_error(const char *message)
@@ -261,7 +267,7 @@ static void init_flac_api(void)
     if (!jflac_resolve_symbol(&module, #symbol, &g_flac_api.field, sizeof(g_flac_api.field),                           \
                               g_flac_init_error, sizeof(g_flac_init_error)))                                           \
     {                                                                                                                  \
-        return;                                                                                                        \
+        goto init_failed;                                                                                              \
     }
 
     RESOLVE(version_string, FLAC__VERSION_STRING);
@@ -274,13 +280,13 @@ static void init_flac_api(void)
         snprintf(buffer, sizeof(buffer), "Incompatible bundled libFLAC version: expected %s but found %s.",
                  JFLAC_EXPECTED_FLAC_VERSION, runtime_version != NULL ? runtime_version : "<missing>");
         set_last_init_error(buffer);
-        return;
+        goto init_failed;
     }
 
     if (*g_flac_api.supports_ogg_flac == 0)
     {
         set_last_init_error("The bundled libFLAC runtime was built without required Ogg FLAC support.");
-        return;
+        goto init_failed;
     }
 
     RESOLVE(metadata_chain_new, FLAC__metadata_chain_new);
@@ -358,7 +364,15 @@ static void init_flac_api(void)
     RESOLVE(format_vorbiscomment_entry_is_legal, FLAC__format_vorbiscomment_entry_is_legal);
 
 #undef RESOLVE
+    /* Transfer the loader reference only after the complete API is usable. */
+    g_flac_module = module;
     g_flac_api_initialized = 1;
+    return;
+
+init_failed:
+    /* A partially resolved table must not outlive the module it points into. */
+    memset(&g_flac_api, 0, sizeof(g_flac_api));
+    jflac_close_library(&module);
 }
 
 /*
@@ -376,9 +390,30 @@ static int flac_api_ready(JNIEnv *env)
             (*env)->ThrowNew(env, exception_class,
                              g_flac_init_error[0] ? g_flac_init_error : "Failed to initialize FLAC API.");
         }
+
         return 0;
     }
+
     return 1;
+}
+
+/*
+ * JNI_OnUnload runs only after the defining class loader is unreachable, so
+ * no Java thread can still enter this shim. Keeping the module until this
+ * point protects every resolved pointer for the full JNI library lifetime.
+ * Abandoned sessions are destroyed first because their destructors still
+ * call libFLAC and may need to release JNI global references.
+ */
+JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved)
+{
+    (void)vm;
+    (void)reserved;
+
+    destroy_all_decode_sessions();
+    destroy_all_encode_contexts();
+    g_flac_api_initialized = 0;
+    memset(&g_flac_api, 0, sizeof(g_flac_api));
+    jflac_close_library(&g_flac_module);
 }
 
 /*
@@ -449,6 +484,7 @@ static int validate_container(JNIEnv *env, jint container)
         throw_illegal_argument_exception(env, "FLAC container code must be native or Ogg.");
         return 0;
     }
+
     return 1;
 }
 
@@ -486,6 +522,7 @@ static int configure_decoder_md5_checking(JNIEnv *env, FLAC__StreamDecoder *deco
         throw_decode_exception(env, "Failed to enable FLAC MD5 checking before decoder initialisation.");
         return 0;
     }
+
     return 1;
 }
 
@@ -509,6 +546,7 @@ static int configure_decoder_chaining(JNIEnv *env, FLAC__StreamDecoder *decoder,
         throw_decode_exception(env, "Failed to enable chained Ogg FLAC decoding before decoder initialisation.");
         return 0;
     }
+
     return 1;
 }
 
@@ -580,6 +618,43 @@ static void throw_illegal_state_exception(JNIEnv *env, const char *message)
     {
         (*env)->ThrowNew(env, exception_class, message);
     }
+}
+
+/*
+ * Reads no-argument Java getters while enforcing JNI's exception discipline.
+ * Call*Method may leave an exception pending even when the returned value looks
+ * usable; centralising the immediate check keeps larger request snapshots
+ * readable and prevents a later JNI call from running in that state.
+ */
+static int call_int_getter(JNIEnv *env, jobject receiver, jmethodID getter, jint *result)
+{
+    *result = (*env)->CallIntMethod(env, receiver, getter);
+    return !(*env)->ExceptionCheck(env);
+}
+
+static int call_long_getter(JNIEnv *env, jobject receiver, jmethodID getter, jlong *result)
+{
+    *result = (*env)->CallLongMethod(env, receiver, getter);
+    return !(*env)->ExceptionCheck(env);
+}
+
+static int call_boolean_getter(JNIEnv *env, jobject receiver, jmethodID getter, jboolean *result)
+{
+    *result = (*env)->CallBooleanMethod(env, receiver, getter);
+    return !(*env)->ExceptionCheck(env);
+}
+
+static int call_object_getter(JNIEnv *env, jobject receiver, jmethodID getter, jobject *result)
+{
+    *result = (*env)->CallObjectMethod(env, receiver, getter);
+    return !(*env)->ExceptionCheck(env);
+}
+
+static int find_instance_method(JNIEnv *env, jclass receiver_class, const char *name, const char *signature,
+                                jmethodID *result)
+{
+    *result = (*env)->GetMethodID(env, receiver_class, name, signature);
+    return *result != NULL && !(*env)->ExceptionCheck(env);
 }
 
 /*
@@ -667,6 +742,7 @@ static char *jstring_to_utf8(JNIEnv *env, jstring value)
         {
             empty[0] = '\0';
         }
+
         (*env)->ReleaseStringChars(env, value, chars);
         return empty;
     }
@@ -702,6 +778,7 @@ static size_t fixed_ascii_length(const char *value, size_t capacity)
     {
         length += 1u;
     }
+
     return length;
 }
 
@@ -729,25 +806,56 @@ static int copy_fixed_ascii_field(char *destination, size_t destination_size, co
  */
 static jobject new_utf8_string(JNIEnv *env, const char *bytes, size_t length)
 {
-    jclass string_class = (*env)->FindClass(env, "java/lang/String");
-    jclass charsets_class = (*env)->FindClass(env, "java/nio/charset/StandardCharsets");
-    if (string_class == NULL || charsets_class == NULL)
+    if (length > (size_t)INT_MAX)
+    {
+        throw_decode_exception(env, "UTF-8 metadata text is too large for one JVM byte array.");
+        return NULL;
+    }
+
+    /*
+     * Keep the charset lookup and temporary byte array inside this helper.
+     * PopLocalFrame promotes only the returned String into the caller's frame,
+     * so repeated metadata strings cannot exhaust the JNI local-reference table.
+     */
+    if ((*env)->PushLocalFrame(env, 6) < 0)
     {
         return NULL;
+    }
+
+    jclass string_class = (*env)->FindClass(env, "java/lang/String");
+    if (string_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jmethodID ctor = (*env)->GetMethodID(env, string_class, "<init>", "([BLjava/nio/charset/Charset;)V");
-    jfieldID utf8_field = (*env)->GetStaticFieldID(env, charsets_class, "UTF_8", "Ljava/nio/charset/Charset;");
-    if (ctor == NULL || utf8_field == NULL)
+    if (ctor == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jclass charsets_class = (*env)->FindClass(env, "java/nio/charset/StandardCharsets");
+    if (charsets_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jfieldID utf8_field = (*env)->GetStaticFieldID(env, charsets_class, "UTF_8", "Ljava/nio/charset/Charset;");
+    if (utf8_field == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jobject charset = (*env)->GetStaticObjectField(env, charsets_class, utf8_field);
-    jbyteArray byte_array = (*env)->NewByteArray(env, (jsize)length);
-    if (byte_array == NULL || charset == NULL)
+    if (charset == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jbyteArray byte_array = (*env)->NewByteArray(env, (jsize)length);
+    if (byte_array == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     if (length > 0u)
@@ -755,11 +863,17 @@ static jobject new_utf8_string(JNIEnv *env, const char *bytes, size_t length)
         (*env)->SetByteArrayRegion(env, byte_array, 0, (jsize)length, (const jbyte *)bytes);
         if ((*env)->ExceptionCheck(env))
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
-    return (*env)->NewObject(env, string_class, ctor, byte_array, charset);
+    jobject result = (*env)->NewObject(env, string_class, ctor, byte_array, charset);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -768,33 +882,47 @@ static jobject new_utf8_string(JNIEnv *env, const char *bytes, size_t length)
  */
 static jobject new_stream_info(JNIEnv *env, const FLAC__StreamMetadata_StreamInfo *stream_info)
 {
-    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacStreamInfo");
-    if (clazz == NULL)
+    if ((*env)->PushLocalFrame(env, 4) < 0)
     {
         return NULL;
     }
+
+    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacStreamInfo");
+    if (clazz == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
     jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(IIIJIIII[B)V");
     if (ctor == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jbyteArray md5_signature = (*env)->NewByteArray(env, (jsize)JFLAC_STREAMINFO_MD5_LENGTH);
     if (md5_signature == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
+
     (*env)->SetByteArrayRegion(env, md5_signature, 0, (jsize)JFLAC_STREAMINFO_MD5_LENGTH,
                                (const jbyte *)stream_info->md5sum);
     if ((*env)->ExceptionCheck(env))
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
-    return (*env)->NewObject(env, clazz, ctor, (jint)stream_info->sample_rate, (jint)stream_info->channels,
-                             (jint)stream_info->bits_per_sample, (jlong)stream_info->total_samples,
-                             (jint)stream_info->min_blocksize, (jint)stream_info->max_blocksize,
-                             (jint)stream_info->min_framesize, (jint)stream_info->max_framesize, md5_signature);
+    jobject result = (*env)->NewObject(env, clazz, ctor, (jint)stream_info->sample_rate,
+                                       (jint)stream_info->channels, (jint)stream_info->bits_per_sample,
+                                       (jlong)stream_info->total_samples, (jint)stream_info->min_blocksize,
+                                       (jint)stream_info->max_blocksize, (jint)stream_info->min_framesize,
+                                       (jint)stream_info->max_framesize, md5_signature);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -805,29 +933,36 @@ static jobject new_stream_info(JNIEnv *env, const FLAC__StreamMetadata_StreamInf
 static jobject new_pull_decoder_open_result(JNIEnv *env, jlong handle,
                                             const FLAC__StreamMetadata_StreamInfo *stream_info_data)
 {
+    if ((*env)->PushLocalFrame(env, 4) < 0)
+    {
+        return NULL;
+    }
+
     jobject stream_info = new_stream_info(env, stream_info_data);
     if (stream_info == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/internal/NativePullDecoderOpenResult");
     if (clazz == NULL)
     {
-        (*env)->DeleteLocalRef(env, stream_info);
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(JLorg/zzvsjs/jflac/FlacStreamInfo;)V");
     if (ctor == NULL)
     {
-        (*env)->DeleteLocalRef(env, stream_info);
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jobject result = (*env)->NewObject(env, clazz, ctor, handle, stream_info);
-    (*env)->DeleteLocalRef(env, stream_info);
-    return result;
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -839,34 +974,45 @@ static jobject new_application_block(JNIEnv *env, const FLAC__StreamMetadata *bl
     const FLAC__StreamMetadata_Application *application = &block->data.application;
     uint32_t data_length =
         block->length >= JFLAC_APPLICATION_ID_LENGTH ? block->length - JFLAC_APPLICATION_ID_LENGTH : 0u;
+    if ((*env)->PushLocalFrame(env, 5) < 0)
+    {
+        return NULL;
+    }
+
     jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacApplicationBlock");
     if (clazz == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
+
     jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "([B[B)V");
     if (ctor == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
-    jbyteArray id = (*env)->NewByteArray(env, (jsize)JFLAC_APPLICATION_ID_LENGTH);
     if (data_length > (uint32_t)INT_MAX)
     {
         throw_decode_exception(env, "APPLICATION metadata block is too large for one JVM ByteArray.");
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jbyteArray id = (*env)->NewByteArray(env, (jsize)JFLAC_APPLICATION_ID_LENGTH);
+    if (id == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jbyteArray data = (*env)->NewByteArray(env, (jsize)data_length);
-    if (id == NULL || data == NULL)
+    if (data == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     (*env)->SetByteArrayRegion(env, id, 0, (jsize)JFLAC_APPLICATION_ID_LENGTH, (const jbyte *)application->id);
     if ((*env)->ExceptionCheck(env))
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     if (data_length > 0u)
@@ -874,11 +1020,17 @@ static jobject new_application_block(JNIEnv *env, const FLAC__StreamMetadata *bl
         (*env)->SetByteArrayRegion(env, data, 0, (jsize)data_length, (const jbyte *)application->data);
         if ((*env)->ExceptionCheck(env))
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
-    return (*env)->NewObject(env, clazz, ctor, id, data);
+    jobject result = (*env)->NewObject(env, clazz, ctor, id, data);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -887,18 +1039,30 @@ static jobject new_application_block(JNIEnv *env, const FLAC__StreamMetadata *bl
  */
 static jobject new_padding_block(JNIEnv *env, const FLAC__StreamMetadata *block)
 {
-    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacPaddingBlock");
-    if (clazz == NULL)
-    {
-        return NULL;
-    }
-    jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(I)V");
-    if (ctor == NULL)
+    if ((*env)->PushLocalFrame(env, 2) < 0)
     {
         return NULL;
     }
 
-    return (*env)->NewObject(env, clazz, ctor, (jint)block->length);
+    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacPaddingBlock");
+    if (clazz == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(I)V");
+    if (ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jobject result = (*env)->NewObject(env, clazz, ctor, (jint)block->length);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -914,21 +1078,27 @@ static jobject new_unknown_metadata_block(JNIEnv *env, const FLAC__StreamMetadat
         return NULL;
     }
 
-    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacUnknownMetadataBlock");
-    if (clazz == NULL)
+    if ((*env)->PushLocalFrame(env, 4) < 0)
     {
         return NULL;
     }
+
+    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacUnknownMetadataBlock");
+    if (clazz == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
     jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(I[B)V");
     if (ctor == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     jbyteArray data = (*env)->NewByteArray(env, (jsize)block->length);
     if (data == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     if (block->length > 0u)
@@ -936,11 +1106,17 @@ static jobject new_unknown_metadata_block(JNIEnv *env, const FLAC__StreamMetadat
         (*env)->SetByteArrayRegion(env, data, 0, (jsize)block->length, (const jbyte *)block->data.unknown.data);
         if ((*env)->ExceptionCheck(env))
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
-    return (*env)->NewObject(env, clazz, ctor, (jint)block->type, data);
+    jobject result = (*env)->NewObject(env, clazz, ctor, (jint)block->type, data);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -949,34 +1125,58 @@ static jobject new_unknown_metadata_block(JNIEnv *env, const FLAC__StreamMetadat
  */
 static jobject new_seek_table(JNIEnv *env, const FLAC__StreamMetadata_SeekTable *seek_table)
 {
-    jclass point_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacSeekPoint");
-    if (point_class == NULL)
-    {
-        return NULL;
-    }
-    jmethodID point_ctor = (*env)->GetMethodID(env, point_class, "<init>", "(JJI)V");
-    jclass list_class = (*env)->FindClass(env, "java/util/ArrayList");
-    if (list_class == NULL)
-    {
-        return NULL;
-    }
-    jmethodID list_ctor = (*env)->GetMethodID(env, list_class, "<init>", "(I)V");
-    jmethodID list_add = (*env)->GetMethodID(env, list_class, "add", "(Ljava/lang/Object;)Z");
-    jclass table_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacSeekTable");
-    if (table_class == NULL)
-    {
-        return NULL;
-    }
-    jmethodID table_ctor = (*env)->GetMethodID(env, table_class, "<init>", "(Ljava/util/List;)V");
-    if (point_ctor == NULL || list_ctor == NULL || list_add == NULL || table_ctor == NULL)
+    if ((*env)->PushLocalFrame(env, 8) < 0)
     {
         return NULL;
     }
 
-    jobject points = (*env)->NewObject(env, list_class, list_ctor, (jint)seek_table->num_points);
-    if (points == NULL)
+    jclass point_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacSeekPoint");
+    if (point_class == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID point_ctor = (*env)->GetMethodID(env, point_class, "<init>", "(JJI)V");
+    if (point_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jclass list_class = (*env)->FindClass(env, "java/util/ArrayList");
+    if (list_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID list_ctor = (*env)->GetMethodID(env, list_class, "<init>", "(I)V");
+    if (list_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID list_add = (*env)->GetMethodID(env, list_class, "add", "(Ljava/lang/Object;)Z");
+    if (list_add == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jclass table_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacSeekTable");
+    if (table_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID table_ctor = (*env)->GetMethodID(env, table_class, "<init>", "(Ljava/util/List;)V");
+    if (table_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jobject points = (*env)->NewObject(env, list_class, list_ctor, (jint)seek_table->num_points);
+    jboolean points_construction_threw = (*env)->ExceptionCheck(env);
+    if (points == NULL || points_construction_threw)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     for (uint32_t i = 0; i < seek_table->num_points; ++i)
@@ -987,20 +1187,34 @@ static jobject new_seek_table(JNIEnv *env, const FLAC__StreamMetadata_SeekTable 
                                                       ? JFLAC_SEEKPOINT_PLACEHOLDER_JAVA_VALUE
                                                       : native_point->sample_number),
                                           (jlong)native_point->stream_offset, (jint)native_point->frame_samples);
-        if (point == NULL)
+        jboolean point_construction_threw = (*env)->ExceptionCheck(env);
+        if (point == NULL || point_construction_threw)
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
 
-        (*env)->CallBooleanMethod(env, points, list_add, point);
+        jboolean added = (*env)->CallBooleanMethod(env, points, list_add, point);
+        jboolean add_threw = (*env)->ExceptionCheck(env);
         (*env)->DeleteLocalRef(env, point);
-        if ((*env)->ExceptionCheck(env))
+        if (add_threw)
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
+        }
+
+        if (added == JNI_FALSE)
+        {
+            throw_decode_exception(env, "Failed to append a SEEKTABLE point to the JVM result.");
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
-    return (*env)->NewObject(env, table_class, table_ctor, points);
+    jobject result = (*env)->NewObject(env, table_class, table_ctor, points);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -1009,18 +1223,30 @@ static jobject new_seek_table(JNIEnv *env, const FLAC__StreamMetadata_SeekTable 
  */
 static jobject new_cue_sheet_index(JNIEnv *env, const FLAC__StreamMetadata_CueSheet_Index *index)
 {
-    jclass index_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheetIndex");
-    if (index_class == NULL)
-    {
-        return NULL;
-    }
-    jmethodID index_ctor = (*env)->GetMethodID(env, index_class, "<init>", "(JI)V");
-    if (index_ctor == NULL)
+    if ((*env)->PushLocalFrame(env, 3) < 0)
     {
         return NULL;
     }
 
-    return (*env)->NewObject(env, index_class, index_ctor, (jlong)index->offset, (jint)index->number);
+    jclass index_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheetIndex");
+    if (index_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID index_ctor = (*env)->GetMethodID(env, index_class, "<init>", "(JI)V");
+    if (index_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jobject result = (*env)->NewObject(env, index_class, index_ctor, (jlong)index->offset, (jint)index->number);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -1029,24 +1255,46 @@ static jobject new_cue_sheet_index(JNIEnv *env, const FLAC__StreamMetadata_CueSh
  */
 static jobject new_cue_sheet_track(JNIEnv *env, const FLAC__StreamMetadata_CueSheet_Track *track)
 {
-    jclass list_class = (*env)->FindClass(env, "java/util/ArrayList");
-    jclass track_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheetTrack");
-    if (list_class == NULL || track_class == NULL)
-    {
-        return NULL;
-    }
-    jmethodID list_ctor = (*env)->GetMethodID(env, list_class, "<init>", "(I)V");
-    jmethodID list_add = (*env)->GetMethodID(env, list_class, "add", "(Ljava/lang/Object;)Z");
-    jmethodID track_ctor = (*env)->GetMethodID(env, track_class, "<init>", "(JILjava/lang/String;IZLjava/util/List;)V");
-    if (list_ctor == NULL || list_add == NULL || track_ctor == NULL)
+    if ((*env)->PushLocalFrame(env, 8) < 0)
     {
         return NULL;
     }
 
-    jobject indices = (*env)->NewObject(env, list_class, list_ctor, (jint)track->num_indices);
-    if (indices == NULL)
+    jclass list_class = (*env)->FindClass(env, "java/util/ArrayList");
+    if (list_class == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID list_ctor = (*env)->GetMethodID(env, list_class, "<init>", "(I)V");
+    if (list_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID list_add = (*env)->GetMethodID(env, list_class, "add", "(Ljava/lang/Object;)Z");
+    if (list_add == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jclass track_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheetTrack");
+    if (track_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID track_ctor = (*env)->GetMethodID(env, track_class, "<init>", "(JILjava/lang/String;IZLjava/util/List;)V");
+    if (track_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jobject indices = (*env)->NewObject(env, list_class, list_ctor, (jint)track->num_indices);
+    jboolean indices_construction_threw = (*env)->ExceptionCheck(env);
+    if (indices == NULL || indices_construction_threw)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     for (uint32_t i = 0; i < track->num_indices; ++i)
@@ -1054,24 +1302,38 @@ static jobject new_cue_sheet_track(JNIEnv *env, const FLAC__StreamMetadata_CueSh
         jobject index = new_cue_sheet_index(env, &track->indices[i]);
         if (index == NULL)
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
-        (*env)->CallBooleanMethod(env, indices, list_add, index);
+
+        jboolean added = (*env)->CallBooleanMethod(env, indices, list_add, index);
+        jboolean add_threw = (*env)->ExceptionCheck(env);
         (*env)->DeleteLocalRef(env, index);
-        if ((*env)->ExceptionCheck(env))
+        if (add_threw)
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
+        }
+
+        if (added == JNI_FALSE)
+        {
+            throw_decode_exception(env, "Failed to append a CUESHEET index to the JVM result.");
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
     jobject isrc = new_utf8_string(env, track->isrc, fixed_ascii_length(track->isrc, sizeof(track->isrc) - 1u));
     if (isrc == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
-    return (*env)->NewObject(env, track_class, track_ctor, (jlong)track->offset, (jint)track->number, isrc,
-                             (jint)track->type, track->pre_emphasis ? JNI_TRUE : JNI_FALSE, indices);
+    jobject result = (*env)->NewObject(env, track_class, track_ctor, (jlong)track->offset, (jint)track->number, isrc,
+                                       (jint)track->type, track->pre_emphasis ? JNI_TRUE : JNI_FALSE, indices);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -1080,25 +1342,47 @@ static jobject new_cue_sheet_track(JNIEnv *env, const FLAC__StreamMetadata_CueSh
  */
 static jobject new_cue_sheet(JNIEnv *env, const FLAC__StreamMetadata_CueSheet *cue_sheet)
 {
-    jclass list_class = (*env)->FindClass(env, "java/util/ArrayList");
-    jclass cue_sheet_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheet");
-    if (list_class == NULL || cue_sheet_class == NULL)
-    {
-        return NULL;
-    }
-    jmethodID list_ctor = (*env)->GetMethodID(env, list_class, "<init>", "(I)V");
-    jmethodID list_add = (*env)->GetMethodID(env, list_class, "add", "(Ljava/lang/Object;)Z");
-    jmethodID cue_sheet_ctor =
-        (*env)->GetMethodID(env, cue_sheet_class, "<init>", "(Ljava/lang/String;JZLjava/util/List;)V");
-    if (list_ctor == NULL || list_add == NULL || cue_sheet_ctor == NULL)
+    if ((*env)->PushLocalFrame(env, 8) < 0)
     {
         return NULL;
     }
 
-    jobject tracks = (*env)->NewObject(env, list_class, list_ctor, (jint)cue_sheet->num_tracks);
-    if (tracks == NULL)
+    jclass list_class = (*env)->FindClass(env, "java/util/ArrayList");
+    if (list_class == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID list_ctor = (*env)->GetMethodID(env, list_class, "<init>", "(I)V");
+    if (list_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID list_add = (*env)->GetMethodID(env, list_class, "add", "(Ljava/lang/Object;)Z");
+    if (list_add == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jclass cue_sheet_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheet");
+    if (cue_sheet_class == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID cue_sheet_ctor =
+        (*env)->GetMethodID(env, cue_sheet_class, "<init>", "(Ljava/lang/String;JZLjava/util/List;)V");
+    if (cue_sheet_ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jobject tracks = (*env)->NewObject(env, list_class, list_ctor, (jint)cue_sheet->num_tracks);
+    jboolean tracks_construction_threw = (*env)->ExceptionCheck(env);
+    if (tracks == NULL || tracks_construction_threw)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     for (uint32_t i = 0; i < cue_sheet->num_tracks; ++i)
@@ -1106,13 +1390,21 @@ static jobject new_cue_sheet(JNIEnv *env, const FLAC__StreamMetadata_CueSheet *c
         jobject track = new_cue_sheet_track(env, &cue_sheet->tracks[i]);
         if (track == NULL)
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
-        (*env)->CallBooleanMethod(env, tracks, list_add, track);
+
+        jboolean added = (*env)->CallBooleanMethod(env, tracks, list_add, track);
+        jboolean add_threw = (*env)->ExceptionCheck(env);
         (*env)->DeleteLocalRef(env, track);
-        if ((*env)->ExceptionCheck(env))
+        if (add_threw)
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
+        }
+
+        if (added == JNI_FALSE)
+        {
+            throw_decode_exception(env, "Failed to append a CUESHEET track to the JVM result.");
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
@@ -1121,11 +1413,18 @@ static jobject new_cue_sheet(JNIEnv *env, const FLAC__StreamMetadata_CueSheet *c
         fixed_ascii_length(cue_sheet->media_catalog_number, sizeof(cue_sheet->media_catalog_number) - 1u));
     if (media_catalog_number == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
-    return (*env)->NewObject(env, cue_sheet_class, cue_sheet_ctor, media_catalog_number, (jlong)cue_sheet->lead_in,
-                             cue_sheet->is_cd ? JNI_TRUE : JNI_FALSE, tracks);
+    jobject result = (*env)->NewObject(env, cue_sheet_class, cue_sheet_ctor, media_catalog_number,
+                                       (jlong)cue_sheet->lead_in,
+                                       cue_sheet->is_cd ? JNI_TRUE : JNI_FALSE, tracks);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -1135,24 +1434,46 @@ static jobject new_cue_sheet(JNIEnv *env, const FLAC__StreamMetadata_CueSheet *c
  */
 static jobject new_picture(JNIEnv *env, const FLAC__StreamMetadata_Picture *picture)
 {
-    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacPicture");
-    if (clazz == NULL)
+    if (picture->data_length > (uint32_t)INT_MAX)
     {
+        throw_decode_exception(env, "PICTURE metadata data is too large for one JVM ByteArray.");
         return NULL;
     }
-    jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(ILjava/lang/String;Ljava/lang/String;IIII[B)V");
-    if (ctor == NULL)
+
+    if ((*env)->PushLocalFrame(env, 6) < 0)
     {
         return NULL;
     }
 
+    jclass clazz = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacPicture");
+    if (clazz == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jmethodID ctor = (*env)->GetMethodID(env, clazz, "<init>", "(ILjava/lang/String;Ljava/lang/String;IIII[B)V");
+    if (ctor == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
     jobject mime_type = new_utf8_string(env, picture->mime_type, strlen(picture->mime_type));
+    if (mime_type == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
     jobject description =
         new_utf8_string(env, (const char *)picture->description, strlen((const char *)picture->description));
-    jbyteArray data = (*env)->NewByteArray(env, (jsize)picture->data_length);
-    if (mime_type == NULL || description == NULL || data == NULL)
+    if (description == NULL)
     {
-        return NULL;
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    jbyteArray data = (*env)->NewByteArray(env, (jsize)picture->data_length);
+    if (data == NULL)
+    {
+        return (*env)->PopLocalFrame(env, NULL);
     }
 
     if (picture->data_length > 0u)
@@ -1160,12 +1481,19 @@ static jobject new_picture(JNIEnv *env, const FLAC__StreamMetadata_Picture *pict
         (*env)->SetByteArrayRegion(env, data, 0, (jsize)picture->data_length, (const jbyte *)picture->data);
         if ((*env)->ExceptionCheck(env))
         {
-            return NULL;
+            return (*env)->PopLocalFrame(env, NULL);
         }
     }
 
-    return (*env)->NewObject(env, clazz, ctor, (jint)picture->type, mime_type, description, (jint)picture->width,
-                             (jint)picture->height, (jint)picture->depth, (jint)picture->colors, data);
+    jobject result = (*env)->NewObject(env, clazz, ctor, (jint)picture->type, mime_type, description,
+                                       (jint)picture->width, (jint)picture->height, (jint)picture->depth,
+                                       (jint)picture->colors, data);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return (*env)->PopLocalFrame(env, NULL);
+    }
+
+    return (*env)->PopLocalFrame(env, result);
 }
 
 /*
@@ -1232,6 +1560,7 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
         throw_decode_exception(env, "Failed to read FLAC metadata.");
         return NULL;
     }
+
     free(utf8_path);
 
     iterator = g_flac_api.metadata_iterator_new();
@@ -1322,14 +1651,14 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
 
     jobject vendor = NULL;
     jclass string_class = (*env)->FindClass(env, "java/lang/String");
-    jobjectArray comment_entries = (*env)->NewObjectArray(env, 0, string_class, NULL);
-    if (comment_entries == NULL)
+    if (string_class == NULL)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
         return NULL;
     }
 
+    jobjectArray comment_entries = NULL;
     if (vorbis_block != NULL)
     {
         /*
@@ -1341,9 +1670,20 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
         const FLAC__StreamMetadata_VorbisComment *vorbis_comment = &vorbis_block->data.vorbis_comment;
         vendor = new_utf8_string(env, (const char *)vorbis_comment->vendor_string.entry,
                                  vorbis_comment->vendor_string.length);
-        comment_entries = (*env)->NewObjectArray(env, (jsize)vorbis_comment->num_comments, string_class, NULL);
-        if (comment_entries == NULL)
+        jboolean vendor_conversion_threw = (*env)->ExceptionCheck(env);
+        if (vendor == NULL || vendor_conversion_threw)
         {
+            (*env)->DeleteLocalRef(env, string_class);
+            g_flac_api.metadata_iterator_delete(iterator);
+            g_flac_api.metadata_chain_delete(chain);
+            return NULL;
+        }
+
+        comment_entries = (*env)->NewObjectArray(env, (jsize)vorbis_comment->num_comments, string_class, NULL);
+        jboolean comments_allocation_threw = (*env)->ExceptionCheck(env);
+        if (comment_entries == NULL || comments_allocation_threw)
+        {
+            (*env)->DeleteLocalRef(env, string_class);
             g_flac_api.metadata_iterator_delete(iterator);
             g_flac_api.metadata_chain_delete(chain);
             return NULL;
@@ -1353,21 +1693,41 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
         {
             jobject entry = new_utf8_string(env, (const char *)vorbis_comment->comments[i].entry,
                                             vorbis_comment->comments[i].length);
-            if (entry == NULL)
+            jboolean entry_conversion_threw = (*env)->ExceptionCheck(env);
+            if (entry == NULL || entry_conversion_threw)
             {
+                (*env)->DeleteLocalRef(env, string_class);
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, comment_entries, (jsize)i, entry);
-            if ((*env)->ExceptionCheck(env))
+            jboolean set_threw = (*env)->ExceptionCheck(env);
+            (*env)->DeleteLocalRef(env, entry);
+            if (set_threw)
             {
+                (*env)->DeleteLocalRef(env, string_class);
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
         }
     }
+    else
+    {
+        comment_entries = (*env)->NewObjectArray(env, 0, string_class, NULL);
+        jboolean comments_allocation_threw = (*env)->ExceptionCheck(env);
+        if (comment_entries == NULL || comments_allocation_threw)
+        {
+            (*env)->DeleteLocalRef(env, string_class);
+            g_flac_api.metadata_iterator_delete(iterator);
+            g_flac_api.metadata_chain_delete(chain);
+            return NULL;
+        }
+    }
+
+    (*env)->DeleteLocalRef(env, string_class);
 
     /*
      * The following repeated passes all use the same pattern:
@@ -1376,8 +1736,17 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
      * 3. copy only blocks of that type into the array in file order.
      */
     jclass picture_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacPicture");
+    if (picture_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jobjectArray pictures = (*env)->NewObjectArray(env, picture_count, picture_class, NULL);
-    if (pictures == NULL)
+    jboolean pictures_allocation_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, picture_class);
+    if (pictures == NULL || pictures_allocation_threw)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1399,8 +1768,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, pictures, picture_index++, picture);
-            if ((*env)->ExceptionCheck(env))
+            jboolean set_threw = (*env)->ExceptionCheck(env);
+            (*env)->DeleteLocalRef(env, picture);
+            if (set_threw)
             {
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
@@ -1410,8 +1782,17 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jclass application_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacApplicationBlock");
+    if (application_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jobjectArray application_blocks = (*env)->NewObjectArray(env, application_count, application_class, NULL);
-    if (application_blocks == NULL)
+    jboolean applications_allocation_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, application_class);
+    if (application_blocks == NULL || applications_allocation_threw)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1433,9 +1814,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, application_blocks, application_index++, application);
+            jboolean set_threw = (*env)->ExceptionCheck(env);
             (*env)->DeleteLocalRef(env, application);
-            if ((*env)->ExceptionCheck(env))
+            if (set_threw)
             {
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
@@ -1445,8 +1828,17 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jclass seek_table_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacSeekTable");
+    if (seek_table_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jobjectArray seek_tables = (*env)->NewObjectArray(env, seek_table_count, seek_table_class, NULL);
-    if (seek_tables == NULL)
+    jboolean seek_tables_allocation_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, seek_table_class);
+    if (seek_tables == NULL || seek_tables_allocation_threw)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1468,9 +1860,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, seek_tables, seek_table_index++, seek_table);
+            jboolean set_threw = (*env)->ExceptionCheck(env);
             (*env)->DeleteLocalRef(env, seek_table);
-            if ((*env)->ExceptionCheck(env))
+            if (set_threw)
             {
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
@@ -1480,8 +1874,17 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jclass cue_sheet_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheet");
+    if (cue_sheet_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jobjectArray cue_sheets = (*env)->NewObjectArray(env, cue_sheet_count, cue_sheet_class, NULL);
-    if (cue_sheets == NULL)
+    jboolean cue_sheets_allocation_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, cue_sheet_class);
+    if (cue_sheets == NULL || cue_sheets_allocation_threw)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1503,9 +1906,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, cue_sheets, cue_sheet_index++, cue_sheet);
+            jboolean set_threw = (*env)->ExceptionCheck(env);
             (*env)->DeleteLocalRef(env, cue_sheet);
-            if ((*env)->ExceptionCheck(env))
+            if (set_threw)
             {
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
@@ -1515,8 +1920,17 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jclass padding_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacPaddingBlock");
+    if (padding_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jobjectArray padding_blocks = (*env)->NewObjectArray(env, padding_count, padding_class, NULL);
-    if (padding_blocks == NULL)
+    jboolean padding_allocation_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, padding_class);
+    if (padding_blocks == NULL || padding_allocation_threw)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1538,9 +1952,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, padding_blocks, padding_index++, padding);
+            jboolean set_threw = (*env)->ExceptionCheck(env);
             (*env)->DeleteLocalRef(env, padding);
-            if ((*env)->ExceptionCheck(env))
+            if (set_threw)
             {
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
@@ -1550,8 +1966,17 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jclass unknown_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacUnknownMetadataBlock");
+    if (unknown_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jobjectArray unknown_blocks = (*env)->NewObjectArray(env, unknown_count, unknown_class, NULL);
-    if (unknown_blocks == NULL)
+    jboolean unknown_allocation_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, unknown_class);
+    if (unknown_blocks == NULL || unknown_allocation_threw)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1573,9 +1998,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
                 g_flac_api.metadata_chain_delete(chain);
                 return NULL;
             }
+
             (*env)->SetObjectArrayElement(env, unknown_blocks, unknown_index++, unknown);
+            jboolean set_threw = (*env)->ExceptionCheck(env);
             (*env)->DeleteLocalRef(env, unknown);
-            if ((*env)->ExceptionCheck(env))
+            if (set_threw)
             {
                 g_flac_api.metadata_iterator_delete(iterator);
                 g_flac_api.metadata_chain_delete(chain);
@@ -1585,8 +2012,15 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jintArray metadata_block_types = (*env)->NewIntArray(env, ordered_block_count);
+    if (metadata_block_types == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jintArray metadata_block_indices = (*env)->NewIntArray(env, ordered_block_count);
-    if (metadata_block_types == NULL || metadata_block_indices == NULL)
+    if (metadata_block_indices == NULL)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1643,6 +2077,13 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
         }
 
         (*env)->SetIntArrayRegion(env, metadata_block_types, ordered_index, 1, &block_type);
+        if ((*env)->ExceptionCheck(env))
+        {
+            g_flac_api.metadata_iterator_delete(iterator);
+            g_flac_api.metadata_chain_delete(chain);
+            return NULL;
+        }
+
         (*env)->SetIntArrayRegion(env, metadata_block_indices, ordered_index, 1, &block_index);
         if ((*env)->ExceptionCheck(env))
         {
@@ -1650,17 +2091,25 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
             g_flac_api.metadata_chain_delete(chain);
             return NULL;
         }
+
         ordered_index += 1;
     } while (g_flac_api.metadata_iterator_next(iterator));
 
     jclass payload_class = (*env)->FindClass(env, "org/zzvsjs/jflac/internal/NativeMetadataPayload");
+    if (payload_class == NULL)
+    {
+        g_flac_api.metadata_iterator_delete(iterator);
+        g_flac_api.metadata_chain_delete(chain);
+        return NULL;
+    }
+
     jmethodID payload_ctor =
         (*env)->GetMethodID(env, payload_class, "<init>",
                             "(Lorg/zzvsjs/jflac/FlacStreamInfo;Ljava/lang/String;[Ljava/lang/String;[Lorg/zzvsjs/jflac/"
                             "FlacPicture;[Lorg/zzvsjs/jflac/FlacApplicationBlock;[Lorg/zzvsjs/jflac/FlacSeekTable;"
                             "[Lorg/zzvsjs/jflac/FlacCueSheet;[Lorg/zzvsjs/jflac/FlacPaddingBlock;"
                             "[Lorg/zzvsjs/jflac/FlacUnknownMetadataBlock;[I[I)V");
-    if (payload_class == NULL || payload_ctor == NULL)
+    if (payload_ctor == NULL)
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
@@ -1670,8 +2119,15 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     jobject payload = (*env)->NewObject(env, payload_class, payload_ctor, stream_info, vendor, comment_entries,
                                         pictures, application_blocks, seek_tables, cue_sheets, padding_blocks,
                                         unknown_blocks, metadata_block_types, metadata_block_indices);
+    jboolean payload_construction_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, payload_class);
     g_flac_api.metadata_iterator_delete(iterator);
     g_flac_api.metadata_chain_delete(chain);
+    if (payload_construction_threw)
+    {
+        return NULL;
+    }
+
     return payload;
 }
 
@@ -1687,6 +2143,7 @@ JNIEXPORT jboolean JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_isSampl
     {
         return JNI_FALSE;
     }
+
     return g_flac_api.format_sample_rate_is_valid((uint32_t)sample_rate) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -1702,6 +2159,7 @@ JNIEXPORT jboolean JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_isSampl
     {
         return JNI_FALSE;
     }
+
     return g_flac_api.format_sample_rate_is_subset((uint32_t)sample_rate) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -1718,6 +2176,7 @@ JNIEXPORT jboolean JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_isBlock
     {
         return JNI_FALSE;
     }
+
     return g_flac_api.format_blocksize_is_subset((uint32_t)block_size, (uint32_t)sample_rate) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -2024,6 +2483,7 @@ static void clear_decode_seekable_channel(DecodeContext *context)
     {
         (*env)->DeleteGlobalRef(env, context->seekable_channel);
     }
+
     context->seekable_channel = NULL;
 }
 
@@ -2046,6 +2506,7 @@ static void clear_decode_input_stream(DecodeContext *context)
     {
         (*env)->DeleteGlobalRef(env, context->input_stream);
     }
+
     context->input_stream = NULL;
     context->input_stream_is_global = 0;
 }
@@ -2084,8 +2545,10 @@ static DecodeSessionRegistryEntry *find_decode_session_entry_locked(jlong handle
             {
                 *previous = prev;
             }
+
             return entry;
         }
+
         prev = entry;
         entry = entry->next;
     }
@@ -2094,6 +2557,7 @@ static DecodeSessionRegistryEntry *find_decode_session_entry_locked(jlong handle
     {
         *previous = NULL;
     }
+
     return NULL;
 }
 
@@ -2140,6 +2604,7 @@ static void destroy_decode_session(DecodeSession *session)
         g_flac_api.stream_decoder_delete(session->decoder);
         session->decoder = NULL;
     }
+
     clear_decode_seekable_channel(&session->context);
     clear_decode_input_stream(&session->context);
     clear_decode_pull_pending(&session->context);
@@ -2199,6 +2664,7 @@ static DecodeSession *acquire_decode_session(JNIEnv *env, jlong handle)
             session->reference_count += 1;
             session->in_use = 1;
         }
+
         unlock_decode_session_registry();
     }
 
@@ -2206,6 +2672,7 @@ static DecodeSession *acquire_decode_session(JNIEnv *env, jlong handle)
     {
         throw_illegal_state_exception(env, "The native FLAC decoder handle is not active.");
     }
+
     return session;
 }
 
@@ -2228,6 +2695,7 @@ static void release_decode_session_reference(DecodeSession *session)
     {
         session->reference_count -= 1;
     }
+
     session->in_use = 0;
     /*
      * A release request during decode only marks the session as released. The
@@ -2271,6 +2739,7 @@ static DecodeSession *remove_decode_session(jlong handle)
         {
             previous->next = entry->next;
         }
+
         free(entry);
 
         if (session != NULL)
@@ -2287,9 +2756,32 @@ static DecodeSession *remove_decode_session(jlong handle)
             }
         }
     }
+
     unlock_decode_session_registry();
 
     return session_to_destroy;
+}
+
+/*
+ * Releases every session that remains registered when this JNI library is
+ * unloaded. Public close paths normally remove entries one at a time; this is
+ * the class-loader teardown fallback for sessions abandoned by Java code.
+ * JNI_OnUnload cannot overlap a native entry point, so no operation reference
+ * can still be using a detached session.
+ */
+static void destroy_all_decode_sessions(void)
+{
+    lock_decode_session_registry();
+    DecodeSessionRegistryEntry *entry = g_decode_session_registry;
+    g_decode_session_registry = NULL;
+    unlock_decode_session_registry();
+    while (entry != NULL)
+    {
+        DecodeSessionRegistryEntry *next = entry->next;
+        destroy_decode_session(entry->session);
+        free(entry);
+        entry = next;
+    }
 }
 
 /*
@@ -2325,8 +2817,6 @@ static int prepare_decode_context(JNIEnv *env, DecodeContext *context, jobject c
         (*env)->GetMethodID(env, consumer_class, "onStreamInfo", "(Lorg/zzvsjs/jflac/FlacStreamInfo;)V");
     context->on_pcm_interleaved = (*env)->GetMethodID(env, consumer_class, "onPcmInterleaved", "([II)V");
     context->on_complete = (*env)->GetMethodID(env, consumer_class, "onComplete", "()V");
-    context->input_stream = NULL;
-    context->input_read = NULL;
     context->saw_error = 0;
     context->suppress_metadata = 0;
     context->range_limited = 0;
@@ -2338,6 +2828,7 @@ static int prepare_decode_context(JNIEnv *env, DecodeContext *context, jobject c
     {
         return 0;
     }
+
     return 1;
 }
 
@@ -2461,6 +2952,7 @@ static FLAC__bool process_decode_stream(FLAC__StreamDecoder *decoder, DecodeCont
                 {
                     return validate_chained_link_sample_count(context) ? true : false;
                 }
+
                 if (state != FLAC__STREAM_DECODER_END_OF_LINK)
                 {
                     return false;
@@ -2478,6 +2970,7 @@ static FLAC__bool process_decode_stream(FLAC__StreamDecoder *decoder, DecodeCont
                 }
             }
         }
+
         return g_flac_api.stream_decoder_process_until_end_of_stream(decoder);
     }
 
@@ -2583,6 +3076,7 @@ static int prepare_decode_input_stream(JNIEnv *env, DecodeContext *context, jobj
     {
         return 0;
     }
+
     return 1;
 }
 
@@ -2695,6 +3189,7 @@ static FLAC__StreamDecoderReadStatus decode_channel_read_callback(const FLAC__St
         {
             *bytes = 0u;
         }
+
         return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
     }
 
@@ -2724,8 +3219,9 @@ static FLAC__StreamDecoderReadStatus decode_channel_read_callback(const FLAC__St
     }
 
     jint read = (*env)->CallIntMethod(env, context->seekable_channel, context->channel_read, byte_buffer);
+    jboolean read_failed = (*env)->ExceptionCheck(env);
     (*env)->DeleteLocalRef(env, byte_buffer);
-    if ((*env)->ExceptionCheck(env))
+    if (read_failed)
     {
         *bytes = 0u;
         return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
@@ -2774,11 +3270,13 @@ static FLAC__StreamDecoderSeekStatus decode_channel_seek_callback(const FLAC__St
 
     jobject ignored = (*env)->CallObjectMethod(env, context->seekable_channel, context->channel_seek,
                                                context->channel_base_offset + (jlong)absolute_byte_offset);
+    jboolean seek_failed = (*env)->ExceptionCheck(env);
     if (ignored != NULL)
     {
         (*env)->DeleteLocalRef(env, ignored);
     }
-    return (*env)->ExceptionCheck(env) ? FLAC__STREAM_DECODER_SEEK_STATUS_ERROR : FLAC__STREAM_DECODER_SEEK_STATUS_OK;
+
+    return seek_failed ? FLAC__STREAM_DECODER_SEEK_STATUS_ERROR : FLAC__STREAM_DECODER_SEEK_STATUS_OK;
 }
 
 /*
@@ -2859,11 +3357,13 @@ static FLAC__bool decode_channel_eof_callback(const FLAC__StreamDecoder *decoder
     {
         return true;
     }
+
     jlong size = (*env)->CallLongMethod(env, context->seekable_channel, context->channel_size);
     if ((*env)->ExceptionCheck(env))
     {
         return true;
     }
+
     return position >= size ? true : false;
 }
 
@@ -2889,6 +3389,7 @@ static FLAC__StreamDecoderReadStatus decode_read_callback(const FLAC__StreamDeco
         {
             *bytes = 0u;
         }
+
         return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
     }
 
@@ -3017,6 +3518,7 @@ static int drain_decode_pull_pending(JNIEnv *env, DecodeContext *context)
     {
         clear_decode_pull_pending(context);
     }
+
     return 1;
 }
 
@@ -3171,8 +3673,9 @@ static FLAC__StreamDecoderWriteStatus decode_write_callback(const FLAC__StreamDe
     }
 
     (*env)->CallVoidMethod(env, context->consumer, context->on_pcm_interleaved, samples, (jint)output_frames);
+    jboolean callback_failed = (*env)->ExceptionCheck(env);
     (*env)->DeleteLocalRef(env, samples);
-    if ((*env)->ExceptionCheck(env))
+    if (callback_failed)
     {
         return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
     }
@@ -3262,6 +3765,7 @@ static void decode_metadata_callback(const FLAC__StreamDecoder *decoder, const F
     }
 
     (*context->env)->CallVoidMethod(context->env, context->consumer, context->on_stream_info, stream_info);
+    (void)(*context->env)->ExceptionCheck(context->env);
     (*context->env)->DeleteLocalRef(context->env, stream_info);
 }
 
@@ -3296,6 +3800,7 @@ static void copy_resolved_decoder_state(const FLAC__StreamDecoder *decoder, char
         buffer[0] = '\0';
         return;
     }
+
     snprintf(buffer, buffer_size, "%s", state);
 }
 
@@ -3364,6 +3869,7 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
         free(utf8_path);
         return;
     }
+
     configure_decode_range(&context, range_limited, max_frames);
 
     FLAC__StreamDecoder *decoder = g_flac_api.stream_decoder_new();
@@ -3443,7 +3949,9 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
             if (!(*env)->ExceptionCheck(env) && finish_success)
             {
                 (*env)->CallVoidMethod(env, consumer, context.on_complete);
+                (void)(*env)->ExceptionCheck(env);
             }
+
             g_flac_api.stream_decoder_delete(decoder);
             return;
         }
@@ -3514,6 +4022,7 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
     if (!(*env)->ExceptionCheck(env) && success && finish_success)
     {
         (*env)->CallVoidMethod(env, consumer, context.on_complete);
+        (void)(*env)->ExceptionCheck(env);
     }
 
     g_flac_api.stream_decoder_delete(decoder);
@@ -3629,6 +4138,7 @@ static void decode_stream_internal(JNIEnv *env, jobject input_stream, jint conta
          * libFLAC reached EOF and the consumer can be completed.
          */
         (*env)->CallVoidMethod(env, consumer, context.on_complete);
+        (void)(*env)->ExceptionCheck(env);
     }
 
     g_flac_api.stream_decoder_delete(decoder);
@@ -3684,6 +4194,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
         clear_decode_seekable_channel(&context);
         return;
     }
+
     configure_decode_range(&context, range_limited, max_frames);
 
     FLAC__StreamDecoder *decoder = g_flac_api.stream_decoder_new();
@@ -3761,7 +4272,9 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
             if (!(*env)->ExceptionCheck(env) && finish_success)
             {
                 (*env)->CallVoidMethod(env, consumer, context.on_complete);
+                (void)(*env)->ExceptionCheck(env);
             }
+
             g_flac_api.stream_decoder_delete(decoder);
             clear_decode_seekable_channel(&context);
             return;
@@ -3840,6 +4353,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
          * native cleanup below still runs.
          */
         (*env)->CallVoidMethod(env, consumer, context.on_complete);
+        (void)(*env)->ExceptionCheck(env);
     }
 
     /*
@@ -4207,6 +4721,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
             destroy_decode_session(session);
             return NULL;
         }
+
         init_status = init_stream_decoder_for_container(session->decoder, decode_read_callback, NULL, NULL, NULL, NULL,
                                                         decode_write_callback, decode_metadata_callback,
                                                         decode_error_callback, &session->context, container);
@@ -4218,6 +4733,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
             destroy_decode_session(session);
             return NULL;
         }
+
         init_status = init_stream_decoder_for_container(
             session->decoder, decode_read_callback, decode_channel_seek_callback, decode_channel_tell_callback,
             decode_channel_length_callback, decode_channel_eof_callback, decode_write_callback,
@@ -4279,6 +4795,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
         destroy_decode_session(registered_session);
         return NULL;
     }
+
     return result;
 }
 
@@ -4387,6 +4904,20 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
     }
 
     /*
+     * Pull and callback-driven decoders share the opaque handle registry, but
+     * they have different callback state machines. In particular, a pull
+     * InputStream session owns a global reference stored in DecodeContext.
+     * Rejecting the wrong operation before prepare_decode_context() prevents
+     * per-call callback setup from disturbing that long-lived transport state.
+     */
+    if (session->context.pull_mode)
+    {
+        release_decode_session_reference(session);
+        throw_illegal_state_exception(env, "A pull decoder handle cannot be used for callback-driven decoding.");
+        return;
+    }
+
+    /*
      * From here until release_decode_session_reference(), the registry keeps
      * the session in-use. Every early return must release the reference.
      */
@@ -4409,6 +4940,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
         release_decode_session_reference(session);
         return;
     }
+
     /*
      * Kotlin already has session STREAMINFO from open. Suppressing metadata
      * here avoids duplicate onStreamInfo calls during repeated session decodes.
@@ -4464,7 +4996,9 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
     if (!(*env)->ExceptionCheck(env) && success)
     {
         (*env)->CallVoidMethod(env, consumer, session->context.on_complete);
+        (void)(*env)->ExceptionCheck(env);
     }
+
     /*
      * Do this even when onComplete throws. The pending Java exception is left
      * untouched, while the native context stops retaining a stale local ref.
@@ -4492,6 +5026,13 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
         return;
     }
 
+    if (session->context.pull_mode)
+    {
+        release_decode_session_reference(session);
+        throw_illegal_state_exception(env, "A pull decoder handle cannot be used for callback-driven decoding.");
+        return;
+    }
+
     /*
      * Bounded session decode has more early exits than unbounded decode. Keep
      * all validation after acquisition paired with release_decode_session_reference().
@@ -4514,6 +5055,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
         release_decode_session_reference(session);
         return;
     }
+
     session->context.suppress_metadata = JFLAC_SUPPRESS_METADATA_CALLBACKS;
     /*
      * configure_decode_range() also handles the zero-length range case by
@@ -4541,7 +5083,9 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
         if (!(*env)->ExceptionCheck(env))
         {
             (*env)->CallVoidMethod(env, consumer, session->context.on_complete);
+            (void)(*env)->ExceptionCheck(env);
         }
+
         /*
          * No seek or finish is needed for a successful empty range. Keeping the
          * decoder open preserves the session for the caller's next range.
@@ -4591,7 +5135,9 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
     if (!(*env)->ExceptionCheck(env) && success)
     {
         (*env)->CallVoidMethod(env, consumer, session->context.on_complete);
+        (void)(*env)->ExceptionCheck(env);
     }
+
     /*
      * As above, never leave a JNI local reference in the reusable context after
      * the call has returned, regardless of whether onComplete succeeded.
@@ -4732,6 +5278,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
     {
         return written_frames;
     }
+
     return end_of_stream ? (jint)-1 : (jint)0;
 }
 
@@ -4863,6 +5410,7 @@ static void destroy_encode_context(EncodeContext *context)
         {
             (*env)->DeleteGlobalRef(env, context->output_stream);
         }
+
         context->output_stream = NULL;
     }
 
@@ -4874,6 +5422,7 @@ static void destroy_encode_context(EncodeContext *context)
         {
             (*env)->DeleteGlobalRef(env, context->output_channel);
         }
+
         context->output_channel = NULL;
     }
 
@@ -4903,8 +5452,10 @@ static EncodeContextRegistryEntry *find_encode_context_entry_locked(jlong handle
             {
                 *previous = prev;
             }
+
             return entry;
         }
+
         prev = entry;
         entry = entry->next;
     }
@@ -4913,6 +5464,7 @@ static EncodeContextRegistryEntry *find_encode_context_entry_locked(jlong handle
     {
         *previous = NULL;
     }
+
     return NULL;
 }
 
@@ -4971,6 +5523,7 @@ static EncodeContext *acquire_encode_context(JNIEnv *env, jlong handle)
             context->reference_count += 1;
             context->in_use = 1;
         }
+
         unlock_encode_context_registry();
     }
 
@@ -4978,6 +5531,7 @@ static EncodeContext *acquire_encode_context(JNIEnv *env, jlong handle)
     {
         throw_illegal_state_exception(env, "The native FLAC encoder handle is not active.");
     }
+
     return context;
 }
 
@@ -4995,6 +5549,7 @@ static void release_encode_context_reference(EncodeContext *context)
     {
         context->reference_count -= 1;
     }
+
     context->in_use = 0;
     should_destroy = context->released && context->reference_count == 0;
     unlock_encode_context_registry();
@@ -5028,6 +5583,7 @@ static EncodeContext *remove_encode_context(jlong handle)
         {
             previous->next = entry->next;
         }
+
         free(entry);
 
         if (context != NULL)
@@ -5039,9 +5595,32 @@ static EncodeContext *remove_encode_context(jlong handle)
             }
         }
     }
+
     unlock_encode_context_registry();
 
     return context_to_destroy;
+}
+
+/*
+ * Detaches and destroys every encoder retained by the opaque-handle registry.
+ * JNI_OnUnload calls this only after JNI work has stopped, but destruction is
+ * still performed outside the registry lock so callback/global-reference
+ * cleanup never runs while shared registry state is locked.
+ */
+static void destroy_all_encode_contexts(void)
+{
+    lock_encode_context_registry();
+    EncodeContextRegistryEntry *entry = g_encode_context_registry;
+    g_encode_context_registry = NULL;
+    unlock_encode_context_registry();
+    while (entry != NULL)
+    {
+        EncodeContextRegistryEntry *next = entry->next;
+        EncodeContext *context = entry->context;
+        free(entry);
+        destroy_encode_context(context);
+        entry = next;
+    }
 }
 
 /*
@@ -5069,8 +5648,10 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
     if (vendor_object != NULL)
     {
         char *vendor = jstring_to_utf8(env, vendor_object);
-        if (vendor == NULL)
+        jboolean vendor_conversion_threw = (*env)->ExceptionCheck(env);
+        if (vendor == NULL || vendor_conversion_threw)
         {
+            free(vendor);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
@@ -5095,17 +5676,32 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
 
     for (jsize i = 0; i < entry_count; ++i)
     {
-        jstring entry_string = (jstring)(*env)->GetObjectArrayElement(env, comment_entries, i);
-        if ((*env)->ExceptionCheck(env))
+        if ((*env)->PushLocalFrame(env, 1) < 0)
         {
             g_flac_api.metadata_object_delete(block);
             return false;
         }
 
+        jstring entry_string = (jstring)(*env)->GetObjectArrayElement(env, comment_entries, i);
+        if ((*env)->ExceptionCheck(env))
+        {
+            (*env)->PopLocalFrame(env, NULL);
+            g_flac_api.metadata_object_delete(block);
+            return false;
+        }
+
         char *utf8_entry = jstring_to_utf8(env, entry_string);
-        const char *separator = utf8_entry != NULL ? strchr(utf8_entry, '=') : NULL;
-        size_t name_length =
-            separator != NULL ? (size_t)(separator - utf8_entry) : (utf8_entry != NULL ? strlen(utf8_entry) : 0u);
+        jboolean conversion_threw = (*env)->ExceptionCheck(env);
+        if (utf8_entry == NULL || conversion_threw)
+        {
+            free(utf8_entry);
+            (*env)->PopLocalFrame(env, NULL);
+            g_flac_api.metadata_object_delete(block);
+            return false;
+        }
+
+        const char *separator = strchr(utf8_entry, '=');
+        size_t name_length = separator != NULL ? (size_t)(separator - utf8_entry) : strlen(utf8_entry);
         size_t value_length = separator != NULL ? strlen(separator + 1) : 0u;
         char *name = (char *)malloc(name_length + 1u);
         char *value = (char *)malloc(value_length + 1u);
@@ -5117,11 +5713,12 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
          * separate NUL-terminated strings. Missing '=' produces an empty value,
          * which is then validated by libFLAC's own comment-entry builder.
          */
-        if (utf8_entry == NULL || name == NULL || value == NULL)
+        if (name == NULL || value == NULL)
         {
             free(utf8_entry);
             free(name);
             free(value);
+            (*env)->PopLocalFrame(env, NULL);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
@@ -5132,6 +5729,7 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
         {
             memcpy(value, separator + 1, value_length);
         }
+
         value[value_length] = '\0';
 
         if (!g_flac_api.metadata_object_vorbiscomment_entry_from_name_value_pair(
@@ -5140,6 +5738,7 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
             free(utf8_entry);
             free(name);
             free(value);
+            (*env)->PopLocalFrame(env, NULL);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
@@ -5155,6 +5754,7 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
             free(utf8_entry);
             free(name);
             free(value);
+            (*env)->PopLocalFrame(env, NULL);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
@@ -5162,7 +5762,7 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
         free(utf8_entry);
         free(name);
         free(value);
-        (*env)->DeleteLocalRef(env, entry_string);
+        (*env)->PopLocalFrame(env, NULL);
     }
 
     *result = block;
@@ -5184,31 +5784,110 @@ static FLAC__bool build_picture_block(JNIEnv *env, jobject picture_object, FLAC_
     }
 
     jclass picture_class = (*env)->GetObjectClass(env, picture_object);
+    if (picture_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_type = (*env)->GetMethodID(env, picture_class, "getType", "()I");
+    if (get_type == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_mime_type = (*env)->GetMethodID(env, picture_class, "getMimeType", "()Ljava/lang/String;");
+    if (get_mime_type == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_description = (*env)->GetMethodID(env, picture_class, "getDescription", "()Ljava/lang/String;");
+    if (get_description == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_width = (*env)->GetMethodID(env, picture_class, "getWidth", "()I");
+    if (get_width == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_height = (*env)->GetMethodID(env, picture_class, "getHeight", "()I");
+    if (get_height == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_depth = (*env)->GetMethodID(env, picture_class, "getDepth", "()I");
+    if (get_depth == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_colors = (*env)->GetMethodID(env, picture_class, "getColors", "()I");
+    if (get_colors == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_data = (*env)->GetMethodID(env, picture_class, "getData", "()[B");
-    if (get_type == NULL || get_mime_type == NULL || get_description == NULL ||
-        get_width == NULL || get_height == NULL || get_depth == NULL || get_colors == NULL ||
-        get_data == NULL)
+    if (get_data == NULL)
     {
         return false;
     }
 
     jint type = (*env)->CallIntMethod(env, picture_object, get_type);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jint width = (*env)->CallIntMethod(env, picture_object, get_width);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jint height = (*env)->CallIntMethod(env, picture_object, get_height);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jint depth = (*env)->CallIntMethod(env, picture_object, get_depth);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jint colors = (*env)->CallIntMethod(env, picture_object, get_colors);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jstring mime_type_object = (jstring)(*env)->CallObjectMethod(env, picture_object, get_mime_type);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jstring description_object = (jstring)(*env)->CallObjectMethod(env, picture_object, get_description);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jbyteArray data_object = (jbyteArray)(*env)->CallObjectMethod(env, picture_object, get_data);
     if ((*env)->ExceptionCheck(env))
     {
+        return false;
+    }
+
+    if (mime_type_object == NULL || description_object == NULL || data_object == NULL)
+    {
+        throw_illegal_argument_exception(env, "PICTURE MIME type, description, and data must not be null.");
         return false;
     }
 
@@ -5219,7 +5898,24 @@ static FLAC__bool build_picture_block(JNIEnv *env, jobject picture_object, FLAC_
     }
 
     char *mime_type = jstring_to_utf8(env, mime_type_object);
+    jboolean mime_type_conversion_threw = (*env)->ExceptionCheck(env);
+    if (mime_type == NULL || mime_type_conversion_threw)
+    {
+        free(mime_type);
+        g_flac_api.metadata_object_delete(block);
+        return false;
+    }
+
     char *description = jstring_to_utf8(env, description_object);
+    jboolean description_conversion_threw = (*env)->ExceptionCheck(env);
+    if (description == NULL || description_conversion_threw)
+    {
+        free(mime_type);
+        free(description);
+        g_flac_api.metadata_object_delete(block);
+        return false;
+    }
+
     jsize data_length = data_object != NULL ? (*env)->GetArrayLength(env, data_object) : 0;
     FLAC__byte *data = NULL;
 
@@ -5238,6 +5934,7 @@ static FLAC__bool build_picture_block(JNIEnv *env, jobject picture_object, FLAC_
             g_flac_api.metadata_object_delete(block);
             return false;
         }
+
         (*env)->GetByteArrayRegion(env, data_object, 0, data_length, (jbyte *)data);
         if ((*env)->ExceptionCheck(env))
         {
@@ -5247,15 +5944,6 @@ static FLAC__bool build_picture_block(JNIEnv *env, jobject picture_object, FLAC_
             g_flac_api.metadata_object_delete(block);
             return false;
         }
-    }
-
-    if (mime_type == NULL || description == NULL)
-    {
-        free(mime_type);
-        free(description);
-        free(data);
-        g_flac_api.metadata_object_delete(block);
-        return false;
     }
 
     block->data.picture.type = (FLAC__StreamMetadata_Picture_Type)type;
@@ -5304,14 +5992,29 @@ static FLAC__bool build_application_block(JNIEnv *env, jobject application_objec
     }
 
     jclass application_class = (*env)->GetObjectClass(env, application_object);
+    if (application_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_id = (*env)->GetMethodID(env, application_class, "getId", "()[B");
+    if (get_id == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_data = (*env)->GetMethodID(env, application_class, "getData", "()[B");
-    if (get_id == NULL || get_data == NULL)
+    if (get_data == NULL)
     {
         return false;
     }
 
     jbyteArray id_object = (jbyteArray)(*env)->CallObjectMethod(env, application_object, get_id);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jbyteArray data_object = (jbyteArray)(*env)->CallObjectMethod(env, application_object, get_data);
     if ((*env)->ExceptionCheck(env))
     {
@@ -5344,6 +6047,7 @@ static FLAC__bool build_application_block(JNIEnv *env, jobject application_objec
         g_flac_api.metadata_object_delete(block);
         return false;
     }
+
     memcpy(block->data.application.id, id, JFLAC_APPLICATION_ID_LENGTH);
 
     jsize data_length = (*env)->GetArrayLength(env, data_object);
@@ -5361,6 +6065,7 @@ static FLAC__bool build_application_block(JNIEnv *env, jobject application_objec
             g_flac_api.metadata_object_delete(block);
             return false;
         }
+
         (*env)->GetByteArrayRegion(env, data_object, 0, data_length, (jbyte *)data);
         if ((*env)->ExceptionCheck(env))
         {
@@ -5403,6 +6108,11 @@ static FLAC__bool build_padding_block(JNIEnv *env, jobject padding_object, FLAC_
     }
 
     jclass padding_class = (*env)->GetObjectClass(env, padding_object);
+    if (padding_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_length = (*env)->GetMethodID(env, padding_class, "getLength", "()I");
     if (get_length == NULL)
     {
@@ -5427,6 +6137,7 @@ static FLAC__bool build_padding_block(JNIEnv *env, jobject padding_object, FLAC_
     {
         return false;
     }
+
     block->length = (uint32_t)length;
 
     *result = block;
@@ -5449,14 +6160,29 @@ static FLAC__bool build_unknown_metadata_block(JNIEnv *env, jobject unknown_obje
     }
 
     jclass unknown_class = (*env)->GetObjectClass(env, unknown_object);
+    if (unknown_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_type = (*env)->GetMethodID(env, unknown_class, "getType", "()I");
+    if (get_type == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_data = (*env)->GetMethodID(env, unknown_class, "getData", "()[B");
-    if (get_type == NULL || get_data == NULL)
+    if (get_data == NULL)
     {
         return false;
     }
 
     jint type = (*env)->CallIntMethod(env, unknown_object, get_type);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jbyteArray data_object = (jbyteArray)(*env)->CallObjectMethod(env, unknown_object, get_data);
     if ((*env)->ExceptionCheck(env))
     {
@@ -5502,6 +6228,7 @@ static FLAC__bool build_unknown_metadata_block(JNIEnv *env, jobject unknown_obje
             g_flac_api.metadata_object_delete(block);
             return false;
         }
+
         (*env)->GetByteArrayRegion(env, data_object, 0, data_length, (jbyte *)data);
         if ((*env)->ExceptionCheck(env))
         {
@@ -5537,25 +6264,55 @@ static FLAC__bool build_seek_table_block(JNIEnv *env, jobject seek_table_object,
     }
 
     jclass table_class = (*env)->GetObjectClass(env, seek_table_object);
+    if (table_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_points = (*env)->GetMethodID(env, table_class, "getPoints", "()Ljava/util/List;");
+    if (get_points == NULL)
+    {
+        return false;
+    }
+
     jclass list_class = (*env)->FindClass(env, "java/util/List");
-    if (get_points == NULL || list_class == NULL)
+    if (list_class == NULL)
     {
         return false;
     }
 
     jmethodID list_size = (*env)->GetMethodID(env, list_class, "size", "()I");
+    if (list_size == NULL)
+    {
+        return false;
+    }
+
     jmethodID list_get = (*env)->GetMethodID(env, list_class, "get", "(I)Ljava/lang/Object;");
+    if (list_get == NULL)
+    {
+        return false;
+    }
+
     jclass point_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacSeekPoint");
-    if (list_size == NULL || list_get == NULL || point_class == NULL)
+    if (point_class == NULL)
     {
         return false;
     }
 
     jmethodID get_sample_number = (*env)->GetMethodID(env, point_class, "getSampleNumber", "()J");
+    if (get_sample_number == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_stream_offset = (*env)->GetMethodID(env, point_class, "getStreamOffset", "()J");
+    if (get_stream_offset == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_frame_samples = (*env)->GetMethodID(env, point_class, "getFrameSamples", "()I");
-    if (get_sample_number == NULL || get_stream_offset == NULL || get_frame_samples == NULL)
+    if (get_frame_samples == NULL)
     {
         return false;
     }
@@ -5607,7 +6364,21 @@ static FLAC__bool build_seek_table_block(JNIEnv *env, jobject seek_table_object,
         }
 
         jlong sample_number = (*env)->CallLongMethod(env, point_object, get_sample_number);
+        if ((*env)->ExceptionCheck(env))
+        {
+            (*env)->DeleteLocalRef(env, point_object);
+            g_flac_api.metadata_object_delete(block);
+            return false;
+        }
+
         jlong stream_offset = (*env)->CallLongMethod(env, point_object, get_stream_offset);
+        if ((*env)->ExceptionCheck(env))
+        {
+            (*env)->DeleteLocalRef(env, point_object);
+            g_flac_api.metadata_object_delete(block);
+            return false;
+        }
+
         jint frame_samples = (*env)->CallIntMethod(env, point_object, get_frame_samples);
         if ((*env)->ExceptionCheck(env))
         {
@@ -5657,23 +6428,77 @@ static FLAC__bool fill_cue_sheet_track(JNIEnv *env, FLAC__StreamMetadata *block,
     }
 
     jclass track_class = (*env)->GetObjectClass(env, track_object);
+    if (track_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_offset = (*env)->GetMethodID(env, track_class, "getOffset", "()J");
+    if (get_offset == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_number = (*env)->GetMethodID(env, track_class, "getNumber", "()I");
+    if (get_number == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_isrc = (*env)->GetMethodID(env, track_class, "getIsrc", "()Ljava/lang/String;");
+    if (get_isrc == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_type = (*env)->GetMethodID(env, track_class, "getType", "()I");
+    if (get_type == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_pre_emphasis = (*env)->GetMethodID(env, track_class, "getPreEmphasis", "()Z");
+    if (get_pre_emphasis == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_indices = (*env)->GetMethodID(env, track_class, "getIndices", "()Ljava/util/List;");
-    if (get_offset == NULL || get_number == NULL || get_isrc == NULL || get_type == NULL ||
-        get_pre_emphasis == NULL || get_indices == NULL)
+    if (get_indices == NULL)
     {
         return false;
     }
 
     jlong offset = (*env)->CallLongMethod(env, track_object, get_offset);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jint number = (*env)->CallIntMethod(env, track_object, get_number);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jstring isrc_object = (jstring)(*env)->CallObjectMethod(env, track_object, get_isrc);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jint type = (*env)->CallIntMethod(env, track_object, get_type);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jboolean pre_emphasis = (*env)->CallBooleanMethod(env, track_object, get_pre_emphasis);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jobject indices = (*env)->CallObjectMethod(env, track_object, get_indices);
     if ((*env)->ExceptionCheck(env))
     {
@@ -5687,24 +6512,50 @@ static FLAC__bool fill_cue_sheet_track(JNIEnv *env, FLAC__StreamMetadata *block,
     }
 
     char *isrc = jstring_to_utf8(env, isrc_object);
-    if (isrc == NULL)
-    {
-        return false;
-    }
-
-    jclass list_class = (*env)->FindClass(env, "java/util/List");
-    jclass index_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheetIndex");
-    if (list_class == NULL || index_class == NULL)
+    jboolean isrc_conversion_threw = (*env)->ExceptionCheck(env);
+    if (isrc == NULL || isrc_conversion_threw)
     {
         free(isrc);
         return false;
     }
+
+    jclass list_class = (*env)->FindClass(env, "java/util/List");
+    if (list_class == NULL)
+    {
+        free(isrc);
+        return false;
+    }
+
+    jclass index_class = (*env)->FindClass(env, "org/zzvsjs/jflac/FlacCueSheetIndex");
+    if (index_class == NULL)
+    {
+        free(isrc);
+        return false;
+    }
+
     jmethodID list_size = (*env)->GetMethodID(env, list_class, "size", "()I");
+    if (list_size == NULL)
+    {
+        free(isrc);
+        return false;
+    }
+
     jmethodID list_get = (*env)->GetMethodID(env, list_class, "get", "(I)Ljava/lang/Object;");
+    if (list_get == NULL)
+    {
+        free(isrc);
+        return false;
+    }
+
     jmethodID get_index_offset = (*env)->GetMethodID(env, index_class, "getOffset", "()J");
+    if (get_index_offset == NULL)
+    {
+        free(isrc);
+        return false;
+    }
+
     jmethodID get_index_number = (*env)->GetMethodID(env, index_class, "getNumber", "()I");
-    if (list_size == NULL || list_get == NULL || get_index_offset == NULL ||
-        get_index_number == NULL)
+    if (get_index_number == NULL)
     {
         free(isrc);
         return false;
@@ -5740,6 +6591,7 @@ static FLAC__bool fill_cue_sheet_track(JNIEnv *env, FLAC__StreamMetadata *block,
         throw_illegal_argument_exception(env, "CUESHEET track ISRC is too long.");
         return false;
     }
+
     free(isrc);
 
     for (jint i = 0; i < index_count; ++i)
@@ -5762,12 +6614,20 @@ static FLAC__bool fill_cue_sheet_track(JNIEnv *env, FLAC__StreamMetadata *block,
         }
 
         jlong index_offset = (*env)->CallLongMethod(env, index_object, get_index_offset);
-        jint index_number = (*env)->CallIntMethod(env, index_object, get_index_number);
-        (*env)->DeleteLocalRef(env, index_object);
         if ((*env)->ExceptionCheck(env))
         {
+            (*env)->DeleteLocalRef(env, index_object);
             return false;
         }
+
+        jint index_number = (*env)->CallIntMethod(env, index_object, get_index_number);
+        if ((*env)->ExceptionCheck(env))
+        {
+            (*env)->DeleteLocalRef(env, index_object);
+            return false;
+        }
+
+        (*env)->DeleteLocalRef(env, index_object);
 
         track->indices[i].offset = (FLAC__uint64)index_offset;
         track->indices[i].number = (FLAC__byte)index_number;
@@ -5791,21 +6651,55 @@ static FLAC__bool build_cue_sheet_block(JNIEnv *env, jobject cue_sheet_object, F
     }
 
     jclass cue_sheet_class = (*env)->GetObjectClass(env, cue_sheet_object);
+    if (cue_sheet_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_media_catalog_number =
         (*env)->GetMethodID(env, cue_sheet_class, "getMediaCatalogNumber", "()Ljava/lang/String;");
+    if (get_media_catalog_number == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_lead_in = (*env)->GetMethodID(env, cue_sheet_class, "getLeadIn", "()J");
+    if (get_lead_in == NULL)
+    {
+        return false;
+    }
+
     jmethodID is_cd = (*env)->GetMethodID(env, cue_sheet_class, "isCd", "()Z");
+    if (is_cd == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_tracks = (*env)->GetMethodID(env, cue_sheet_class, "getTracks", "()Ljava/util/List;");
-    if (get_media_catalog_number == NULL || get_lead_in == NULL || is_cd == NULL ||
-        get_tracks == NULL)
+    if (get_tracks == NULL)
     {
         return false;
     }
 
     jstring media_catalog_number_object =
         (jstring)(*env)->CallObjectMethod(env, cue_sheet_object, get_media_catalog_number);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jlong lead_in = (*env)->CallLongMethod(env, cue_sheet_object, get_lead_in);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jboolean cd = (*env)->CallBooleanMethod(env, cue_sheet_object, is_cd);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jobject tracks = (*env)->CallObjectMethod(env, cue_sheet_object, get_tracks);
     if ((*env)->ExceptionCheck(env))
     {
@@ -5819,8 +6713,10 @@ static FLAC__bool build_cue_sheet_block(JNIEnv *env, jobject cue_sheet_object, F
     }
 
     char *media_catalog_number = jstring_to_utf8(env, media_catalog_number_object);
-    if (media_catalog_number == NULL)
+    jboolean catalog_conversion_threw = (*env)->ExceptionCheck(env);
+    if (media_catalog_number == NULL || catalog_conversion_threw)
     {
+        free(media_catalog_number);
         return false;
     }
 
@@ -5830,9 +6726,16 @@ static FLAC__bool build_cue_sheet_block(JNIEnv *env, jobject cue_sheet_object, F
         free(media_catalog_number);
         return false;
     }
+
     jmethodID list_size = (*env)->GetMethodID(env, list_class, "size", "()I");
+    if (list_size == NULL)
+    {
+        free(media_catalog_number);
+        return false;
+    }
+
     jmethodID list_get = (*env)->GetMethodID(env, list_class, "get", "(I)Ljava/lang/Object;");
-    if (list_size == NULL || list_get == NULL)
+    if (list_get == NULL)
     {
         free(media_catalog_number);
         return false;
@@ -5862,6 +6765,7 @@ static FLAC__bool build_cue_sheet_block(JNIEnv *env, jobject cue_sheet_object, F
         throw_illegal_argument_exception(env, "CUESHEET media catalog number is too long.");
         return false;
     }
+
     free(media_catalog_number);
 
     if (!g_flac_api.metadata_object_cuesheet_resize_tracks(block, (uint32_t)track_count))
@@ -5876,20 +6780,28 @@ static FLAC__bool build_cue_sheet_block(JNIEnv *env, jobject cue_sheet_object, F
      */
     for (jint i = 0; i < track_count; ++i)
     {
-        jobject track_object = (*env)->CallObjectMethod(env, tracks, list_get, i);
-        if ((*env)->ExceptionCheck(env))
+        if ((*env)->PushLocalFrame(env, 16) < 0)
         {
             g_flac_api.metadata_object_delete(block);
             return false;
         }
 
-        if (!fill_cue_sheet_track(env, block, (uint32_t)i, track_object))
+        jobject track_object = (*env)->CallObjectMethod(env, tracks, list_get, i);
+        if ((*env)->ExceptionCheck(env))
         {
-            (*env)->DeleteLocalRef(env, track_object);
+            (*env)->PopLocalFrame(env, NULL);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
-        (*env)->DeleteLocalRef(env, track_object);
+
+        FLAC__bool track_success = fill_cue_sheet_track(env, block, (uint32_t)i, track_object);
+        jboolean track_conversion_threw = (*env)->ExceptionCheck(env);
+        (*env)->PopLocalFrame(env, NULL);
+        if (!track_success || track_conversion_threw)
+        {
+            g_flac_api.metadata_object_delete(block);
+            return false;
+        }
     }
 
     const char *violation = NULL;
@@ -5912,6 +6824,52 @@ static FLAC__bool build_cue_sheet_block(JNIEnv *env, jobject cue_sheet_object, F
 }
 
 static FLAC__bool ensure_metadata_block_length_fits(JNIEnv *env, FLAC__StreamMetadata *block);
+
+typedef FLAC__bool (*MetadataBlockBuilder)(JNIEnv *env, jobject value, FLAC__StreamMetadata **result);
+
+/*
+ * Appends every element of one typed Java metadata array to the native block
+ * table. One local frame per element contains all references created by the
+ * selected builder, including nested model getters. The native block pointer
+ * survives PopLocalFrame because it is owned by libFLAC, not by the JVM.
+ */
+static FLAC__bool build_metadata_array_blocks(JNIEnv *env, jobjectArray values, jsize value_count,
+                                              MetadataBlockBuilder builder, EncodeContext *context,
+                                              uint32_t *next_index)
+{
+    for (jsize i = 0; i < value_count; ++i)
+    {
+        if ((*env)->PushLocalFrame(env, 16) < 0)
+        {
+            return false;
+        }
+
+        jobject value = (*env)->GetObjectArrayElement(env, values, i);
+        if ((*env)->ExceptionCheck(env))
+        {
+            (*env)->PopLocalFrame(env, NULL);
+            return false;
+        }
+
+        FLAC__bool success = builder(env, value, &context->metadata_blocks[*next_index]);
+        jboolean builder_threw = (*env)->ExceptionCheck(env);
+        if (success && !builder_threw)
+        {
+            success = ensure_metadata_block_length_fits(env, context->metadata_blocks[*next_index]);
+        }
+
+        jboolean length_check_threw = (*env)->ExceptionCheck(env);
+        (*env)->PopLocalFrame(env, NULL);
+        if (!success || builder_threw || length_check_threw)
+        {
+            return false;
+        }
+
+        *next_index += 1u;
+    }
+
+    return true;
+}
 
 /*
  * Builds the metadata block array attached to a new encoder from grouped Java
@@ -5939,6 +6897,7 @@ static FLAC__bool build_metadata_blocks(JNIEnv *env, jobjectArray comment_entrie
         throw_encode_exception(env, "Too many FLAC metadata blocks were requested.");
         return false;
     }
+
     uint32_t total_blocks = (uint32_t)total_blocks_64;
 
     context->metadata_blocks = NULL;
@@ -5960,6 +6919,13 @@ static FLAC__bool build_metadata_blocks(JNIEnv *env, jobjectArray comment_entrie
         return false;
     }
 
+    /*
+     * metadata_count is also the destructor's cleanup span. Publish the full
+     * zero-initialised table immediately so a later partial-build failure
+     * deletes every block that an earlier builder successfully installed.
+     */
+    context->metadata_count = total_blocks;
+
     uint32_t index = 0;
     if (comment_count > 0)
     {
@@ -5970,124 +6936,23 @@ static FLAC__bool build_metadata_blocks(JNIEnv *env, jobjectArray comment_entrie
             destroy_metadata_blocks(context);
             return false;
         }
+
         index += 1u;
     }
 
-    for (jsize i = 0; i < picture_count; ++i)
+    if (!build_metadata_array_blocks(env, pictures, picture_count, build_picture_block, context, &index) ||
+        !build_metadata_array_blocks(env, application_blocks, application_count, build_application_block, context,
+                                     &index) ||
+        !build_metadata_array_blocks(env, seek_tables, seek_table_count, build_seek_table_block, context, &index) ||
+        !build_metadata_array_blocks(env, cue_sheets, cue_sheet_count, build_cue_sheet_block, context, &index) ||
+        !build_metadata_array_blocks(env, padding_blocks, padding_count, build_padding_block, context, &index) ||
+        !build_metadata_array_blocks(env, unknown_blocks, unknown_count, build_unknown_metadata_block, context,
+                                     &index))
     {
-        jobject picture_object = (*env)->GetObjectArrayElement(env, pictures, i);
-        if ((*env)->ExceptionCheck(env))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-
-        if (!build_picture_block(env, picture_object, &context->metadata_blocks[index]) ||
-            !ensure_metadata_block_length_fits(env, context->metadata_blocks[index]))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-        index += 1u;
-        (*env)->DeleteLocalRef(env, picture_object);
+        destroy_metadata_blocks(context);
+        return false;
     }
 
-    for (jsize i = 0; i < application_count; ++i)
-    {
-        jobject application_object = (*env)->GetObjectArrayElement(env, application_blocks, i);
-        if ((*env)->ExceptionCheck(env))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-
-        if (!build_application_block(env, application_object, &context->metadata_blocks[index]) ||
-            !ensure_metadata_block_length_fits(env, context->metadata_blocks[index]))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-        index += 1u;
-        (*env)->DeleteLocalRef(env, application_object);
-    }
-
-    for (jsize i = 0; i < seek_table_count; ++i)
-    {
-        jobject seek_table_object = (*env)->GetObjectArrayElement(env, seek_tables, i);
-        if ((*env)->ExceptionCheck(env))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-
-        if (!build_seek_table_block(env, seek_table_object, &context->metadata_blocks[index]) ||
-            !ensure_metadata_block_length_fits(env, context->metadata_blocks[index]))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-        index += 1u;
-        (*env)->DeleteLocalRef(env, seek_table_object);
-    }
-
-    for (jsize i = 0; i < cue_sheet_count; ++i)
-    {
-        jobject cue_sheet_object = (*env)->GetObjectArrayElement(env, cue_sheets, i);
-        if ((*env)->ExceptionCheck(env))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-
-        if (!build_cue_sheet_block(env, cue_sheet_object, &context->metadata_blocks[index]) ||
-            !ensure_metadata_block_length_fits(env, context->metadata_blocks[index]))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-        index += 1u;
-        (*env)->DeleteLocalRef(env, cue_sheet_object);
-    }
-
-    for (jsize i = 0; i < padding_count; ++i)
-    {
-        jobject padding_object = (*env)->GetObjectArrayElement(env, padding_blocks, i);
-        if ((*env)->ExceptionCheck(env))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-
-        if (!build_padding_block(env, padding_object, &context->metadata_blocks[index]) ||
-            !ensure_metadata_block_length_fits(env, context->metadata_blocks[index]))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-        index += 1u;
-        (*env)->DeleteLocalRef(env, padding_object);
-    }
-
-    for (jsize i = 0; i < unknown_count; ++i)
-    {
-        jobject unknown_object = (*env)->GetObjectArrayElement(env, unknown_blocks, i);
-        if ((*env)->ExceptionCheck(env))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-
-        if (!build_unknown_metadata_block(env, unknown_object, &context->metadata_blocks[index]) ||
-            !ensure_metadata_block_length_fits(env, context->metadata_blocks[index]))
-        {
-            destroy_metadata_blocks(context);
-            return false;
-        }
-        index += 1u;
-        (*env)->DeleteLocalRef(env, unknown_object);
-    }
-
-    context->metadata_count = total_blocks;
     return true;
 }
 
@@ -6098,6 +6963,7 @@ static FLAC__bool ensure_metadata_block_length_fits(JNIEnv *env, FLAC__StreamMet
         throw_illegal_argument_exception(env, "FLAC metadata length must fit the 24-bit metadata length field.");
         return false;
     }
+
     return true;
 }
 
@@ -6109,11 +6975,20 @@ static FLAC__bool ensure_instance_of(JNIEnv *env, jobject value, const char *cla
         return false;
     }
 
-    if (!(*env)->IsInstanceOf(env, value, expected_class))
+    jboolean matches = (*env)->IsInstanceOf(env, value, expected_class);
+    jboolean check_threw = (*env)->ExceptionCheck(env);
+    (*env)->DeleteLocalRef(env, expected_class);
+    if (check_threw)
+    {
+        return false;
+    }
+
+    if (matches == JNI_FALSE)
     {
         throw_illegal_argument_exception(env, message);
         return false;
     }
+
     return true;
 }
 
@@ -6127,14 +7002,29 @@ static FLAC__bool build_vorbis_comment_transport_block(JNIEnv *env, jobject bloc
     }
 
     jclass block_class = (*env)->GetObjectClass(env, block_value);
+    if (block_class == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_vendor = (*env)->GetMethodID(env, block_class, "getVendor", "()Ljava/lang/String;");
+    if (get_vendor == NULL)
+    {
+        return false;
+    }
+
     jmethodID get_entries = (*env)->GetMethodID(env, block_class, "getEntries", "()[Ljava/lang/String;");
-    if (get_vendor == NULL || get_entries == NULL)
+    if (get_entries == NULL)
     {
         return false;
     }
 
     jstring vendor = (jstring)(*env)->CallObjectMethod(env, block_value, get_vendor);
+    if ((*env)->ExceptionCheck(env))
+    {
+        return false;
+    }
+
     jobjectArray entries = (jobjectArray)(*env)->CallObjectMethod(env, block_value, get_entries);
     if ((*env)->ExceptionCheck(env))
     {
@@ -6217,8 +7107,10 @@ static FLAC__bool build_ordered_metadata_block(JNIEnv *env, jint block_type, job
             g_flac_api.metadata_object_delete(*result);
             *result = NULL;
         }
+
         return false;
     }
+
     return true;
 }
 
@@ -6255,8 +7147,16 @@ static FLAC__bool build_ordered_metadata_blocks(JNIEnv *env, jintArray metadata_
         return false;
     }
 
+    /* See build_metadata_blocks(): the destructor needs the full table span during construction too. */
+    context->metadata_count = (uint32_t)type_count;
     for (jsize i = 0; i < type_count; ++i)
     {
+        if ((*env)->PushLocalFrame(env, 16) < 0)
+        {
+            destroy_metadata_blocks(context);
+            return false;
+        }
+
         /*
          * The two Java arrays are parallel: metadata_block_types[i] says how to
          * interpret metadata_block_values[i]. JNI array access can throw, so
@@ -6266,6 +7166,7 @@ static FLAC__bool build_ordered_metadata_blocks(JNIEnv *env, jintArray metadata_
         (*env)->GetIntArrayRegion(env, metadata_block_types, i, 1, &block_type);
         if ((*env)->ExceptionCheck(env))
         {
+            (*env)->PopLocalFrame(env, NULL);
             destroy_metadata_blocks(context);
             return false;
         }
@@ -6273,22 +7174,22 @@ static FLAC__bool build_ordered_metadata_blocks(JNIEnv *env, jintArray metadata_
         jobject block_value = (*env)->GetObjectArrayElement(env, metadata_block_values, i);
         if ((*env)->ExceptionCheck(env))
         {
+            (*env)->PopLocalFrame(env, NULL);
             destroy_metadata_blocks(context);
             return false;
         }
 
-        if (!build_ordered_metadata_block(env, block_type, block_value,
-                                          &context->metadata_blocks[i]))
+        FLAC__bool success =
+            build_ordered_metadata_block(env, block_type, block_value, &context->metadata_blocks[i]);
+        jboolean builder_threw = (*env)->ExceptionCheck(env);
+        (*env)->PopLocalFrame(env, NULL);
+        if (!success || builder_threw)
         {
-            (*env)->DeleteLocalRef(env, block_value);
             destroy_metadata_blocks(context);
             return false;
         }
-
-        (*env)->DeleteLocalRef(env, block_value);
     }
 
-    context->metadata_count = (uint32_t)type_count;
     return true;
 }
 
@@ -6349,6 +7250,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetada
         g_flac_api.metadata_chain_delete(chain);
         return;
     }
+
     free(utf8_path);
 
     FLAC__Metadata_Iterator *iterator = g_flac_api.metadata_iterator_new();
@@ -6392,26 +7294,33 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetada
     }
 
     jclass request_class = (*env)->GetObjectClass(env, request);
-    jmethodID get_comment_entries =
-        (*env)->GetMethodID(env, request_class, "getCommentEntries", "()[Ljava/lang/String;");
-    jmethodID get_pictures =
-        (*env)->GetMethodID(env, request_class, "getPictures", "()[Lorg/zzvsjs/jflac/FlacPicture;");
-    jmethodID get_application_blocks =
-        (*env)->GetMethodID(env, request_class, "getApplicationBlocks", "()[Lorg/zzvsjs/jflac/FlacApplicationBlock;");
-    jmethodID get_seek_tables =
-        (*env)->GetMethodID(env, request_class, "getSeekTables", "()[Lorg/zzvsjs/jflac/FlacSeekTable;");
-    jmethodID get_cue_sheets =
-        (*env)->GetMethodID(env, request_class, "getCueSheets", "()[Lorg/zzvsjs/jflac/FlacCueSheet;");
-    jmethodID get_padding_blocks =
-        (*env)->GetMethodID(env, request_class, "getPaddingBlocks", "()[Lorg/zzvsjs/jflac/FlacPaddingBlock;");
-    jmethodID get_unknown_blocks =
-        (*env)->GetMethodID(env, request_class, "getUnknownBlocks", "()[Lorg/zzvsjs/jflac/FlacUnknownMetadataBlock;");
-    jmethodID get_metadata_block_types = (*env)->GetMethodID(env, request_class, "getMetadataBlockTypes", "()[I");
-    jmethodID get_metadata_block_values =
-        (*env)->GetMethodID(env, request_class, "getMetadataBlockValues", "()[Ljava/lang/Object;");
-    if (get_comment_entries == NULL || get_pictures == NULL || get_application_blocks == NULL ||
-        get_seek_tables == NULL || get_cue_sheets == NULL || get_padding_blocks == NULL ||
-        get_unknown_blocks == NULL || get_metadata_block_types == NULL || get_metadata_block_values == NULL)
+    jmethodID get_comment_entries = NULL;
+    jmethodID get_pictures = NULL;
+    jmethodID get_application_blocks = NULL;
+    jmethodID get_seek_tables = NULL;
+    jmethodID get_cue_sheets = NULL;
+    jmethodID get_padding_blocks = NULL;
+    jmethodID get_unknown_blocks = NULL;
+    jmethodID get_metadata_block_types = NULL;
+    jmethodID get_metadata_block_values = NULL;
+    if (request_class == NULL ||
+        !find_instance_method(env, request_class, "getCommentEntries", "()[Ljava/lang/String;",
+                              &get_comment_entries) ||
+        !find_instance_method(env, request_class, "getPictures", "()[Lorg/zzvsjs/jflac/FlacPicture;",
+                              &get_pictures) ||
+        !find_instance_method(env, request_class, "getApplicationBlocks",
+                              "()[Lorg/zzvsjs/jflac/FlacApplicationBlock;", &get_application_blocks) ||
+        !find_instance_method(env, request_class, "getSeekTables", "()[Lorg/zzvsjs/jflac/FlacSeekTable;",
+                              &get_seek_tables) ||
+        !find_instance_method(env, request_class, "getCueSheets", "()[Lorg/zzvsjs/jflac/FlacCueSheet;",
+                              &get_cue_sheets) ||
+        !find_instance_method(env, request_class, "getPaddingBlocks", "()[Lorg/zzvsjs/jflac/FlacPaddingBlock;",
+                              &get_padding_blocks) ||
+        !find_instance_method(env, request_class, "getUnknownBlocks",
+                              "()[Lorg/zzvsjs/jflac/FlacUnknownMetadataBlock;", &get_unknown_blocks) ||
+        !find_instance_method(env, request_class, "getMetadataBlockTypes", "()[I", &get_metadata_block_types) ||
+        !find_instance_method(env, request_class, "getMetadataBlockValues", "()[Ljava/lang/Object;",
+                              &get_metadata_block_values))
     {
         /*
          * GetMethodID leaves a pending Java exception on failure. Preserve it
@@ -6422,22 +7331,39 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetada
         return;
     }
 
-    jobjectArray comment_entries = (jobjectArray)(*env)->CallObjectMethod(env, request, get_comment_entries);
-    jobjectArray pictures = (jobjectArray)(*env)->CallObjectMethod(env, request, get_pictures);
-    jobjectArray application_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_application_blocks);
-    jobjectArray seek_tables = (jobjectArray)(*env)->CallObjectMethod(env, request, get_seek_tables);
-    jobjectArray cue_sheets = (jobjectArray)(*env)->CallObjectMethod(env, request, get_cue_sheets);
-    jobjectArray padding_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_padding_blocks);
-    jobjectArray unknown_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_unknown_blocks);
-    jintArray metadata_block_types = (jintArray)(*env)->CallObjectMethod(env, request, get_metadata_block_types);
-    jobjectArray metadata_block_values =
-        (jobjectArray)(*env)->CallObjectMethod(env, request, get_metadata_block_values);
-    if ((*env)->ExceptionCheck(env))
+    jobject comment_entries_value = NULL;
+    jobject pictures_value = NULL;
+    jobject application_blocks_value = NULL;
+    jobject seek_tables_value = NULL;
+    jobject cue_sheets_value = NULL;
+    jobject padding_blocks_value = NULL;
+    jobject unknown_blocks_value = NULL;
+    jobject metadata_block_types_value = NULL;
+    jobject metadata_block_values_value = NULL;
+    if (!call_object_getter(env, request, get_comment_entries, &comment_entries_value) ||
+        !call_object_getter(env, request, get_pictures, &pictures_value) ||
+        !call_object_getter(env, request, get_application_blocks, &application_blocks_value) ||
+        !call_object_getter(env, request, get_seek_tables, &seek_tables_value) ||
+        !call_object_getter(env, request, get_cue_sheets, &cue_sheets_value) ||
+        !call_object_getter(env, request, get_padding_blocks, &padding_blocks_value) ||
+        !call_object_getter(env, request, get_unknown_blocks, &unknown_blocks_value) ||
+        !call_object_getter(env, request, get_metadata_block_types, &metadata_block_types_value) ||
+        !call_object_getter(env, request, get_metadata_block_values, &metadata_block_values_value))
     {
         g_flac_api.metadata_iterator_delete(iterator);
         g_flac_api.metadata_chain_delete(chain);
         return;
     }
+
+    jobjectArray comment_entries = (jobjectArray)comment_entries_value;
+    jobjectArray pictures = (jobjectArray)pictures_value;
+    jobjectArray application_blocks = (jobjectArray)application_blocks_value;
+    jobjectArray seek_tables = (jobjectArray)seek_tables_value;
+    jobjectArray cue_sheets = (jobjectArray)cue_sheets_value;
+    jobjectArray padding_blocks = (jobjectArray)padding_blocks_value;
+    jobjectArray unknown_blocks = (jobjectArray)unknown_blocks_value;
+    jintArray metadata_block_types = (jintArray)metadata_block_types_value;
+    jobjectArray metadata_block_values = (jobjectArray)metadata_block_values_value;
 
     EncodeContext metadata_context;
     memset(&metadata_context, 0, sizeof(metadata_context));
@@ -6462,6 +7388,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetada
         {
             throw_metadata_edit_exception(env, "Failed to build FLAC metadata edit blocks.");
         }
+
         return;
     }
 
@@ -6490,6 +7417,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetada
          */
         metadata_context.metadata_blocks[i] = NULL;
     }
+
     destroy_metadata_blocks(&metadata_context);
 
     /*
@@ -6538,6 +7466,7 @@ static JNIEnv *encode_context_env(EncodeContext *context)
     {
         return NULL;
     }
+
     return env;
 }
 
@@ -6659,6 +7588,7 @@ static FLAC__StreamEncoderReadStatus encode_channel_read_callback(const FLAC__St
         {
             *bytes = 0u;
         }
+
         return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
     }
 
@@ -6693,8 +7623,9 @@ static FLAC__StreamEncoderReadStatus encode_channel_read_callback(const FLAC__St
     }
 
     jint read = (*env)->CallIntMethod(env, context->output_channel, context->channel_read, byte_buffer);
+    jboolean read_failed = (*env)->ExceptionCheck(env);
     (*env)->DeleteLocalRef(env, byte_buffer);
-    if ((*env)->ExceptionCheck(env))
+    if (read_failed)
     {
         *bytes = 0u;
         return FLAC__STREAM_ENCODER_READ_STATUS_ABORT;
@@ -6771,6 +7702,7 @@ static FLAC__StreamEncoderWriteStatus encode_channel_write_callback(const FLAC__
             throw_encode_exception(env, "SeekableByteChannel returned zero bytes for a non-empty write request.");
             return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
         }
+
         written_total += (size_t)written;
     }
 
@@ -6798,11 +7730,13 @@ static FLAC__StreamEncoderSeekStatus encode_channel_seek_callback(const FLAC__St
 
     jobject ignored = (*env)->CallObjectMethod(env, context->output_channel, context->channel_seek,
                                                context->channel_base_offset + (jlong)absolute_byte_offset);
+    jboolean seek_failed = (*env)->ExceptionCheck(env);
     if (ignored != NULL)
     {
         (*env)->DeleteLocalRef(env, ignored);
     }
-    return (*env)->ExceptionCheck(env) ? FLAC__STREAM_ENCODER_SEEK_STATUS_ERROR : FLAC__STREAM_ENCODER_SEEK_STATUS_OK;
+
+    return seek_failed ? FLAC__STREAM_ENCODER_SEEK_STATUS_ERROR : FLAC__STREAM_ENCODER_SEEK_STATUS_OK;
 }
 
 /*
@@ -6884,14 +7818,16 @@ static FLAC__StreamEncoderWriteStatus encode_write_callback(const FLAC__StreamEn
         (*env)->SetByteArrayRegion(env, chunk, 0, (jsize)bytes, (const jbyte *)buffer);
     }
 
-    if (!(*env)->ExceptionCheck(env))
+    jboolean write_failed = (*env)->ExceptionCheck(env);
+    if (!write_failed)
     {
         (*env)->CallVoidMethod(env, context->output_stream, context->output_write, chunk, (jint)0, (jint)bytes);
+        write_failed = (*env)->ExceptionCheck(env);
     }
+
     (*env)->DeleteLocalRef(env, chunk);
 
-    return (*env)->ExceptionCheck(env) ? FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR
-                                      : FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+    return write_failed ? FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR : FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
 }
 
 /*
@@ -6918,43 +7854,57 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
      * class-loader lifetime problems.
      */
     jclass request_class = (*env)->GetObjectClass(env, request);
-    jmethodID get_sample_rate = (*env)->GetMethodID(env, request_class, "getSampleRate", "()I");
-    jmethodID get_channels = (*env)->GetMethodID(env, request_class, "getChannels", "()I");
-    jmethodID get_bits_per_sample = (*env)->GetMethodID(env, request_class, "getBitsPerSample", "()I");
-    jmethodID get_total_samples_estimate =
-        (*env)->GetMethodID(env, request_class, "getTotalSamplesEstimate", "()Ljava/lang/Long;");
-    jmethodID get_compression_level = (*env)->GetMethodID(env, request_class, "getCompressionLevel", "()I");
-    jmethodID is_verify = (*env)->GetMethodID(env, request_class, "isVerify", "()Z");
-    jmethodID is_streamable_subset = (*env)->GetMethodID(env, request_class, "isStreamableSubset", "()Z");
-    jmethodID get_block_size = (*env)->GetMethodID(env, request_class, "getBlockSize", "()Ljava/lang/Integer;");
-    jmethodID get_num_threads = (*env)->GetMethodID(env, request_class, "getNumThreads", "()I");
-    jmethodID get_container = (*env)->GetMethodID(env, request_class, "getContainer", "()I");
-    jmethodID get_ogg_serial_number =
-        (*env)->GetMethodID(env, request_class, "getOggSerialNumber", "()Ljava/lang/Integer;");
-    jmethodID get_comment_entries =
-        (*env)->GetMethodID(env, request_class, "getCommentEntries", "()[Ljava/lang/String;");
-    jmethodID get_pictures =
-        (*env)->GetMethodID(env, request_class, "getPictures", "()[Lorg/zzvsjs/jflac/FlacPicture;");
-    jmethodID get_application_blocks =
-        (*env)->GetMethodID(env, request_class, "getApplicationBlocks", "()[Lorg/zzvsjs/jflac/FlacApplicationBlock;");
-    jmethodID get_seek_tables =
-        (*env)->GetMethodID(env, request_class, "getSeekTables", "()[Lorg/zzvsjs/jflac/FlacSeekTable;");
-    jmethodID get_cue_sheets =
-        (*env)->GetMethodID(env, request_class, "getCueSheets", "()[Lorg/zzvsjs/jflac/FlacCueSheet;");
-    jmethodID get_padding_blocks =
-        (*env)->GetMethodID(env, request_class, "getPaddingBlocks", "()[Lorg/zzvsjs/jflac/FlacPaddingBlock;");
-    jmethodID get_unknown_blocks =
-        (*env)->GetMethodID(env, request_class, "getUnknownBlocks", "()[Lorg/zzvsjs/jflac/FlacUnknownMetadataBlock;");
-    jmethodID get_metadata_block_types = (*env)->GetMethodID(env, request_class, "getMetadataBlockTypes", "()[I");
-    jmethodID get_metadata_block_values =
-        (*env)->GetMethodID(env, request_class, "getMetadataBlockValues", "()[Ljava/lang/Object;");
-    if (get_sample_rate == NULL || get_channels == NULL || get_bits_per_sample == NULL ||
-        get_total_samples_estimate == NULL || get_compression_level == NULL || is_verify == NULL ||
-        is_streamable_subset == NULL || get_block_size == NULL || get_num_threads == NULL || get_container == NULL ||
-        get_ogg_serial_number == NULL || get_comment_entries == NULL || get_pictures == NULL ||
-        get_application_blocks == NULL || get_seek_tables == NULL || get_cue_sheets == NULL ||
-        get_padding_blocks == NULL || get_unknown_blocks == NULL || get_metadata_block_types == NULL ||
-        get_metadata_block_values == NULL)
+    jmethodID get_sample_rate = NULL;
+    jmethodID get_channels = NULL;
+    jmethodID get_bits_per_sample = NULL;
+    jmethodID get_total_samples_estimate = NULL;
+    jmethodID get_compression_level = NULL;
+    jmethodID is_verify = NULL;
+    jmethodID is_streamable_subset = NULL;
+    jmethodID get_block_size = NULL;
+    jmethodID get_num_threads = NULL;
+    jmethodID get_container = NULL;
+    jmethodID get_ogg_serial_number = NULL;
+    jmethodID get_comment_entries = NULL;
+    jmethodID get_pictures = NULL;
+    jmethodID get_application_blocks = NULL;
+    jmethodID get_seek_tables = NULL;
+    jmethodID get_cue_sheets = NULL;
+    jmethodID get_padding_blocks = NULL;
+    jmethodID get_unknown_blocks = NULL;
+    jmethodID get_metadata_block_types = NULL;
+    jmethodID get_metadata_block_values = NULL;
+    if (request_class == NULL ||
+        !find_instance_method(env, request_class, "getSampleRate", "()I", &get_sample_rate) ||
+        !find_instance_method(env, request_class, "getChannels", "()I", &get_channels) ||
+        !find_instance_method(env, request_class, "getBitsPerSample", "()I", &get_bits_per_sample) ||
+        !find_instance_method(env, request_class, "getTotalSamplesEstimate", "()Ljava/lang/Long;",
+                              &get_total_samples_estimate) ||
+        !find_instance_method(env, request_class, "getCompressionLevel", "()I", &get_compression_level) ||
+        !find_instance_method(env, request_class, "isVerify", "()Z", &is_verify) ||
+        !find_instance_method(env, request_class, "isStreamableSubset", "()Z", &is_streamable_subset) ||
+        !find_instance_method(env, request_class, "getBlockSize", "()Ljava/lang/Integer;", &get_block_size) ||
+        !find_instance_method(env, request_class, "getNumThreads", "()I", &get_num_threads) ||
+        !find_instance_method(env, request_class, "getContainer", "()I", &get_container) ||
+        !find_instance_method(env, request_class, "getOggSerialNumber", "()Ljava/lang/Integer;",
+                              &get_ogg_serial_number) ||
+        !find_instance_method(env, request_class, "getCommentEntries", "()[Ljava/lang/String;",
+                              &get_comment_entries) ||
+        !find_instance_method(env, request_class, "getPictures", "()[Lorg/zzvsjs/jflac/FlacPicture;",
+                              &get_pictures) ||
+        !find_instance_method(env, request_class, "getApplicationBlocks",
+                              "()[Lorg/zzvsjs/jflac/FlacApplicationBlock;", &get_application_blocks) ||
+        !find_instance_method(env, request_class, "getSeekTables", "()[Lorg/zzvsjs/jflac/FlacSeekTable;",
+                              &get_seek_tables) ||
+        !find_instance_method(env, request_class, "getCueSheets", "()[Lorg/zzvsjs/jflac/FlacCueSheet;",
+                              &get_cue_sheets) ||
+        !find_instance_method(env, request_class, "getPaddingBlocks", "()[Lorg/zzvsjs/jflac/FlacPaddingBlock;",
+                              &get_padding_blocks) ||
+        !find_instance_method(env, request_class, "getUnknownBlocks",
+                              "()[Lorg/zzvsjs/jflac/FlacUnknownMetadataBlock;", &get_unknown_blocks) ||
+        !find_instance_method(env, request_class, "getMetadataBlockTypes", "()[I", &get_metadata_block_types) ||
+        !find_instance_method(env, request_class, "getMetadataBlockValues", "()[Ljava/lang/Object;",
+                              &get_metadata_block_values))
     {
         /*
          * Missing methods normally indicate Java/native version skew. The JVM
@@ -6969,33 +7919,60 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
      * Later encoder callbacks should depend only on EncodeContext, not on
      * calling back into the request object.
      */
-    jint sample_rate = (*env)->CallIntMethod(env, request, get_sample_rate);
-    jint channels = (*env)->CallIntMethod(env, request, get_channels);
-    jint bits_per_sample = (*env)->CallIntMethod(env, request, get_bits_per_sample);
-    jint compression_level = (*env)->CallIntMethod(env, request, get_compression_level);
-    jboolean verify = (*env)->CallBooleanMethod(env, request, is_verify);
-    jboolean streamable_subset = (*env)->CallBooleanMethod(env, request, is_streamable_subset);
-    jint num_threads = (*env)->CallIntMethod(env, request, get_num_threads);
-    jint container = (*env)->CallIntMethod(env, request, get_container);
-    jobject total_samples_object = (*env)->CallObjectMethod(env, request, get_total_samples_estimate);
-    jobject block_size_object = (*env)->CallObjectMethod(env, request, get_block_size);
-    jobject ogg_serial_number_object = (*env)->CallObjectMethod(env, request, get_ogg_serial_number);
-    jobjectArray comment_entries = (jobjectArray)(*env)->CallObjectMethod(env, request, get_comment_entries);
-    jobjectArray pictures = (jobjectArray)(*env)->CallObjectMethod(env, request, get_pictures);
-    jobjectArray application_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_application_blocks);
-    jobjectArray seek_tables = (jobjectArray)(*env)->CallObjectMethod(env, request, get_seek_tables);
-    jobjectArray cue_sheets = (jobjectArray)(*env)->CallObjectMethod(env, request, get_cue_sheets);
-    jobjectArray padding_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_padding_blocks);
-    jobjectArray unknown_blocks = (jobjectArray)(*env)->CallObjectMethod(env, request, get_unknown_blocks);
-    jintArray metadata_block_types = (jintArray)(*env)->CallObjectMethod(env, request, get_metadata_block_types);
-    jobjectArray metadata_block_values =
-        (jobjectArray)(*env)->CallObjectMethod(env, request, get_metadata_block_values);
-    if ((*env)->ExceptionCheck(env))
+    jint sample_rate = 0;
+    jint channels = 0;
+    jint bits_per_sample = 0;
+    jint compression_level = 0;
+    jboolean verify = JNI_FALSE;
+    jboolean streamable_subset = JNI_FALSE;
+    jint num_threads = 0;
+    jint container = 0;
+    jobject total_samples_object = NULL;
+    jobject block_size_object = NULL;
+    jobject ogg_serial_number_object = NULL;
+    jobject comment_entries_value = NULL;
+    jobject pictures_value = NULL;
+    jobject application_blocks_value = NULL;
+    jobject seek_tables_value = NULL;
+    jobject cue_sheets_value = NULL;
+    jobject padding_blocks_value = NULL;
+    jobject unknown_blocks_value = NULL;
+    jobject metadata_block_types_value = NULL;
+    jobject metadata_block_values_value = NULL;
+    if (!call_int_getter(env, request, get_sample_rate, &sample_rate) ||
+        !call_int_getter(env, request, get_channels, &channels) ||
+        !call_int_getter(env, request, get_bits_per_sample, &bits_per_sample) ||
+        !call_int_getter(env, request, get_compression_level, &compression_level) ||
+        !call_boolean_getter(env, request, is_verify, &verify) ||
+        !call_boolean_getter(env, request, is_streamable_subset, &streamable_subset) ||
+        !call_int_getter(env, request, get_num_threads, &num_threads) ||
+        !call_int_getter(env, request, get_container, &container) ||
+        !call_object_getter(env, request, get_total_samples_estimate, &total_samples_object) ||
+        !call_object_getter(env, request, get_block_size, &block_size_object) ||
+        !call_object_getter(env, request, get_ogg_serial_number, &ogg_serial_number_object) ||
+        !call_object_getter(env, request, get_comment_entries, &comment_entries_value) ||
+        !call_object_getter(env, request, get_pictures, &pictures_value) ||
+        !call_object_getter(env, request, get_application_blocks, &application_blocks_value) ||
+        !call_object_getter(env, request, get_seek_tables, &seek_tables_value) ||
+        !call_object_getter(env, request, get_cue_sheets, &cue_sheets_value) ||
+        !call_object_getter(env, request, get_padding_blocks, &padding_blocks_value) ||
+        !call_object_getter(env, request, get_unknown_blocks, &unknown_blocks_value) ||
+        !call_object_getter(env, request, get_metadata_block_types, &metadata_block_types_value) ||
+        !call_object_getter(env, request, get_metadata_block_values, &metadata_block_values_value))
     {
         free(utf8_path);
         return 0;
     }
 
+    jobjectArray comment_entries = (jobjectArray)comment_entries_value;
+    jobjectArray pictures = (jobjectArray)pictures_value;
+    jobjectArray application_blocks = (jobjectArray)application_blocks_value;
+    jobjectArray seek_tables = (jobjectArray)seek_tables_value;
+    jobjectArray cue_sheets = (jobjectArray)cue_sheets_value;
+    jobjectArray padding_blocks = (jobjectArray)padding_blocks_value;
+    jobjectArray unknown_blocks = (jobjectArray)unknown_blocks_value;
+    jintArray metadata_block_types = (jintArray)metadata_block_types_value;
+    jobjectArray metadata_block_values = (jobjectArray)metadata_block_values_value;
     if (!validate_container(env, container))
     {
         free(utf8_path);
@@ -7009,12 +7986,31 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         return 0;
     }
 
-    jclass long_class = (*env)->FindClass(env, "java/lang/Long");
-    jclass integer_class = (*env)->FindClass(env, "java/lang/Integer");
-    jmethodID long_value = long_class != NULL ? (*env)->GetMethodID(env, long_class, "longValue", "()J") : NULL;
-    jmethodID int_value = integer_class != NULL ? (*env)->GetMethodID(env, integer_class, "intValue", "()I") : NULL;
-    if ((total_samples_object != NULL && long_value == NULL) ||
-        ((block_size_object != NULL || ogg_serial_number_object != NULL) && int_value == NULL))
+    jclass long_class = NULL;
+    jclass integer_class = NULL;
+    jmethodID long_value = NULL;
+    jmethodID int_value = NULL;
+    if (total_samples_object != NULL)
+    {
+        long_class = (*env)->FindClass(env, "java/lang/Long");
+        if (long_class == NULL || !find_instance_method(env, long_class, "longValue", "()J", &long_value))
+        {
+            free(utf8_path);
+            return 0;
+        }
+    }
+
+    if (block_size_object != NULL || ogg_serial_number_object != NULL)
+    {
+        integer_class = (*env)->FindClass(env, "java/lang/Integer");
+        if (integer_class == NULL || !find_instance_method(env, integer_class, "intValue", "()I", &int_value))
+        {
+            free(utf8_path);
+            return 0;
+        }
+    }
+
+    if ((*env)->ExceptionCheck(env))
     {
         /* Preserve NoSuchMethodError/ClassNotFoundException from boxed value lookup. */
         free(utf8_path);
@@ -7033,23 +8029,38 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     FLAC__bool has_ogg_serial_number = ogg_serial_number_object != NULL;
     if (has_total_samples_estimate)
     {
-        total_samples_estimate = (FLAC__uint64)(*env)->CallLongMethod(env, total_samples_object, long_value);
+        jlong value = 0;
+        if (!call_long_getter(env, total_samples_object, long_value, &value))
+        {
+            free(utf8_path);
+            return 0;
+        }
+
+        total_samples_estimate = (FLAC__uint64)value;
     }
 
     if (has_block_size)
     {
-        block_size = (uint32_t)(*env)->CallIntMethod(env, block_size_object, int_value);
+        jint value = 0;
+        if (!call_int_getter(env, block_size_object, int_value, &value))
+        {
+            free(utf8_path);
+            return 0;
+        }
+
+        block_size = (uint32_t)value;
     }
 
     if (has_ogg_serial_number)
     {
-        ogg_serial_number = (long)(*env)->CallIntMethod(env, ogg_serial_number_object, int_value);
-    }
+        jint value = 0;
+        if (!call_int_getter(env, ogg_serial_number_object, int_value, &value))
+        {
+            free(utf8_path);
+            return 0;
+        }
 
-    if ((*env)->ExceptionCheck(env))
-    {
-        free(utf8_path);
-        return 0;
+        ogg_serial_number = (long)value;
     }
 
     EncodeContext *context = (EncodeContext *)calloc(1u, sizeof(EncodeContext));
@@ -7118,6 +8129,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
                 throw_encode_exception(env, "libFLAC returned an unknown encoder thread configuration status.");
                 break;
             }
+
             return 0;
         }
     }
@@ -7168,6 +8180,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         {
             throw_encode_exception(env, "Failed to build FLAC metadata blocks.");
         }
+
         return 0;
     }
 
@@ -7215,6 +8228,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     {
         init_status = init_file_encoder_for_container(context->encoder, utf8_path, NULL, NULL, container);
     }
+
     free(utf8_path);
     if (init_status != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
     {
@@ -7227,6 +8241,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         {
             throw_encode_exception(env, buffer);
         }
+
         return 0;
     }
 
@@ -7237,6 +8252,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         throw_encode_exception(env, "Failed to register FLAC encoder handle.");
         return 0;
     }
+
     return handle;
 }
 
@@ -7372,6 +8388,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeEncode
         throw_encode_exception(env, buffer);
         return;
     }
+
     release_encode_context_reference(context);
 }
 
@@ -7388,6 +8405,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_finishEncod
     {
         return;
     }
+
     remove_encode_context(handle);
 
     FLAC__bool success = g_flac_api.stream_encoder_finish(context->encoder);
@@ -7401,6 +8419,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_finishEncod
     if (success && context->output_stream != NULL && context->output_flush != NULL)
     {
         (*env)->CallVoidMethod(env, context->output_stream, context->output_flush);
+        (void)(*env)->ExceptionCheck(env);
     }
 
     release_encode_context_reference(context);

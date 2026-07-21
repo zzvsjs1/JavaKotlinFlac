@@ -51,11 +51,13 @@ final class PcmSampleReader {
         if (maxFrames < 0) {
             throw new IllegalArgumentException("maxFrames must not be negative");
         }
+
         Objects.requireNonNull(output, "output");
         long samplesWanted = (long) maxFrames * channels;
         if (output.length < samplesWanted) {
             throw new IllegalArgumentException("output is too small for the requested frame count");
         }
+
         if (maxFrames == 0) {
             return 0;
         }
@@ -65,6 +67,7 @@ final class PcmSampleReader {
         if (bytesRead == -1) {
             return -1;
         }
+
         if (bytesRead % frameSize != 0) {
             throw new IOException("Unexpected EOF in final partial PCM frame");
         }
@@ -106,6 +109,7 @@ final class PcmSampleReader {
             if (read == -1) {
                 return total == 0 ? -1 : total;
             }
+
             if (read == 0) {
                 /*
                  * AudioInputStream should either make progress or report EOF
@@ -114,8 +118,10 @@ final class PcmSampleReader {
                  */
                 throw new IOException("PCM input returned no bytes for a positive read request.");
             }
+
             total += read;
         }
+
         return total;
     }
 
@@ -170,6 +176,7 @@ final class PcmSampleReader {
                 || sampleRate != Math.rint(sampleRate)) {
             throw new IllegalArgumentException("sample rate must be a positive whole number");
         }
+
         return Math.toIntExact((long) sampleRate);
     }
 
@@ -178,6 +185,7 @@ final class PcmSampleReader {
         if (channels < 1 || channels > 8) {
             throw new IllegalArgumentException("channel count must be between 1 and 8");
         }
+
         return channels;
     }
 
@@ -188,14 +196,18 @@ final class PcmSampleReader {
             if (bits == 8) {
                 return bits;
             }
+
             throw new IllegalArgumentException("only 8-bit unsigned PCM is supported");
         }
+
         if (!encoding.equals(AudioFormat.Encoding.PCM_SIGNED)) {
             throw new IllegalArgumentException("only PCM signed and 8-bit PCM unsigned formats are supported");
         }
+
         if (bits == 8 || bits == 16 || bits == 24 || bits == 32) {
             return bits;
         }
+
         throw new IllegalArgumentException("signed PCM sample size must be 8, 16, 24, or 32 bits");
     }
 
@@ -205,6 +217,7 @@ final class PcmSampleReader {
         if (frameSize != expectedFrameSize) {
             throw new IllegalArgumentException("frame size does not match sample size and channel count");
         }
+
         return frameSize;
     }
 }

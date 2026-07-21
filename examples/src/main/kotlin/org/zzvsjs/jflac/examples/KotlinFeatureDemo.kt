@@ -50,6 +50,7 @@ fun main(args: Array<String>) {
                                 "${chunk.frames} frame(s)"
                     )
                 }
+
                 printedChunks += 1
             }
         )
@@ -90,6 +91,7 @@ fun main(args: Array<String>) {
             demoFrames - halfFrames
         )
     }
+
     printStreamInfo("encoded file session", reader.read(fileOutput).streamInfo)
 
     val streamOutput = outputDir.resolve("kotlin-output-stream.flac")
@@ -101,6 +103,7 @@ fun main(args: Array<String>) {
             metadata = FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("jflac Kotlin OutputStream demo")))
         )
     }
+
     Files.newInputStream(streamOutput).use { encodedStream ->
         val decoded = FlacDecoder().decode(encodedStream)
         println("OutputStream encode then InputStream decode: ${decoded.totalFrames} frame(s)")
@@ -121,6 +124,7 @@ fun main(args: Array<String>) {
             metadata = FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("jflac Kotlin seekable channel demo")))
         )
     }
+
     printStreamInfo("encoded seekable channel", reader.read(channelOutput).streamInfo)
 
     val editedCopy = outputDir.resolve("kotlin-edited-copy.flac")
@@ -128,6 +132,7 @@ fun main(args: Array<String>) {
     FlacMetadataEditor().edit(editedCopy) { session ->
         session.setVorbisComments(mapOf("TITLE" to listOf("Edited by KotlinFeatureDemo")))
     }
+
     println("Edited copy comments: ${reader.read(editedCopy).vorbisComment?.comments}")
 
     println("Example output directory: $outputDir")

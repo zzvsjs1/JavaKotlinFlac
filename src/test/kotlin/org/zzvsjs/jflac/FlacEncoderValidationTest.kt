@@ -9,6 +9,7 @@ class FlacEncoderValidationTest {
         assertFailsWith<IllegalArgumentException> {
             validateFlacEncodingOptions(FlacEncodingOptions(numThreads = 0))
         }
+
         assertFailsWith<IllegalArgumentException> {
             validateFlacEncodingOptions(FlacEncodingOptions(numThreads = 129))
         }

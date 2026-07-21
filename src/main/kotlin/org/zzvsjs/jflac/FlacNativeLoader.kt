@@ -54,6 +54,7 @@ object FlacNativeLoader {
             platform.libraries.forEach { library ->
                 System.load(extractedLibraries.getValue(library).toAbsolutePath().toString())
             }
+
             /*
              * Loading a DLL only proves that the operating-system loader could
              * map it. Resolve the complete libFLAC contract now so version,
@@ -89,10 +90,11 @@ object FlacNativeLoader {
     private fun bundleHash(platform: NativePlatform): String {
         val digest = MessageDigest.getInstance("SHA-256")
         platform.libraries.map { it.resourcePath(platform) }.forEach { resourcePath ->
-            val bytes = openResource(resourcePath).readBytes()
+            val bytes = openResource(resourcePath).use { input -> input.readBytes() }
             digest.update(resourcePath.toByteArray(Charsets.UTF_8))
             digest.update(bytes)
         }
+
         return digest.digest().joinToString("") { "%02x".format(it) }.take(12)
     }
 
@@ -133,6 +135,7 @@ object FlacNativeLoader {
         if (!MessageDigest.isEqual(expectedDigest, extractedDigest)) {
             throw NativeLoadException("Extracted native resource failed verification: $resourcePath")
         }
+
         return targetFile
     }
 
@@ -284,6 +287,7 @@ internal fun inspectNativeFlacStream(input: InputStream): NativeFlacStream {
             if (read > 0) {
                 pushback.unread(magic, 0, read)
             }
+
             NativeFlacStream(pushback, detectNativeFlacContainer(magic, read))
         }
     } catch (e: IOException) {
@@ -310,6 +314,7 @@ internal fun validateNativeFlacMetadataEditPath(path: Path): Path {
     if (inspected.container == NativeFlacContainer.OGG) {
         throw UnsupportedFeatureException("Ogg FLAC metadata editing is not supported.")
     }
+
     return inspected.path
 }
 
@@ -328,7 +333,9 @@ private fun readMagic(input: InputStream, magic: ByteArray): Int {
         if (read < 0) {
             break
         }
+
         totalRead += read
     }
+
     return totalRead
 }

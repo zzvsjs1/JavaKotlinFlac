@@ -53,12 +53,14 @@ data class FlacInterleavedPcmChunk(
 ) {
     init {
         require(frames >= 0) { "Frame count must be non-negative." }
+
         require(firstFrameIndex >= 0L) { "First frame index must be non-negative." }
 
         val expectedSampleCount = frames.toLong() * streamInfo.channels.toLong()
         require(expectedSampleCount <= Int.MAX_VALUE.toLong()) {
             "PCM chunk is too large for one JVM IntArray."
         }
+
         require(interleavedSamples.size == expectedSampleCount.toInt()) {
             "Interleaved sample count must equal frames * channels."
         }
@@ -78,6 +80,7 @@ data class FlacInterleavedPcmChunk(
                 result[channelIndex][frameIndex] = interleavedSamples[sourceIndex++]
             }
         }
+
         return result
     }
 }
@@ -96,7 +99,9 @@ data class FlacChannelPcmChunk(
 ) {
     init {
         require(frames >= 0) { "Frame count must be non-negative." }
+
         require(firstFrameIndex >= 0L) { "First frame index must be non-negative." }
+
         require(channelSamples.size == streamInfo.channels) {
             "Channel sample list size must equal the FLAC channel count."
         }

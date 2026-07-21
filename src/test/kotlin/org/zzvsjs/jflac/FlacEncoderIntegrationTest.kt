@@ -24,6 +24,7 @@ class FlacEncoderIntegrationTest {
                     options = FlacEncodingOptions(numThreads = 2)
                 )
             }
+
             assertTrue(failure.message.orEmpty().contains("pthread"))
         } finally {
             Files.deleteIfExists(output)

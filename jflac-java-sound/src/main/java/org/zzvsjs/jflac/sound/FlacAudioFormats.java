@@ -76,6 +76,7 @@ final class FlacAudioFormats {
             long duration = Math.multiplyExact(info.getTotalSamples(), 1_000_000L) / info.getSampleRate();
             properties.put("duration", duration);
         }
+
         return Map.copyOf(properties);
     }
 
@@ -86,6 +87,7 @@ final class FlacAudioFormats {
             properties.put(JflacAudioFileProperties.VORBIS_VENDOR, vorbisComment.getVendor());
             properties.put(JflacAudioFileProperties.VORBIS_COMMENTS, copyComments(vorbisComment.getComments()));
         }
+
         putIfNotEmpty(properties, JflacAudioFileProperties.PICTURES, metadata.getPictures());
         putIfNotEmpty(properties, JflacAudioFileProperties.APPLICATION_BLOCKS, metadata.getApplicationBlocks());
         putIfNotEmpty(properties, JflacAudioFileProperties.SEEK_TABLES, metadata.getSeekTables());
@@ -101,6 +103,7 @@ final class FlacAudioFormats {
         for (Map.Entry<String, List<String>> entry : comments.entrySet()) {
             copied.put(entry.getKey(), List.copyOf(entry.getValue()));
         }
+
         return Map.copyOf(copied);
     }
 
@@ -120,6 +123,7 @@ final class FlacAudioFormats {
         if (info.getTotalSamples() <= 0 || info.getTotalSamples() > Integer.MAX_VALUE) {
             return AudioSystem.NOT_SPECIFIED;
         }
+
         return Math.toIntExact(info.getTotalSamples());
     }
 }

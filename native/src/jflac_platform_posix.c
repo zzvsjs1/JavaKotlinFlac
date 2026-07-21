@@ -30,11 +30,15 @@ void jflac_call_once(JflacOnce *once, JflacOnceInitialiser initialiser)
         initialiser();
         once->complete = 1;
     }
+
     jflac_mutex_unlock(&once->mutex);
 }
 
 int jflac_open_sibling_library(const char *library_filename, JflacModule *module, char *error, size_t error_size)
 {
+    module->handle = NULL;
+    module->owns_handle = 0;
+
     Dl_info module_info;
     if (dladdr((const void *)&g_jflac_module_anchor, &module_info) == 0 || module_info.dli_fname == NULL)
     {
@@ -57,6 +61,7 @@ int jflac_open_sibling_library(const char *library_filename, JflacModule *module
         snprintf(error, error_size, "Unable to allocate the bundled library path.");
         return 0;
     }
+
     memcpy(sibling_path, module_info.dli_fname, directory_length);
     memcpy(sibling_path + directory_length, library_filename, filename_length + 1u);
 
@@ -72,7 +77,25 @@ int jflac_open_sibling_library(const char *library_filename, JflacModule *module
     }
 
     module->handle = loaded;
+    module->owns_handle = 1;
     return 1;
+}
+
+void jflac_close_library(JflacModule *module)
+{
+    if (module == NULL)
+    {
+        return;
+    }
+
+    if (module->handle != NULL && module->owns_handle)
+    {
+        /* There is no useful recovery if the loader rejects an unload here. */
+        (void)dlclose(module->handle);
+    }
+
+    module->handle = NULL;
+    module->owns_handle = 0;
 }
 
 int jflac_resolve_symbol(const JflacModule *module, const char *symbol_name, void *target, size_t target_size,
@@ -87,6 +110,7 @@ int jflac_resolve_symbol(const JflacModule *module, const char *symbol_name, voi
                  lookup_error);
         return 0;
     }
+
     if (target_size != sizeof(address))
     {
         snprintf(error, error_size, "Cannot represent the libFLAC symbol pointer for %s on this platform.",

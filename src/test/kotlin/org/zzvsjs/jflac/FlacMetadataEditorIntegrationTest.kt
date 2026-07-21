@@ -241,6 +241,7 @@ class FlacMetadataEditorIntegrationTest {
                     FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("Edited")))
                 )
             }
+
             assertTrue(error.message!!.contains("Ogg FLAC metadata editing"))
         } finally {
             Files.deleteIfExists(oggFile)

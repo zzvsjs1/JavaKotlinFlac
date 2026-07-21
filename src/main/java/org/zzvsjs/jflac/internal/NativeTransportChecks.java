@@ -62,27 +62,23 @@ final class NativeTransportChecks {
     }
 
     private static Class<?> orderedMetadataValueClass(int blockType) {
-        switch (blockType) {
-            case FLAC_METADATA_TYPE_STREAMINFO:
-                throw new IllegalArgumentException("STREAMINFO metadata blocks cannot be supplied.");
-            case FLAC_METADATA_TYPE_PADDING:
-                return FlacPaddingBlock.class;
-            case FLAC_METADATA_TYPE_APPLICATION:
-                return FlacApplicationBlock.class;
-            case FLAC_METADATA_TYPE_SEEKTABLE:
-                return FlacSeekTable.class;
-            case FLAC_METADATA_TYPE_VORBIS_COMMENT:
-                return NativeVorbisCommentBlock.class;
-            case FLAC_METADATA_TYPE_CUESHEET:
-                return FlacCueSheet.class;
-            case FLAC_METADATA_TYPE_PICTURE:
-                return FlacPicture.class;
-            default:
+        return switch (blockType) {
+            case FLAC_METADATA_TYPE_STREAMINFO ->
+                    throw new IllegalArgumentException("STREAMINFO metadata blocks cannot be supplied.");
+            case FLAC_METADATA_TYPE_PADDING -> FlacPaddingBlock.class;
+            case FLAC_METADATA_TYPE_APPLICATION -> FlacApplicationBlock.class;
+            case FLAC_METADATA_TYPE_SEEKTABLE -> FlacSeekTable.class;
+            case FLAC_METADATA_TYPE_VORBIS_COMMENT -> NativeVorbisCommentBlock.class;
+            case FLAC_METADATA_TYPE_CUESHEET -> FlacCueSheet.class;
+            case FLAC_METADATA_TYPE_PICTURE -> FlacPicture.class;
+            default -> {
                 if (blockType >= FLAC_UNKNOWN_METADATA_MIN_TYPE && blockType <= FLAC_UNKNOWN_METADATA_MAX_TYPE) {
-                    return FlacUnknownMetadataBlock.class;
+                    yield FlacUnknownMetadataBlock.class;
                 }
+
                 throw new IllegalArgumentException("Unknown metadata type must be in the FLAC reserved range 7..126.");
-        }
+            }
+        };
     }
 
     static void requireNoEmbeddedNul(String value, String name) {

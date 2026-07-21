@@ -95,6 +95,7 @@ class FlacChainedOggIntegrationTest {
             val rangeFailure = assertFailsWith<IllegalArgumentException> {
                 decoder.decode(path, firstSample = 0, maxFrames = 1)
             }
+
             assertTrue(rangeFailure.message.orEmpty().contains("whole-stream"))
 
             val sessionFailure = assertFailsWith<IllegalArgumentException> { decoder.open(path) }
@@ -103,6 +104,7 @@ class FlacChainedOggIntegrationTest {
             val pullFailure = assertFailsWith<IllegalArgumentException> {
                 decoder.openPull(ByteArrayInputStream(fixture.bytes))
             }
+
             assertTrue(pullFailure.message.orEmpty().contains("whole-stream"))
         } finally {
             Files.deleteIfExists(path)
@@ -222,6 +224,7 @@ class FlacChainedOggIntegrationTest {
             check(bytes.copyOfRange(md5Start, md5Start + 16).any { value -> value != 0.toByte() }) {
                 "Seekable Ogg fixture did not back-patch a STREAMINFO MD5 signature."
             }
+
             bytes
         } finally {
             Files.deleteIfExists(output)
@@ -244,6 +247,7 @@ class FlacChainedOggIntegrationTest {
 
     private fun rewriteOggTotalSamples(bytes: ByteArray, totalSamples: Long) {
         require(totalSamples in 0 until (1L shl 36)) { "FLAC total samples must fit its 36-bit field." }
+
         val markerIndex = findFlacMarker(bytes)
         val highTotalByte = markerIndex + 21
         bytes[highTotalByte] = (
@@ -253,6 +257,7 @@ class FlacChainedOggIntegrationTest {
         repeat(4) { index ->
             bytes[markerIndex + 22 + index] = (totalSamples ushr ((3 - index) * Byte.SIZE_BITS)).toByte()
         }
+
         rewriteContainingOggPageChecksum(bytes, highTotalByte)
     }
 
@@ -268,6 +273,7 @@ class FlacChainedOggIntegrationTest {
         var pageStart = 0
         while (pageStart < bytes.size) {
             require(pageStart + OGG_PAGE_HEADER_LENGTH <= bytes.size) { "The Ogg page header is truncated." }
+
             require(
                 bytes[pageStart] == 'O'.code.toByte() &&
                     bytes[pageStart + 1] == 'g'.code.toByte() &&
@@ -278,6 +284,7 @@ class FlacChainedOggIntegrationTest {
             val segmentCount = bytes[pageStart + OGG_PAGE_SEGMENT_COUNT_OFFSET].toInt() and 0xFF
             val lacingStart = pageStart + OGG_PAGE_HEADER_LENGTH
             require(lacingStart + segmentCount <= bytes.size) { "The Ogg lacing table is truncated." }
+
             var bodyLength = 0
             repeat(segmentCount) { index -> bodyLength += bytes[lacingStart + index].toInt() and 0xFF }
             val pageEnd = lacingStart + segmentCount + bodyLength
@@ -290,10 +297,13 @@ class FlacChainedOggIntegrationTest {
                     bytes[pageStart + OGG_PAGE_CHECKSUM_OFFSET + index] =
                         (checksum ushr (index * Byte.SIZE_BITS)).toByte()
                 }
+
                 return
             }
+
             pageStart = pageEnd
         }
+
         error("The changed STREAMINFO byte does not belong to an Ogg page.")
     }
 
@@ -309,6 +319,7 @@ class FlacChainedOggIntegrationTest {
                 }
             }
         }
+
         return checksum
     }
 
@@ -316,11 +327,13 @@ class FlacChainedOggIntegrationTest {
         if (sequence.isEmpty()) {
             return 0
         }
+
         for (start in 0..size - sequence.size) {
             if (sequence.indices.all { offset -> this[start + offset] == sequence[offset] }) {
                 return start
             }
         }
+
         return -1
     }
 

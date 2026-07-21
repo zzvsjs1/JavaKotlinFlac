@@ -247,9 +247,11 @@ public final class FlacAudioFileReader extends AudioFileReader {
         if (Arrays.equals(header, FLAC_MAGIC)) {
             return new HeaderDetails(JflacAudioFileTypes.FLAC, FlacAudioFormats.CONTAINER_NATIVE);
         }
+
         if (Arrays.equals(header, OGG_MAGIC)) {
             return new HeaderDetails(JflacAudioFileTypes.OGG_FLAC, FlacAudioFormats.CONTAINER_OGG);
         }
+
         throw new UnsupportedAudioFileException(NOT_FLAC_CANDIDATE);
     }
 
@@ -333,6 +335,7 @@ public final class FlacAudioFileReader extends AudioFileReader {
         if (session == null) {
             return primary;
         }
+
         try {
             session.close();
             return primary;
@@ -354,6 +357,7 @@ public final class FlacAudioFileReader extends AudioFileReader {
         if (!reset) {
             return primary;
         }
+
         try {
             stream.reset();
             return primary;
@@ -372,6 +376,7 @@ public final class FlacAudioFileReader extends AudioFileReader {
         if (primary == null) {
             return cleanupFailure;
         }
+
         primary.addSuppressed(cleanupFailure);
         return primary;
     }
@@ -390,15 +395,19 @@ public final class FlacAudioFileReader extends AudioFileReader {
         if (failure instanceof UnsupportedAudioFileException e) {
             throw e;
         }
+
         if (failure instanceof IOException e) {
             throw e;
         }
+
         if (failure instanceof RuntimeException e) {
             throw e;
         }
+
         if (failure instanceof Error e) {
             throw e;
         }
+
         throw new IOException("Failed to create FLAC PCM stream.", failure);
     }
 

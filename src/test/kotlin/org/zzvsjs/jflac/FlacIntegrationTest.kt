@@ -126,6 +126,7 @@ class FlacIntegrationTest {
         val fromStream = Files.newInputStream(sampleFile).use { input ->
             decoder.decode(input)
         }
+
         val fromChannel = Files.newByteChannel(sampleFile).use { channel ->
             decoder.decode(channel)
         }
@@ -197,27 +198,32 @@ class FlacIntegrationTest {
         val rangeFailure = assertFailsWith<IllegalArgumentException> {
             decoder.decode(sampleFile, firstSample = 0, maxFrames = 1)
         }
+
         assertTrue(rangeFailure.message.orEmpty().contains("whole-stream"))
 
         val sessionFailure = assertFailsWith<IllegalArgumentException> {
             decoder.open(sampleFile)
         }
+
         assertTrue(sessionFailure.message.orEmpty().contains("whole-stream"))
 
         val pullFailure = assertFailsWith<IllegalArgumentException> {
             decoder.openPull(sampleFile)
         }
+
         assertTrue(pullFailure.message.orEmpty().contains("whole-stream"))
 
         val seekFailure = assertFailsWith<IllegalArgumentException> {
             decoder.decode(sampleFile, firstSample = 0, consumer = CollectingConsumer())
         }
+
         assertTrue(seekFailure.message.orEmpty().contains("whole-stream"))
 
         Files.newByteChannel(sampleFile).use { channel ->
             val channelSessionFailure = assertFailsWith<IllegalArgumentException> {
                 decoder.open(channel)
             }
+
             assertTrue(channelSessionFailure.message.orEmpty().contains("whole-stream"))
         }
     }
@@ -314,6 +320,7 @@ class FlacIntegrationTest {
             assertEquals(expectedFirstFrame, chunk.firstFrameIndex)
             expectedFirstFrame += chunk.frames.toLong()
         }
+
         assertEquals(streamInfo.totalSamples, expectedFirstFrame)
     }
 
@@ -510,6 +517,7 @@ class FlacIntegrationTest {
         assertFailsWith<IllegalArgumentException> {
             FlacDecoder().decode(sampleFile, firstSample = 0, maxFrames = -1)
         }
+
         assertFailsWith<IllegalArgumentException> {
             FlacDecoder().decodeInterleaved(
                 path = sampleFile,
@@ -797,12 +805,15 @@ class FlacIntegrationTest {
         assertFailsWith<IllegalStateException> {
             NativeBindings.decodeDecoderFrom(0, 0, CollectingConsumer())
         }
+
         assertFailsWith<IllegalStateException> {
             NativeBindings.decodeDecoderRange(0, 0, 1, CollectingConsumer())
         }
+
         assertFailsWith<IllegalStateException> {
             NativeBindings.decodeDecoderFrom(Long.MAX_VALUE, 0, CollectingConsumer())
         }
+
         assertFailsWith<IllegalStateException> {
             NativeBindings.decodeDecoderRange(Long.MAX_VALUE, 0, 1, CollectingConsumer())
         }
@@ -813,8 +824,39 @@ class FlacIntegrationTest {
         assertFailsWith<IllegalStateException> {
             NativeBindings.decodeDecoderFrom(handle, 0, CollectingConsumer())
         }
+
         assertFailsWith<IllegalStateException> {
             NativeBindings.decodeDecoderRange(handle, 0, 1, CollectingConsumer())
+        }
+    }
+
+    @Test
+    fun callbackDecodeRejectsPullHandleWithoutCorruptingIt() {
+        FlacNativeLoader.load()
+
+        Files.newInputStream(sampleFile).use { input ->
+            val result = NativeBindings.openPullDecoderStream(input, NativeFlacContainer.NATIVE.nativeCode)
+            try {
+                assertFailsWith<IllegalStateException> {
+                    NativeBindings.decodeDecoderFrom(result.handle, 0, CollectingConsumer())
+                }
+
+                assertFailsWith<IllegalStateException> {
+                    NativeBindings.decodeDecoderRange(result.handle, 0, 1, CollectingConsumer())
+                }
+
+                /*
+                 * The rejected operations must leave both the pull decoder and
+                 * its JNI global InputStream reference intact.
+                 */
+                val samples = IntArray(result.streamInfo.channels)
+                assertEquals(
+                    1,
+                    NativeBindings.readPullDecoderInterleaved(result.handle, samples, 1)
+                )
+            } finally {
+                NativeBindings.releasePullDecoder(result.handle)
+            }
         }
     }
 
@@ -827,6 +869,7 @@ class FlacIntegrationTest {
             val error = assertFailsWith<FlacDecodeException> {
                 FlacMetadataReader().read(fixture)
             }
+
             assertTrue(error.message.orEmpty().contains("multiple VORBIS_COMMENT"))
         } finally {
             Files.deleteIfExists(fixture)
@@ -871,6 +914,7 @@ class FlacIntegrationTest {
             if (!finished) {
                 NativeBindings.releaseEncoder(handle)
             }
+
             Files.deleteIfExists(output)
         }
     }
@@ -906,9 +950,11 @@ class FlacIntegrationTest {
             assertFailsWith<IllegalStateException> {
                 NativeBindings.writeEncoderInterleaved(Long.MAX_VALUE, intArrayOf(0), 1)
             }
+
             assertFailsWith<IllegalStateException> {
                 NativeBindings.finishEncoder(Long.MAX_VALUE)
             }
+
             NativeBindings.releaseEncoder(Long.MAX_VALUE)
 
             val handle = NativeBindings.openEncoderFile(output.toString(), request)
@@ -916,9 +962,11 @@ class FlacIntegrationTest {
             assertFailsWith<IllegalStateException> {
                 NativeBindings.writeEncoderInterleaved(handle, intArrayOf(0), 1)
             }
+
             assertFailsWith<IllegalStateException> {
                 NativeBindings.finishEncoder(handle)
             }
+
             NativeBindings.releaseEncoder(handle)
         } finally {
             Files.deleteIfExists(output)
@@ -934,6 +982,7 @@ class FlacIntegrationTest {
             assertFailsWith<IllegalArgumentException> {
                 NativeBindings.decodeDecoderRange(handle, 0, -1, CollectingConsumer())
             }
+
             assertFailsWith<IllegalArgumentException> {
                 NativeBindings.decodeDecoderRange(handle, 0, 1, null)
             }
@@ -1138,6 +1187,7 @@ class FlacIntegrationTest {
             if (samples.size != frames * currentInfo.channels) {
                 invalidChunkCount += 1
             }
+
             totalFrames += frames.toLong()
         }
 

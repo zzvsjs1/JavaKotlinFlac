@@ -43,6 +43,7 @@ public final class FlacAudioFileWriterTest {
                 break;
             }
         }
+
         assertTrue(found, "Java Sound service loader should find the jflac FLAC writer.");
     }
 
@@ -326,6 +327,7 @@ public final class FlacAudioFileWriterTest {
             bytes[index * 2] = (byte) value;
             bytes[index * 2 + 1] = (byte) (value >> 8);
         }
+
         return new AudioInputStream(new ByteArrayInputStream(bytes), format, frames);
     }
 

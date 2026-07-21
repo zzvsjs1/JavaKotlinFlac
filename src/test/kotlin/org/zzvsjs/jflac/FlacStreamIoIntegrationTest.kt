@@ -6,10 +6,15 @@ import java.io.IOException
 import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class FlacStreamIoIntegrationTest {
@@ -109,6 +114,7 @@ class FlacStreamIoIntegrationTest {
             val fullFromChannel = Files.newByteChannel(file, StandardOpenOption.READ).use { channel ->
                 FlacDecoder().decode(channel)
             }
+
             val firstSample = 11L
             val maxFrames = 17L
             val rangeFromChannel = Files.newByteChannel(file, StandardOpenOption.READ).use { channel ->
@@ -142,12 +148,14 @@ class FlacStreamIoIntegrationTest {
                 assertEquals(1, decoded.streamInfo.channels)
                 assertEquals(80, decoded.totalFrames)
             }
+
             Files.newByteChannel(oggFile, StandardOpenOption.READ).use { channel ->
                 val range = FlacDecoder().decode(channel, firstSample = 5, maxFrames = 12)
 
                 assertEquals(12L, range.totalFrames)
                 assertEquals(12, range.interleavedSamples.size)
             }
+
             Files.newByteChannel(oggFile, StandardOpenOption.READ).use { channel ->
                 FlacDecoder().open(channel).use { session ->
                     val chunks = ArrayList<FlacInterleavedPcmChunk>()
@@ -298,6 +306,88 @@ class FlacStreamIoIntegrationTest {
 
         assertEquals((firstFrames + secondFrames).toLong(), decoded.totalFrames)
         assertContentEquals(firstChunk + secondChunk, decoded.interleavedSamples)
+    }
+
+    @Test
+    fun finishDuringInFlightWriteWaitsAndProducesCompleteOutput() {
+        val frames = 4_096
+        val format = FlacAudioFormat(
+            sampleRate = 44_100,
+            channels = 1,
+            bitsPerSample = 16,
+            totalSamplesEstimate = frames.toLong()
+        )
+        val samples = deterministicPcm(frames, format)
+        val blockNextWrite = AtomicBoolean(false)
+        val writeCallbackEntered = CountDownLatch(1)
+        val allowWriteCallbackToReturn = CountDownLatch(1)
+        val output = object : ByteArrayOutputStream() {
+            override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                if (blockNextWrite.compareAndSet(true, false)) {
+                    writeCallbackEntered.countDown()
+                    check(allowWriteCallbackToReturn.await(5, TimeUnit.SECONDS)) {
+                        "Timed out waiting to release the encoder output callback."
+                    }
+                }
+
+                super.write(buffer, offset, length)
+            }
+        }
+
+        val session = FlacEncoder().open(
+            output = output,
+            format = format,
+            options = FlacEncodingOptions(blockSize = 256)
+        )
+        val writeFailure = AtomicReference<Throwable?>()
+        val finishFailure = AtomicReference<Throwable?>()
+        val finishAttempted = CountDownLatch(1)
+        val finishCompleted = CountDownLatch(1)
+        val writer = Thread {
+            try {
+                session.writeInterleaved(samples, frames)
+            } catch (t: Throwable) {
+                writeFailure.set(t)
+            }
+        }
+
+        val finisher = Thread {
+            finishAttempted.countDown()
+            try {
+                session.finish()
+            } catch (t: Throwable) {
+                finishFailure.set(t)
+            } finally {
+                finishCompleted.countDown()
+            }
+        }
+
+        try {
+            blockNextWrite.set(true)
+            writer.start()
+            assertTrue(writeCallbackEntered.await(5, TimeUnit.SECONDS))
+
+            finisher.start()
+            assertTrue(finishAttempted.await(5, TimeUnit.SECONDS))
+            assertFalse(
+                finishCompleted.await(200, TimeUnit.MILLISECONDS),
+                "finish() must not race JNI finalisation against an active write."
+            )
+        } finally {
+            allowWriteCallbackToReturn.countDown()
+            writer.join(5_000)
+            finisher.join(5_000)
+            session.close()
+        }
+
+        assertFalse(writer.isAlive)
+        assertFalse(finisher.isAlive)
+        writeFailure.get()?.let { throw it }
+        finishFailure.get()?.let { throw it }
+
+        val decoded = FlacDecoder().decode(ByteArrayInputStream(output.toByteArray()))
+        assertEquals(frames.toLong(), decoded.totalFrames)
+        assertContentEquals(samples, decoded.interleavedSamples)
     }
 
     @Test

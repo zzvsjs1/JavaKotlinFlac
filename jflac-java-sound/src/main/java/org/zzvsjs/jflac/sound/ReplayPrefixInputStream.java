@@ -25,6 +25,7 @@ final class ReplayPrefixInputStream extends InputStream {
         if (position < prefix.length) {
             return prefix[position++] & 0xff;
         }
+
         return delegate.read();
     }
 
@@ -45,6 +46,7 @@ final class ReplayPrefixInputStream extends InputStream {
             offset += prefixBytes;
             length -= prefixBytes;
         }
+
         if (length == 0) {
             return copied;
         }
@@ -53,6 +55,7 @@ final class ReplayPrefixInputStream extends InputStream {
         if (read < 0) {
             return copied == 0 ? -1 : copied;
         }
+
         return copied + read;
     }
 

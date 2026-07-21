@@ -70,6 +70,7 @@ class FlacDecoder @JvmOverloads constructor(
         if (handle == 0L) {
             throw FlacDecodeException("Native decoder initialization returned an invalid handle without throwing an exception.")
         }
+
         return NativeFlacDecodingSession(handle, streamInfo)
     }
 
@@ -88,6 +89,7 @@ class FlacDecoder @JvmOverloads constructor(
         if (handle == 0L) {
             throw FlacDecodeException("Native channel decoder initialization returned an invalid handle without throwing an exception.")
         }
+
         return NativeFlacDecodingSession(handle, streamInfo)
     }
 
@@ -775,6 +777,7 @@ class FlacDecoder @JvmOverloads constructor(
     fun decode(path: Path, firstSample: Long, consumer: PcmConsumer) {
         requireWholeStreamOptionsDisabled("seeked decode")
         require(firstSample >= 0L) { "First sample must be non-negative." }
+
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
         NativeAccess.decodeFileFrom(
@@ -792,6 +795,7 @@ class FlacDecoder @JvmOverloads constructor(
     fun decode(input: SeekableByteChannel, firstSample: Long, consumer: PcmConsumer) {
         requireWholeStreamOptionsDisabled("seeked decode")
         require(firstSample >= 0L) { "First sample must be non-negative." }
+
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
         NativeAccess.decodeChannelFrom(input, container.nativeCode, firstSample, consumer)
@@ -831,6 +835,7 @@ class FlacDecoder @JvmOverloads constructor(
         require(!options.checkMd5) {
             "MD5 checking is only available for whole-stream decode and cannot be used with $operation."
         }
+
         require(!options.decodeChainedOgg) {
             "Chained Ogg decoding is only available for whole-stream decode and cannot be used with $operation."
         }
@@ -999,6 +1004,7 @@ private class NativeFlacDecodingSession(
             } else {
                 NativeAccess.decodeDecoderRange(currentHandle, firstSample, maxFrames, consumer)
             }
+
             succeeded = true
         } catch (t: Throwable) {
             releaseAfterFailure()
@@ -1094,6 +1100,7 @@ private class NativeFlacPullDecodingSession(
             require(requiredSamples <= Int.MAX_VALUE.toLong()) {
                 "Interleaved sample buffer must fit maxFrames * channels."
             }
+
             require(interleavedSamples.size >= requiredSamples.toInt()) {
                 "Interleaved sample buffer must fit maxFrames * channels."
             }
@@ -1118,6 +1125,7 @@ private class NativeFlacPullDecodingSession(
                 } catch (releaseFailure: Throwable) {
                     t.addSuppressed(releaseFailure)
                 }
+
                 throw t
             }
         }
@@ -1164,6 +1172,7 @@ private abstract class SummaryTrackingPcmConsumer(
         val currentInfo = checkNotNull(streamInfo) {
             "PCM data arrived before STREAMINFO was delivered."
         }
+
         check(!completed) { "PCM data arrived after decoding completed." }
 
         val chunk = FlacInterleavedPcmChunk(
@@ -1185,6 +1194,7 @@ private abstract class SummaryTrackingPcmConsumer(
         val currentInfo = checkNotNull(streamInfo) {
             "STREAMINFO was never delivered by the decoder."
         }
+
         check(completed) { "Decoding has not completed yet." }
 
         expectedDecodedFrameCount(currentInfo, firstFrameIndex, maxFrames)?.let { expectedFrames ->

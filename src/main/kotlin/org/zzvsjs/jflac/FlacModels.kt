@@ -40,6 +40,7 @@ data class FlacStreamInfo(
         if (this === other) {
             return true
         }
+
         if (other !is FlacStreamInfo) {
             return false
         }
@@ -103,17 +104,25 @@ data class FlacPicture(
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
+
         if (javaClass != other?.javaClass) return false
 
         other as FlacPicture
 
         if (type != other.type) return false
+
         if (width != other.width) return false
+
         if (height != other.height) return false
+
         if (depth != other.depth) return false
+
         if (colors != other.colors) return false
+
         if (mimeType != other.mimeType) return false
+
         if (description != other.description) return false
+
         if (!data.contentEquals(other.data)) return false
 
         return true
@@ -148,11 +157,13 @@ data class FlacApplicationBlock(
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
+
         if (javaClass != other?.javaClass) return false
 
         other as FlacApplicationBlock
 
         if (!id.contentEquals(other.id)) return false
+
         if (!data.contentEquals(other.data)) return false
 
         return true
@@ -268,6 +279,7 @@ class FlacUnknownMetadataBlock(
         require(type in FLAC_UNKNOWN_METADATA_MIN_TYPE..FLAC_UNKNOWN_METADATA_MAX_TYPE) {
             "Unknown metadata type must be in the FLAC reserved range 7..126."
         }
+
         require(this.data.size <= FLAC_METADATA_MAX_BLOCK_LENGTH) {
             "Unknown metadata payload length must fit the FLAC 24-bit metadata length field."
         }
@@ -277,6 +289,7 @@ class FlacUnknownMetadataBlock(
         if (this === other) {
             return true
         }
+
         if (other !is FlacUnknownMetadataBlock) {
             return false
         }
@@ -357,6 +370,7 @@ data class FlacDecodedAudio(
         require(expectedSampleCount <= Int.MAX_VALUE.toLong()) {
             "Decoded sample count is too large for one JVM IntArray."
         }
+
         require(interleavedSamples.size == expectedSampleCount.toInt()) {
             "Interleaved sample count must equal totalFrames * channels."
         }
@@ -372,6 +386,7 @@ data class FlacDecodedAudio(
         require(totalFrames <= Int.MAX_VALUE.toLong()) {
             "Channel split requires totalFrames to fit in one JVM IntArray length."
         }
+
         val result = List(streamInfo.channels) { IntArray(totalFrames.toInt()) }
         var sourceIndex = 0
         for (frameIndex in 0 until totalFrames.toInt()) {
@@ -379,17 +394,21 @@ data class FlacDecodedAudio(
                 result[channelIndex][frameIndex] = interleavedSamples[sourceIndex++]
             }
         }
+
         return result
     }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
+
         if (javaClass != other?.javaClass) return false
 
         other as FlacDecodedAudio
 
         if (totalFrames != other.totalFrames) return false
+
         if (streamInfo != other.streamInfo) return false
+
         if (!interleavedSamples.contentEquals(other.interleavedSamples)) return false
 
         return true
@@ -461,13 +480,16 @@ class BufferingPcmConsumer @JvmOverloads constructor(
         val currentInfo = checkNotNull(streamInfo) {
             "PCM data arrived before STREAMINFO was delivered."
         }
+
         check(!completed) { "PCM data arrived after decoding completed." }
 
         val expectedSampleCount = frames.toLong() * currentInfo.channels.toLong()
         require(frames >= 0) { "Frame count must be non-negative." }
+
         require(expectedSampleCount <= Int.MAX_VALUE.toLong()) {
             "PCM chunk is too large for one JVM IntArray."
         }
+
         require(samples.size == expectedSampleCount.toInt()) {
             "PCM chunk size must equal frames * channels."
         }
@@ -491,7 +513,9 @@ class BufferingPcmConsumer @JvmOverloads constructor(
         val currentInfo = checkNotNull(streamInfo) {
             "STREAMINFO was never delivered by the decoder."
         }
+
         check(completed) { "Decoding has not completed yet." }
+
         check(totalSamples <= Int.MAX_VALUE.toLong()) {
             "Decoded sample count is too large for one JVM IntArray."
         }
@@ -520,7 +544,9 @@ class BufferingPcmConsumer @JvmOverloads constructor(
 
 internal fun validateDecodeRange(firstSample: Long, maxFrames: Long?) {
     require(firstSample >= 0L) { "First sample must be non-negative." }
+
     require(maxFrames == null || maxFrames >= 0L) { "Max frames must be non-negative." }
+
     require(maxFrames == null || maxFrames <= Long.MAX_VALUE - firstSample) {
         "Decode range end must not overflow Long."
     }
@@ -539,5 +565,6 @@ internal fun expectedDecodedFrameCount(
     check(availableFrames >= 0L) {
         "Decode range starts after STREAMINFO totalSamples."
     }
+
     return maxFrames?.let { minOf(it, availableFrames) } ?: availableFrames
 }

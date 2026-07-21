@@ -22,6 +22,7 @@ final class NativeVorbisCommentBlock {
             if (this.entries[index] == null) {
                 throw new NullPointerException("entries[" + index + "]");
             }
+
             NativeTransportChecks.requireNoEmbeddedNul(this.entries[index], "entries[" + index + "]");
         }
     }

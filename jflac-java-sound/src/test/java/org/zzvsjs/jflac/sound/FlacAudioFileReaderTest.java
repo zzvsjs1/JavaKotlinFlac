@@ -314,6 +314,7 @@ public final class FlacAudioFileReaderTest {
         while ((read = input.read(buffer)) != -1) {
             output.write(buffer, 0, read);
         }
+
         return output.toByteArray();
     }
 
@@ -427,6 +428,7 @@ public final class FlacAudioFileReaderTest {
                     samples[sampleIndex++] = ((frame * 97 + channel * 151) % range) + minSample;
                 }
             }
+
             return samples;
         }
     }

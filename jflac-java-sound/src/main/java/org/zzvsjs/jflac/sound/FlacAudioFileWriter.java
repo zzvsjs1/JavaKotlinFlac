@@ -83,6 +83,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         if (isPcmFormatSupported(stream)) {
             return getAudioFileTypes();
         }
+
         return new AudioFileFormat.Type[0];
     }
 
@@ -124,6 +125,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         } catch (FlacException e) {
             throw new IOException("Failed to encode FLAC through Java Sound.", e);
         }
+
         return byteCount(countingOutput.bytesWritten());
     }
 
@@ -153,6 +155,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         } catch (FlacException e) {
             throw new IOException("Failed to encode FLAC through Java Sound.", e);
         }
+
         return byteCount(Files.size(output.toPath()));
     }
 
@@ -161,6 +164,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         if (!isSupportedFileType(fileType)) {
             throw new IllegalArgumentException("Unsupported FLAC target file type: " + fileType);
         }
+
         return new PcmSampleReader(stream);
     }
 
@@ -253,6 +257,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
                         JflacAudioFileProperties.VORBIS_COMMENTS + " must have String keys."
                 );
             }
+
             if (!(entry.getValue() instanceof List<?> values)) {
                 throw new IllegalArgumentException(
                         JflacAudioFileProperties.VORBIS_COMMENTS + " values must be List<String>."
@@ -265,8 +270,10 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
                     );
                 }
             }
+
             copy.put(key, List.copyOf(values.stream().map(String.class::cast).toList()));
         }
+
         return Collections.unmodifiableMap(copy);
     }
 
@@ -284,6 +291,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
                 throw new IllegalArgumentException(key + " must be a List<" + itemType.getSimpleName() + ">.");
             }
         }
+
         return List.copyOf(list.stream().map(itemType::cast).toList());
     }
 
@@ -291,9 +299,11 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         if (JflacAudioFileTypes.FLAC.equals(fileType)) {
             return FlacEncodingContainer.NATIVE;
         }
+
         if (JflacAudioFileTypes.OGG_FLAC.equals(fileType)) {
             return FlacEncodingContainer.OGG;
         }
+
         throw new IllegalArgumentException("Unsupported FLAC target file type: " + fileType);
     }
 
@@ -317,6 +327,7 @@ public final class FlacAudioFileWriter extends AudioFileWriter {
         if (bytes > Integer.MAX_VALUE) {
             return AudioSystem.NOT_SPECIFIED;
         }
+
         return Math.toIntExact(bytes);
     }
 }

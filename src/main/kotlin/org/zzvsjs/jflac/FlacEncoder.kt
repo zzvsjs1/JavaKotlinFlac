@@ -100,6 +100,7 @@ class FlacEncoder {
                 "Native encoder initialization returned an invalid handle without throwing an exception."
             )
         }
+
         return NativeFlacEncodingSession(handle, format)
     }
 
@@ -139,6 +140,7 @@ class FlacEncoder {
                 "Native stream encoder initialization returned an invalid handle without throwing an exception."
             )
         }
+
         return NativeFlacEncodingSession(handle, format)
     }
 
@@ -176,6 +178,7 @@ class FlacEncoder {
                 "Native channel encoder initialization returned an invalid handle without throwing an exception."
             )
         }
+
         return NativeFlacEncodingSession(handle, format)
     }
 
@@ -254,39 +257,61 @@ private class NativeFlacEncodingSession(
     initialHandle: Long,
     private val format: FlacAudioFormat
 ) : FlacEncodingSession {
+    /*
+     * JNI rejects a handle while another encoder call is using it. Keep the
+     * complete write/finalise operation under one JVM lock so finish cannot
+     * clear the only Java copy of a handle before an in-flight write returns.
+     */
+    private val lock = Any()
     private var handle: Long = initialHandle
     private var state: SessionState = SessionState.ACTIVE
 
     override fun writeInterleaved(samples: IntArray, frames: Int) {
-        ensureActiveForWrite()
-        validateInterleavedPcmChunk(samples, frames, format)
-        if (frames == 0) {
-            return
-        }
+        synchronized(lock) {
+            ensureActiveForWrite()
+            validateInterleavedPcmChunk(samples, frames, format)
+            if (frames == 0) {
+                return
+            }
 
-        try {
-            NativeAccess.writeEncoderInterleaved(handle, samples, frames)
-        } catch (t: Throwable) {
-            releaseAfterFailure()
-            throw t
+            val currentHandle = handle
+            state = SessionState.WRITING
+            try {
+                NativeAccess.writeEncoderInterleaved(currentHandle, samples, frames)
+            } catch (t: Throwable) {
+                failAndRelease(currentHandle, t)
+            }
+
+            state = SessionState.ACTIVE
         }
     }
 
     override fun finish() {
-        when (state) {
-            SessionState.FINISHED -> return
-            SessionState.FAILED -> return
-            SessionState.ACTIVE -> Unit
-        }
+        synchronized(lock) {
+            when (state) {
+                SessionState.FINISHED,
+                SessionState.FAILED,
+                SessionState.FINISHING -> return
+                SessionState.WRITING -> throw IllegalStateException(
+                    "The FLAC encoding session cannot finish from inside an active write."
+                )
+                SessionState.ACTIVE -> state = SessionState.FINISHING
+            }
 
-        val currentHandle = handle
-        handle = 0L
-        try {
-            NativeAccess.finishEncoder(currentHandle)
+            val currentHandle = handle
+            try {
+                NativeAccess.finishEncoder(currentHandle)
+            } catch (t: Throwable) {
+                /*
+                 * Native finalisation normally consumes the handle even when
+                 * it fails. A failure before acquisition does not, so release
+                 * the same handle as a safe, idempotent fallback.
+                 */
+                failAndRelease(currentHandle, t)
+            }
+
+            handle = 0L
             state = SessionState.FINISHED
-        } catch (t: Throwable) {
-            state = SessionState.FAILED
-            throw t
         }
     }
 
@@ -296,27 +321,28 @@ private class NativeFlacEncodingSession(
         }
     }
 
-    /**
-     * Best-effort release used after write failures.
-     *
-     * The native layer still owns the handle after a failed process call, so
-     * the JVM proactively releases it to avoid leaking encoder state.
-     */
-    private fun releaseAfterFailure() {
-        if (state != SessionState.ACTIVE) {
-            return
-        }
-
-        val currentHandle = handle
+    /** Marks the session terminal and preserves the primary JNI failure. */
+    private fun failAndRelease(currentHandle: Long, failure: Throwable): Nothing {
         handle = 0L
         state = SessionState.FAILED
+
         if (currentHandle != 0L) {
-            NativeAccess.releaseEncoder(currentHandle)
+            try {
+                NativeAccess.releaseEncoder(currentHandle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== failure) {
+                    failure.addSuppressed(releaseFailure)
+                }
+            }
         }
+
+        throw failure
     }
 
     private enum class SessionState {
         ACTIVE,
+        WRITING,
+        FINISHING,
         FINISHED,
         FAILED
     }
@@ -330,8 +356,11 @@ private class NativeFlacEncodingSession(
  */
 internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
     require(format.sampleRate > 0) { "Sample rate must be positive." }
+
     require(format.channels in 1..8) { "Channel count must be between 1 and 8." }
+
     require(format.bitsPerSample in 4..32) { "Bits per sample must be between 4 and 32." }
+
     require(format.totalSamplesEstimate == null || format.totalSamplesEstimate >= 0L) {
         "Total sample estimate must be null or non-negative."
     }
@@ -345,8 +374,11 @@ internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
  */
 internal fun validateFlacEncodingOptions(options: FlacEncodingOptions) {
     require(options.compressionLevel in 0..8) { "Compression level must be between 0 and 8." }
+
     require(options.blockSize == null || options.blockSize > 0) { "Block size must be positive when provided." }
+
     require(options.numThreads in 1..128) { "Encoder thread count must be between 1 and 128." }
+
     require(options.container == FlacEncodingContainer.OGG || options.oggSerialNumber == null) {
         "Ogg serial number can only be set for Ogg FLAC encoding."
     }
@@ -371,6 +403,7 @@ internal fun validateFlacEncodingMetadata(metadata: FlacEncodingMetadata) {
     require(metadata.seekTables.size <= 1) {
         "At most one SEEKTABLE metadata block can be encoded."
     }
+
     metadata.seekTables.forEach(::validateSeekTableMetadata)
     metadata.cueSheets.forEach(::validateCueSheetMetadata)
 }
@@ -379,6 +412,7 @@ private fun validateOrderedMetadataBlocks(blocks: List<FlacMetadataBlock>) {
     require(blocks.count { block -> block is FlacMetadataBlock.VorbisComment } <= 1) {
         "At most one Vorbis comment metadata block can be encoded."
     }
+
     require(blocks.count { block -> block is FlacMetadataBlock.SeekTable } <= 1) {
         "At most one SEEKTABLE metadata block can be encoded."
     }
@@ -403,12 +437,16 @@ private fun validateVorbisComments(comments: Map<String, List<String>>, vendor: 
 
     comments.forEach { (key, values) ->
         require(key.isNotBlank()) { "Vorbis comment keys must not be blank." }
+
         require('=' !in key) { "Vorbis comment keys must not contain '='." }
+
         require('\u0000' !in key) { "Vorbis comment keys must not contain embedded NUL characters." }
+
         values.forEach { value ->
             require('\u0000' !in value) { "Vorbis comment values must not contain embedded NUL characters." }
         }
     }
+
     validateVorbisCommentBlockLength(vendor, comments)
 }
 
@@ -424,6 +462,7 @@ private fun validateVorbisCommentBlockLength(vendor: String?, comments: Map<Stri
             totalBytes += 4L + "$key=$value".utf8ByteCount().toLong()
         }
     }
+
     require(totalBytes <= FLAC_METADATA_MAX_BLOCK_LENGTH) {
         "VORBIS_COMMENT metadata length must fit the FLAC 24-bit metadata length field."
     }
@@ -431,12 +470,19 @@ private fun validateVorbisCommentBlockLength(vendor: String?, comments: Map<Stri
 
 private fun validatePictureMetadata(picture: FlacPicture) {
     require(picture.type >= 0) { "Picture type must be non-negative." }
+
     require(picture.mimeType.isNotBlank()) { "Picture MIME type must not be blank." }
+
     require('\u0000' !in picture.mimeType) { "Picture MIME type must not contain embedded NUL characters." }
+
     require('\u0000' !in picture.description) { "Picture description must not contain embedded NUL characters." }
+
     require(picture.width >= 0) { "Picture width must be non-negative." }
+
     require(picture.height >= 0) { "Picture height must be non-negative." }
+
     require(picture.depth >= 0) { "Picture depth must be non-negative." }
+
     require(picture.colors >= 0) { "Picture colour count must be non-negative." }
 
     val blockBytes = FLAC_PICTURE_FIXED_FIELD_BYTES.toLong() +
@@ -460,7 +506,9 @@ private fun validateSeekTableMetadata(seekTable: FlacSeekTable) {
         require(point.sampleNumber >= FLAC_SEEKPOINT_PLACEHOLDER_SAMPLE_NUMBER) {
             "Seek point sample number must be non-negative or -1 for a placeholder."
         }
+
         require(point.streamOffset >= 0L) { "Seek point stream offset must be non-negative." }
+
         require(point.frameSamples in 0..FLAC_SEEKPOINT_MAX_FRAME_SAMPLES) {
             "Seek point frame sample count must fit the FLAC 16-bit field."
         }
@@ -471,22 +519,31 @@ private fun validateCueSheetMetadata(cueSheet: FlacCueSheet) {
     require(cueSheet.mediaCatalogNumber.isFixedAsciiField(FLAC_CUESHEET_MAX_FIXED_FIELD_BYTES)) {
         "CUESHEET media catalog number must be printable ASCII and at most 128 bytes."
     }
+
     require(cueSheet.leadIn >= 0L) { "CUESHEET lead-in must be non-negative." }
+
     require(cueSheet.tracks.size <= FLAC_CUESHEET_MAX_LIST_ITEMS) {
         "CUESHEET track count must fit the FLAC 8-bit field."
     }
+
     cueSheet.tracks.forEach { track ->
         require(track.offset >= 0L) { "CUESHEET track offset must be non-negative." }
+
         require(track.number in 0..255) { "CUESHEET track number must fit the FLAC 8-bit field." }
+
         require(track.isrc.isFixedAsciiField(FLAC_CUESHEET_MAX_ISRC_BYTES)) {
             "CUESHEET track ISRC must be printable ASCII and at most 12 bytes."
         }
+
         require(track.type in 0..1) { "CUESHEET track type must be 0 or 1." }
+
         require(track.indices.size <= FLAC_CUESHEET_MAX_LIST_ITEMS) {
             "CUESHEET index count must fit the FLAC 8-bit field."
         }
+
         track.indices.forEach { index ->
             require(index.offset >= 0L) { "CUESHEET index offset must be non-negative." }
+
             require(index.number in 0..255) { "CUESHEET index number must fit the FLAC 8-bit field." }
         }
     }
@@ -496,6 +553,7 @@ private fun String.isFixedAsciiField(maxBytes: Int): Boolean {
     if (length > maxBytes) {
         return false
     }
+
     return all { char -> char.code in 0x20..0x7e }
 }
 
@@ -516,6 +574,7 @@ internal fun validateNativeFlacOutputPath(path: Path): Path {
     require(parent == null || !Files.exists(parent) || Files.isDirectory(parent)) {
         "Output parent path is not a directory."
     }
+
     return normalized
 }
 
@@ -527,9 +586,11 @@ internal fun validateNativeFlacOutputPath(path: Path): Path {
  */
 internal fun computeFrameCount(samples: IntArray, channels: Int): Int {
     require(channels > 0) { "Channel count must be positive." }
+
     require(samples.size % channels == 0) {
         "Sample array length must be divisible by the channel count."
     }
+
     return samples.size / channels
 }
 
@@ -544,6 +605,7 @@ internal fun validateInterleavedPcmChunk(samples: IntArray, frames: Int, format:
 
     val expectedSampleCount = frames.toLong() * format.channels.toLong()
     require(expectedSampleCount <= Int.MAX_VALUE) { "Frame count is too large for one chunk." }
+
     require(samples.size == expectedSampleCount.toInt()) {
         "Sample array length must equal frames * channels."
     }

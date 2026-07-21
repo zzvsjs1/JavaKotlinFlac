@@ -75,6 +75,7 @@ public final class JavaFeatureDemo {
                                         chunk.getFrames()
                                 );
                             }
+
                             printedChunks += 1;
                         }
                     }
@@ -121,6 +122,7 @@ public final class JavaFeatureDemo {
                     DEMO_FRAMES - halfFrames
             );
         }
+
         printStreamInfo("encoded file session", new FlacMetadataReader().read(fileOutput).getStreamInfo());
 
         Path streamOutput = outputDir.resolve("java-output-stream.flac");
@@ -132,6 +134,7 @@ public final class JavaFeatureDemo {
                     new FlacEncodingMetadata(Map.of("TITLE", List.of("jflac Java OutputStream demo")))
             );
         }
+
         try (InputStream encodedStream = Files.newInputStream(streamOutput)) {
             FlacDecodedAudio decodedStreamOutput = new FlacDecoder().decode(encodedStream);
             System.out.printf("OutputStream encode then InputStream decode: %,d frame(s)%n",
@@ -153,6 +156,7 @@ public final class JavaFeatureDemo {
                     new FlacEncodingMetadata(Map.of("TITLE", List.of("jflac Java seekable channel demo")))
             );
         }
+
         printStreamInfo("encoded seekable channel", new FlacMetadataReader().read(channelOutput).getStreamInfo());
 
         Path editedCopy = outputDir.resolve("java-edited-copy.flac");
@@ -170,6 +174,7 @@ public final class JavaFeatureDemo {
         if (streamInfo.getTotalSamples() > 0L) {
             return Math.min(PREVIEW_FRAMES, streamInfo.getTotalSamples());
         }
+
         return PREVIEW_FRAMES;
     }
 

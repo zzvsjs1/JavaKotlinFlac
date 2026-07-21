@@ -40,6 +40,7 @@ class NativeApiEncapsulationTest {
         val compiler = requireNotNull(ToolProvider.getSystemJavaCompiler()) {
             "The test JVM must be a JDK so Java API visibility can be checked."
         }
+
         val directory = Files.createTempDirectory("jflac-internal-api-probe")
         val outputDirectory = Files.createDirectory(directory.resolve("classes"))
         val source = directory.resolve("NativeAccessProbe.java")
@@ -85,6 +86,7 @@ class NativeApiEncapsulationTest {
         val compiler = requireNotNull(ToolProvider.getSystemJavaCompiler()) {
             "The test JVM must be a JDK so Java API visibility can be checked."
         }
+
         val directory = Files.createTempDirectory("jflac-native-facade-probe")
         val outputDirectory = Files.createDirectory(directory.resolve("classes"))
         val source = directory.resolve("NativeFacadeProbe.java")

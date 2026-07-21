@@ -49,7 +49,7 @@ application {
  */
 val playbackStartScripts by tasks.registering(CreateStartScripts::class) {
     applicationName = "jflac-playback"
-    mainClass.set("org.zzvsjs.jflac.examples.JavaSoundPlaybackDemo")
+    mainClass.set("org.zzvsjs.jflac.examples.playback.JavaSoundPlaybackDemo")
     outputDir = layout.buildDirectory.dir("playback-start-scripts").get().asFile
     classpath = files(tasks.named<Jar>("jar"), configurations.runtimeClasspath)
     defaultJvmOpts = listOf("--enable-native-access=ALL-UNNAMED")
@@ -87,7 +87,7 @@ tasks.register<JavaExec>("runJavaSoundPlayback") {
     group = ApplicationPlugin.APPLICATION_GROUP
     description = "Runs the Java Sound player; use the installed jflac-playback script for the native TUI."
     classpath = sourceSets.main.get().runtimeClasspath
-    mainClass.set("org.zzvsjs.jflac.examples.JavaSoundPlaybackDemo")
+    mainClass.set("org.zzvsjs.jflac.examples.playback.JavaSoundPlaybackDemo")
     /* Gradle otherwise supplies an empty stdin stream to the child JVM. */
     standardInput = System.`in`
 }

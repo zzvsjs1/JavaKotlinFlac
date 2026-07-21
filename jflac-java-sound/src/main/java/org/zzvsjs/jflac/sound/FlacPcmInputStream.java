@@ -116,6 +116,7 @@ final class FlacPcmInputStream extends InputStream {
             writeLittleEndianSample(sampleBuffer[sampleIndex], bitsPerSample, byteBuffer, outputOffset);
             outputOffset += bytesPerSample;
         }
+
         return true;
     }
 
@@ -148,6 +149,7 @@ final class FlacPcmInputStream extends InputStream {
         if (closed) {
             return;
         }
+
         closed = true;
 
         IOException failure = null;
@@ -168,6 +170,7 @@ final class FlacPcmInputStream extends InputStream {
                 }
             }
         }
+
         if (failure != null) {
             throw failure;
         }

@@ -39,6 +39,7 @@ class FlacPullDecoderTest {
                     if (readFrames == -1) {
                         break
                     }
+
                     val readSamples = readFrames * format.channels
                     chunk.copyInto(output, outputOffset, 0, readSamples)
                     outputOffset += readSamples
@@ -80,6 +81,7 @@ class FlacPullDecoderTest {
                     if (readFrames == -1) {
                         break
                     }
+
                     oneFrame.copyInto(output, frameOffset * format.channels, 0, readFrames * format.channels)
                     frameOffset += readFrames
                 }
@@ -117,10 +119,12 @@ class FlacPullDecoderTest {
                         if (readFrames == -1) {
                             break
                         }
+
                         val readSamples = readFrames * format.channels
                         chunk.copyInto(output, offset, 0, readSamples)
                         offset += readSamples
                     }
+
                     assertEquals(samples.size, offset)
                     assertContentEquals(samples, output)
                 }
@@ -146,6 +150,7 @@ class FlacPullDecoderTest {
                     if (readFrames == -1) {
                         break
                     }
+
                     chunk.copyInto(output, offset, 0, readFrames)
                     offset += readFrames
                 }
@@ -178,6 +183,7 @@ class FlacPullDecoderTest {
                 val error = assertFailsWith<IllegalArgumentException> {
                     session.readInterleaved(IntArray(1), 1)
                 }
+
                 assertEquals("Interleaved sample buffer must fit maxFrames * channels.", error.message)
             }
         } finally {
@@ -211,6 +217,7 @@ class FlacPullDecoderTest {
                 val inactive = assertFailsWith<IllegalStateException> {
                     session.readInterleaved(output, 1)
                 }
+
                 assertEquals("The FLAC pull decoding session is no longer active.", inactive.message)
             }
         } finally {
@@ -237,9 +244,11 @@ class FlacPullDecoderTest {
             if (failReads) {
                 throw IOException("simulated PCM read failure")
             }
+
             if (position >= bytes.size) {
                 return -1
             }
+
             return bytes[position++].toInt() and 0xff
         }
 
@@ -248,9 +257,11 @@ class FlacPullDecoderTest {
             if (failReads) {
                 throw IOException("simulated PCM read failure")
             }
+
             if (length == 0) {
                 return 0
             }
+
             if (position >= bytes.size) {
                 return -1
             }

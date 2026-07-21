@@ -24,6 +24,7 @@ void jflac_call_once(JflacOnce *once, JflacOnceInitialiser initialiser)
         initialiser();
         once->complete = 1;
     }
+
     jflac_mutex_unlock(&once->mutex);
 }
 
@@ -93,6 +94,9 @@ static wchar_t *loaded_module_path(HMODULE module, char *error, size_t error_siz
 
 int jflac_open_sibling_library(const char *library_filename, JflacModule *module, char *error, size_t error_size)
 {
+    module->handle = NULL;
+    module->owns_handle = 0;
+
     HMODULE shim_module = NULL;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)(uintptr_t)&jflac_open_sibling_library, &shim_module))
@@ -139,23 +143,44 @@ int jflac_open_sibling_library(const char *library_filename, JflacModule *module
     memcpy(sibling_path + directory_length, wide_filename, filename_length * sizeof(wchar_t));
     free(wide_filename);
 
-    HMODULE loaded = GetModuleHandleW(sibling_path);
-    if (loaded == NULL)
-    {
-        /* The absolute path prevents fallback to the current directory or PATH. */
-        loaded = LoadLibraryW(sibling_path);
-    }
+    /*
+     * Always acquire a reference owned by this JNI shim. GetModuleHandleW
+     * would only borrow another class loader's reference, which could be
+     * released while this shim still has resolved function pointers.
+     * The absolute path also prevents fallback to the current directory or
+     * PATH.
+     */
+    HMODULE loaded = LoadLibraryW(sibling_path);
+    DWORD load_error = loaded == NULL ? GetLastError() : ERROR_SUCCESS;
 
     free(sibling_path);
     if (loaded == NULL)
     {
         set_windows_error(error, error_size, "Unable to load the bundled libFLAC runtime beside the JNI shim",
-                          GetLastError());
+                          load_error);
         return 0;
     }
 
     module->handle = loaded;
+    module->owns_handle = 1;
     return 1;
+}
+
+void jflac_close_library(JflacModule *module)
+{
+    if (module == NULL)
+    {
+        return;
+    }
+
+    if (module->handle != NULL && module->owns_handle)
+    {
+        /* Only an owned LoadLibraryW reference may be passed to FreeLibrary. */
+        (void)FreeLibrary((HMODULE)module->handle);
+    }
+
+    module->handle = NULL;
+    module->owns_handle = 0;
 }
 
 int jflac_resolve_symbol(const JflacModule *module, const char *symbol_name, void *target, size_t target_size,
