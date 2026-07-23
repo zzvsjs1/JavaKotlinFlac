@@ -28,6 +28,7 @@ class FlacFormatValidationTest {
         assertFalse(FlacFormat.isVorbisCommentNameLegal("BAD=KEY"))
 
         assertTrue(FlacFormat.isVorbisCommentValueLegal("Round trip"))
+        assertTrue(FlacFormat.isVorbisCommentValueLegal(""))
 
         assertTrue(FlacFormat.isVorbisCommentEntryLegal("TITLE=Round trip"))
         assertFalse(FlacFormat.isVorbisCommentEntryLegal("TITLE"))

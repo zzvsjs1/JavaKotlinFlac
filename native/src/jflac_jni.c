@@ -775,8 +775,13 @@ static void throw_metadata_chain_edit_exception(JNIEnv *env, const char *action,
 }
 
 /*
- * Converts a Java UTF-16 string into a heap-allocated UTF-8 C string. Callers
- * own the returned buffer and must free it.
+ * Converts a Java String into a heap-allocated standard UTF-8 C string.
+ * Callers own the returned buffer and must free it.
+ *
+ * GetStringUTFChars returns JNI modified UTF-8, which encodes NUL and
+ * supplementary characters differently from the standard UTF-8 required by
+ * file paths and FLAC metadata. Delegating to Java's explicit UTF-8 charset
+ * keeps the conversion identical on Windows, Linux, and macOS.
  */
 static char *jstring_to_utf8(JNIEnv *env, jstring value)
 {
@@ -785,42 +790,80 @@ static char *jstring_to_utf8(JNIEnv *env, jstring value)
         return NULL;
     }
 
-    const jchar *chars = (*env)->GetStringChars(env, value, NULL);
-    if (chars == NULL)
+    /*
+     * The local frame bounds temporary class, charset, and byte-array
+     * references when a metadata operation converts many strings.
+     */
+    if ((*env)->PushLocalFrame(env, 6) < 0)
     {
         return NULL;
     }
 
-    jsize length = (*env)->GetStringLength(env, value);
-    if (length == 0)
+    jclass string_class = (*env)->FindClass(env, "java/lang/String");
+    if (string_class == NULL)
     {
-        char *empty = (char *)malloc(1u);
-        if (empty != NULL)
-        {
-            empty[0] = '\0';
-        }
-
-        (*env)->ReleaseStringChars(env, value, chars);
-        return empty;
-    }
-
-    int required = WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)chars, length, NULL, 0, NULL, NULL);
-    if (required <= 0)
-    {
-        (*env)->ReleaseStringChars(env, value, chars);
+        (*env)->PopLocalFrame(env, NULL);
         return NULL;
     }
 
-    char *buffer = (char *)malloc((size_t)required + 1u);
+    jmethodID get_bytes =
+        (*env)->GetMethodID(env, string_class, "getBytes", "(Ljava/nio/charset/Charset;)[B");
+    if (get_bytes == NULL)
+    {
+        (*env)->PopLocalFrame(env, NULL);
+        return NULL;
+    }
+
+    jclass charsets_class = (*env)->FindClass(env, "java/nio/charset/StandardCharsets");
+    if (charsets_class == NULL)
+    {
+        (*env)->PopLocalFrame(env, NULL);
+        return NULL;
+    }
+
+    jfieldID utf8_field = (*env)->GetStaticFieldID(
+        env, charsets_class, "UTF_8", "Ljava/nio/charset/Charset;");
+    if (utf8_field == NULL)
+    {
+        (*env)->PopLocalFrame(env, NULL);
+        return NULL;
+    }
+
+    jobject charset = (*env)->GetStaticObjectField(env, charsets_class, utf8_field);
+    if (charset == NULL)
+    {
+        (*env)->PopLocalFrame(env, NULL);
+        return NULL;
+    }
+
+    jbyteArray bytes = (jbyteArray)(*env)->CallObjectMethod(env, value, get_bytes, charset);
+    if (bytes == NULL || (*env)->ExceptionCheck(env))
+    {
+        (*env)->PopLocalFrame(env, NULL);
+        return NULL;
+    }
+
+    jsize length = (*env)->GetArrayLength(env, bytes);
+    char *buffer = (char *)malloc((size_t)length + 1u);
     if (buffer == NULL)
     {
-        (*env)->ReleaseStringChars(env, value, chars);
+        (*env)->PopLocalFrame(env, NULL);
         return NULL;
     }
 
-    WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)chars, length, buffer, required, NULL, NULL);
-    buffer[required] = '\0';
-    (*env)->ReleaseStringChars(env, value, chars);
+    if (length > 0)
+    {
+        (*env)->GetByteArrayRegion(env, bytes, 0, length, (jbyte *)buffer);
+        if ((*env)->ExceptionCheck(env))
+        {
+            free(buffer);
+            (*env)->PopLocalFrame(env, NULL);
+            return NULL;
+        }
+    }
+
+    buffer[length] = '\0';
+    (*env)->PopLocalFrame(env, NULL);
     return buffer;
 }
 
@@ -1586,7 +1629,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readMeta
     char *utf8_path = jstring_to_utf8(env, path);
     if (utf8_path == NULL)
     {
-        throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        }
+
         return NULL;
     }
 
@@ -3915,7 +3962,11 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
     char *utf8_path = jstring_to_utf8(env, path);
     if (utf8_path == NULL)
     {
-        throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        }
+
         return;
     }
 
@@ -4556,7 +4607,11 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     char *utf8_path = jstring_to_utf8(env, path);
     if (utf8_path == NULL)
     {
-        throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        }
+
         return 0;
     }
 
@@ -4883,7 +4938,11 @@ JNIEXPORT jobject JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openPull
     char *utf8_path = jstring_to_utf8(env, path);
     if (utf8_path == NULL)
     {
-        throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_decode_exception(env, "Failed to encode file path to UTF-8.");
+        }
+
         return NULL;
     }
 
@@ -7309,7 +7368,11 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeMetada
     char *utf8_path = jstring_to_utf8(env, path);
     if (utf8_path == NULL)
     {
-        throw_metadata_edit_exception(env, "Failed to encode file path to UTF-8.");
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_metadata_edit_exception(env, "Failed to encode file path to UTF-8.");
+        }
+
         return;
     }
 
@@ -8362,7 +8425,11 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openEncode
     char *utf8_path = jstring_to_utf8(env, path);
     if (utf8_path == NULL)
     {
-        throw_encode_exception(env, "Failed to encode output file path to UTF-8.");
+        if (!(*env)->ExceptionCheck(env))
+        {
+            throw_encode_exception(env, "Failed to encode output file path to UTF-8.");
+        }
+
         return 0;
     }
 

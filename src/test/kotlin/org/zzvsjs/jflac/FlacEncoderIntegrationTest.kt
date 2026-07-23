@@ -176,7 +176,7 @@ class FlacEncoderIntegrationTest {
     }
 
     @Test
-    fun encodedVorbisCommentsRoundTripThroughMetadataReader() {
+    fun unicodePathAndVorbisCommentsRoundTripThroughStandardUtf8() {
         val frames = 13
         val format = FlacAudioFormat(
             sampleRate = 32_000,
@@ -184,15 +184,16 @@ class FlacEncoderIntegrationTest {
             bitsPerSample = 16,
             totalSamplesEstimate = frames.toLong()
         )
+        val unicodeValue = "Grüße 世界 \uD83C\uDFB5"
         val metadata = FlacEncodingMetadata(
             comments = mapOf(
                 "TITLE" to listOf("Round trip"),
                 "ARTIST" to listOf("First", "Second"),
-                "UNICODE" to listOf("Grüße 世界"),
+                "UNICODE" to listOf(unicodeValue),
                 "EMPTY" to listOf("")
             )
         )
-        val output = Files.createTempFile("jflac-comment-encode", ".flac")
+        val output = Files.createTempFile("jflac-音频-\uD83C\uDFB5", ".flac")
 
         try {
             FlacEncoder().encode(
@@ -202,11 +203,14 @@ class FlacEncoderIntegrationTest {
                 metadata = metadata
             )
 
+            assertTrue(Files.size(output) > 0)
+            val decoded = FlacDecoder().decode(output)
             val decodedMetadata = FlacMetadataReader().read(output)
 
+            assertEquals(frames.toLong(), decoded.totalFrames)
             assertEquals(listOf("Round trip"), decodedMetadata.vorbisComment?.comments?.get("TITLE"))
             assertEquals(listOf("First", "Second"), decodedMetadata.vorbisComment?.comments?.get("ARTIST"))
-            assertEquals(listOf("Grüße 世界"), decodedMetadata.vorbisComment?.comments?.get("UNICODE"))
+            assertEquals(listOf(unicodeValue), decodedMetadata.vorbisComment?.comments?.get("UNICODE"))
             assertEquals(listOf(""), decodedMetadata.vorbisComment?.comments?.get("EMPTY"))
         } finally {
             Files.deleteIfExists(output)
