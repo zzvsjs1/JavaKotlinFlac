@@ -34,7 +34,9 @@ repositories {
 }
 
 dependencies {
-    testImplementation(kotlin("test-junit"))
+    testImplementation(kotlin("test-junit5"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.14.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.4")
 }
 
 data class NativeTarget(
@@ -1086,9 +1088,12 @@ tasks.withType<KotlinJvmCompile>().configureEach {
 }
 
 tasks.test {
+    useJUnitPlatform()
+
     if (suppliedNativeBundleDirectory == null && nativeTarget != null) {
         dependsOn(syncNativeResources)
     }
+
     systemProperty("jflac.native.tmpdir", layout.buildDirectory.dir("tmp/native-test").get().asFile.absolutePath)
 }
 

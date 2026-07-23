@@ -1,8 +1,8 @@
 package org.zzvsjs.jflac.internal
 
 import org.zzvsjs.jflac.*
-import org.junit.AfterClass
-import org.junit.BeforeClass
+import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.BeforeAll
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.lang.ref.WeakReference
@@ -45,13 +45,13 @@ class FlacIntegrationTest {
         private lateinit var sharedSampleFile: Path
 
         @JvmStatic
-        @BeforeClass
+        @BeforeAll
         fun createSampleFixture() {
             sharedSampleFile = createDecodeFixture("jflac-music-fixture")
         }
 
         @JvmStatic
-        @AfterClass
+        @AfterAll
         fun deleteSampleFixture() {
             if (::sharedSampleFile.isInitialized) {
                 Files.deleteIfExists(sharedSampleFile)

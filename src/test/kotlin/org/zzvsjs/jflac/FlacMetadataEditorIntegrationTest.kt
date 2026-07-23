@@ -1,13 +1,23 @@
 package org.zzvsjs.jflac
 
+import org.junit.jupiter.api.Assumptions.assumeFalse
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.DosFileAttributeView
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermission
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+
+private val POSIX_WRITE_PERMISSIONS = setOf(
+    PosixFilePermission.OWNER_WRITE,
+    PosixFilePermission.GROUP_WRITE,
+    PosixFilePermission.OTHERS_WRITE
+)
 
 class FlacMetadataEditorIntegrationTest {
     @Test
@@ -209,20 +219,31 @@ class FlacMetadataEditorIntegrationTest {
     }
 
     @Test
-    fun replaceReportsReadOnlyFileWriteFailure() {
+    fun editReportsReadOnlyFileWriteFailure() {
         val output = createSmallFlac("jflac-read-only-metadata-edit")
 
         try {
-            setReadOnly(output, true)
-
-            assertFailsWith<FlacMetadataEditException> {
-                FlacMetadataEditor().replace(
-                    output,
-                    FlacEncodingMetadata(comments = mapOf("TITLE" to listOf("Cannot write")))
-                )
+            withReadOnlyFile(output) {
+                assertFailsWith<FlacMetadataEditException> {
+                    /*
+                     * Keeping the replacement value at the same UTF-8 length as
+                     * "Original" and disabling padding forces libFLAC down its
+                     * in-place r+b path. A length-changing edit may instead use
+                     * a sibling temporary file, whose replacement permissions
+                     * are controlled by the parent directory on POSIX systems.
+                     */
+                    FlacMetadataEditor().edit(
+                        output,
+                        FlacMetadataEditOptions(usePadding = false)
+                    ) { session ->
+                        session.setVorbisComments(mapOf("TITLE" to listOf("Rejected")))
+                    }
+                }
             }
+
+            val metadataAfter = FlacMetadataReader().read(output)
+            assertEquals(listOf("Original"), metadataAfter.vorbisComment?.comments?.get("TITLE"))
         } finally {
-            setReadOnly(output, false)
             Files.deleteIfExists(output)
         }
     }
@@ -266,8 +287,37 @@ class FlacMetadataEditorIntegrationTest {
         return output
     }
 
-    private fun setReadOnly(path: Path, readOnly: Boolean) {
-        Files.setAttribute(path, "dos:readonly", readOnly)
+    private fun withReadOnlyFile(path: Path, action: () -> Unit) {
+        val posixView = Files.getFileAttributeView(path, PosixFileAttributeView::class.java)
+        if (posixView != null) {
+            val originalPermissions = posixView.readAttributes().permissions().toSet()
+
+            try {
+                posixView.setPermissions(originalPermissions - POSIX_WRITE_PERMISSIONS)
+                assumeFalse(
+                    Files.isWritable(path),
+                    "The current process can bypass POSIX write permissions, so this test cannot verify a write failure."
+                )
+
+                action()
+            } finally {
+                posixView.setPermissions(originalPermissions)
+            }
+
+            return
+        }
+
+        val dosView = requireNotNull(Files.getFileAttributeView(path, DosFileAttributeView::class.java)) {
+            "The test filesystem exposes neither POSIX nor DOS file attributes."
+        }
+        val originalReadOnly = dosView.readAttributes().isReadOnly
+
+        try {
+            dosView.setReadOnly(true)
+            action()
+        } finally {
+            dosView.setReadOnly(originalReadOnly)
+        }
     }
 
     private fun deterministicPcm(frames: Int, format: FlacAudioFormat): IntArray {

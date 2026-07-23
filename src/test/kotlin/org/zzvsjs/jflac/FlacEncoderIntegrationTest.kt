@@ -1,5 +1,7 @@
 package org.zzvsjs.jflac
 
+import org.junit.jupiter.api.condition.EnabledOnOs
+import org.junit.jupiter.api.condition.OS
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -11,6 +13,7 @@ import kotlin.test.assertTrue
 
 class FlacEncoderIntegrationTest {
     @Test
+    @EnabledOnOs(OS.WINDOWS)
     fun parallelEncodingReportsMissingPthreadCapabilityOnWindowsBuild() {
         val format = FlacAudioFormat(sampleRate = 44_100, channels = 1, bitsPerSample = 16)
         val output = Files.createTempFile("jflac-parallel-unavailable", ".flac")
@@ -26,6 +29,39 @@ class FlacEncoderIntegrationTest {
             }
 
             assertTrue(failure.message.orEmpty().contains("pthread"))
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX, OS.MAC)
+    fun parallelEncodingRoundTripsInterleavedPcmOnPthreadBuilds() {
+        val frames = 8_192
+        val format = FlacAudioFormat(
+            sampleRate = 44_100,
+            channels = 2,
+            bitsPerSample = 16,
+            totalSamplesEstimate = frames.toLong()
+        )
+        val samples = deterministicPcm(frames, format)
+        val output = Files.createTempFile("jflac-parallel-roundtrip", ".flac")
+
+        try {
+            FlacEncoder().encode(
+                output = output,
+                format = format,
+                samples = samples,
+                options = FlacEncodingOptions(numThreads = 2)
+            )
+
+            val decoded = FlacDecoder().decode(output)
+
+            assertEquals(format.sampleRate, decoded.streamInfo.sampleRate)
+            assertEquals(format.channels, decoded.streamInfo.channels)
+            assertEquals(format.bitsPerSample, decoded.streamInfo.bitsPerSample)
+            assertEquals(frames.toLong(), decoded.totalFrames)
+            assertContentEquals(samples, decoded.interleavedSamples)
         } finally {
             Files.deleteIfExists(output)
         }
