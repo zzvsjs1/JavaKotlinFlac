@@ -190,9 +190,8 @@ typedef struct FlacApi
     const char *(*stream_encoder_get_resolved_state_string)(const FLAC__StreamEncoder *encoder);
 
     FLAC__StreamMetadata *(*metadata_object_new)(FLAC__MetadataType type);
+    FLAC__StreamMetadata *(*metadata_object_clone)(const FLAC__StreamMetadata *object);
     void (*metadata_object_delete)(FLAC__StreamMetadata *object);
-    FLAC__bool (*metadata_object_vorbiscomment_entry_from_name_value_pair)(
-        FLAC__StreamMetadata_VorbisComment_Entry *entry, const char *field_name, const char *field_value);
     FLAC__bool (*metadata_object_vorbiscomment_set_vendor_string)(FLAC__StreamMetadata *object,
                                                                   FLAC__StreamMetadata_VorbisComment_Entry entry,
                                                                   FLAC__bool copy);
@@ -238,8 +237,9 @@ static char g_flac_init_error[JFLAC_MESSAGE_BUFFER_SIZE] = "";
 static int g_flac_api_initialized = 0;
 
 /* Implemented beside the corresponding registries later in this file. */
-static void destroy_all_decode_sessions(void);
-static void destroy_all_encode_contexts(void);
+static void destroy_all_decode_sessions(JNIEnv *env);
+static void destroy_all_encode_contexts(JNIEnv *env);
+static void destroy_registry_locks(void);
 
 /* Stores the native initialisation failure for the later Java exception. */
 static void set_last_init_error(const char *message)
@@ -340,9 +340,8 @@ static void init_flac_api(void)
     RESOLVE(stream_encoder_finish, FLAC__stream_encoder_finish);
     RESOLVE(stream_encoder_get_resolved_state_string, FLAC__stream_encoder_get_resolved_state_string);
     RESOLVE(metadata_object_new, FLAC__metadata_object_new);
+    RESOLVE(metadata_object_clone, FLAC__metadata_object_clone);
     RESOLVE(metadata_object_delete, FLAC__metadata_object_delete);
-    RESOLVE(metadata_object_vorbiscomment_entry_from_name_value_pair,
-            FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair);
     RESOLVE(metadata_object_vorbiscomment_set_vendor_string, FLAC__metadata_object_vorbiscomment_set_vendor_string);
     RESOLVE(metadata_object_vorbiscomment_append_comment, FLAC__metadata_object_vorbiscomment_append_comment);
     RESOLVE(metadata_object_picture_set_mime_type, FLAC__metadata_object_picture_set_mime_type);
@@ -366,13 +365,26 @@ static void init_flac_api(void)
 #undef RESOLVE
     /* Transfer the loader reference only after the complete API is usable. */
     g_flac_module = module;
+    module.handle = NULL;
+    module.owns_handle = 0;
     g_flac_api_initialized = 1;
     return;
 
 init_failed:
     /* A partially resolved table must not outlive the module it points into. */
     memset(&g_flac_api, 0, sizeof(g_flac_api));
-    jflac_close_library(&module);
+    if (!jflac_close_library(&module))
+    {
+        /*
+         * init_flac_api() runs once under g_flac_init_once, so no other thread
+         * can publish or replace g_flac_module here. Preserve the sole loader
+         * reference globally so JNI_OnUnload can retry instead of losing it
+         * with this stack-local owner.
+         */
+        g_flac_module = module;
+        module.handle = NULL;
+        module.owns_handle = 0;
+    }
 }
 
 /*
@@ -406,14 +418,59 @@ static int flac_api_ready(JNIEnv *env)
  */
 JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved)
 {
-    (void)vm;
+    /*
+     * JNI_OnUnload may run on a VM-owned thread which is not attached for JNI
+     * calls. Global references still need a valid environment, so attach only
+     * when GetEnv reports a detached thread and undo only that attachment.
+     */
+    JNIEnv *env = NULL;
+    int attached_here = 0;
+    jint env_status = (*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_8);
     (void)reserved;
 
-    destroy_all_decode_sessions();
-    destroy_all_encode_contexts();
+    if (env_status == JNI_EDETACHED)
+    {
+        env = NULL;
+        if ((*vm)->AttachCurrentThread(vm, (void **)&env, NULL) == JNI_OK)
+        {
+            attached_here = 1;
+        }
+    }
+    else if (env_status != JNI_OK)
+    {
+        env = NULL;
+    }
+
+    /*
+     * libFLAC's delete paths abandon unfinished work and do not invoke the
+     * Java transport callbacks. If the VM refuses attachment during teardown,
+     * env remains NULL and the destructors free native state while deliberately
+     * skipping DeleteGlobalRef rather than calling JNI through an invalid env.
+     */
+    destroy_all_decode_sessions(env);
+    destroy_all_encode_contexts(env);
+
+    /*
+     * POSIX mutex implementations may own resources beyond their static
+     * storage. No native entry point can still use these locks once unload has
+     * detached every registered owner.
+     */
+    destroy_registry_locks();
+
+    if (attached_here)
+    {
+        (void)(*vm)->DetachCurrentThread(vm);
+    }
+
     g_flac_api_initialized = 0;
     memset(&g_flac_api, 0, sizeof(g_flac_api));
-    jflac_close_library(&g_flac_module);
+    /*
+     * This is the final retry for a loader reference retained after an earlier
+     * initialisation failure. A rejected unload keeps the module unchanged
+     * until process teardown; no caller falsely observes the reference as
+     * released.
+     */
+    (void)jflac_close_library(&g_flac_module);
 }
 
 /*
@@ -2330,7 +2387,6 @@ typedef struct DecodeContext
      * InputStream, but also supplies seek/tell/length/eof callbacks. The
      * global reference is needed for reusable decoder sessions.
      */
-    JavaVM *jvm;
     jobject seekable_channel;
     jmethodID channel_read;
     jmethodID channel_position;
@@ -2470,20 +2526,14 @@ static void unlock_decode_session_registry(void)
  * helper is safe on partially initialised contexts so error paths can call it
  * without duplicating null checks.
  */
-static void clear_decode_seekable_channel(DecodeContext *context)
+static void clear_decode_seekable_channel(JNIEnv *env, DecodeContext *context)
 {
-    if (context == NULL || context->seekable_channel == NULL || context->jvm == NULL)
+    if (env == NULL || context == NULL || context->seekable_channel == NULL)
     {
         return;
     }
 
-    JNIEnv *env = NULL;
-    if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK &&
-        env != NULL)
-    {
-        (*env)->DeleteGlobalRef(env, context->seekable_channel);
-    }
-
+    (*env)->DeleteGlobalRef(env, context->seekable_channel);
     context->seekable_channel = NULL;
 }
 
@@ -2492,21 +2542,15 @@ static void clear_decode_seekable_channel(DecodeContext *context)
  * ordinary one-shot InputStream path stores only a local reference and therefore
  * leaves input_stream_is_global clear so this helper does not touch it.
  */
-static void clear_decode_input_stream(DecodeContext *context)
+static void clear_decode_input_stream(JNIEnv *env, DecodeContext *context)
 {
-    if (context == NULL || !context->input_stream_is_global || context->input_stream == NULL ||
-        context->jvm == NULL)
+    if (env == NULL || context == NULL || !context->input_stream_is_global ||
+        context->input_stream == NULL)
     {
         return;
     }
 
-    JNIEnv *env = NULL;
-    if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK &&
-        env != NULL)
-    {
-        (*env)->DeleteGlobalRef(env, context->input_stream);
-    }
-
+    (*env)->DeleteGlobalRef(env, context->input_stream);
     context->input_stream = NULL;
     context->input_stream_is_global = 0;
 }
@@ -2591,7 +2635,7 @@ static jlong reserve_decode_session_handle_locked(void)
  * Releases the libFLAC decoder and heap storage owned by one session. It also
  * drops any global channel reference captured for a seekable-channel session.
  */
-static void destroy_decode_session(DecodeSession *session)
+static void destroy_decode_session(JNIEnv *env, DecodeSession *session)
 {
     if (session == NULL)
     {
@@ -2605,8 +2649,8 @@ static void destroy_decode_session(DecodeSession *session)
         session->decoder = NULL;
     }
 
-    clear_decode_seekable_channel(&session->context);
-    clear_decode_input_stream(&session->context);
+    clear_decode_seekable_channel(env, &session->context);
+    clear_decode_input_stream(env, &session->context);
     clear_decode_pull_pending(&session->context);
     free(session);
 }
@@ -2681,7 +2725,7 @@ static DecodeSession *acquire_decode_session(JNIEnv *env, jlong handle)
  * already removed it from the active registry. The Java exception state is not
  * touched here because release is cleanup, not a user-visible operation.
  */
-static void release_decode_session_reference(DecodeSession *session)
+static void release_decode_session_reference(JNIEnv *env, DecodeSession *session)
 {
     int should_destroy = 0;
 
@@ -2707,7 +2751,7 @@ static void release_decode_session_reference(DecodeSession *session)
 
     if (should_destroy)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
     }
 }
 
@@ -2769,7 +2813,7 @@ static DecodeSession *remove_decode_session(jlong handle)
  * JNI_OnUnload cannot overlap a native entry point, so no operation reference
  * can still be using a detached session.
  */
-static void destroy_all_decode_sessions(void)
+static void destroy_all_decode_sessions(JNIEnv *env)
 {
     lock_decode_session_registry();
     DecodeSessionRegistryEntry *entry = g_decode_session_registry;
@@ -2778,10 +2822,31 @@ static void destroy_all_decode_sessions(void)
     while (entry != NULL)
     {
         DecodeSessionRegistryEntry *next = entry->next;
-        destroy_decode_session(entry->session);
+        destroy_decode_session(env, entry->session);
         free(entry);
         entry = next;
     }
+}
+
+/*
+ * Returns the number of Java-visible decoder handles currently owned by the
+ * registry. This package-private diagnostic is deliberately read-only and is
+ * used to verify lifecycle ownership without exposing native pointers.
+ */
+static jlong active_decode_session_count(void)
+{
+    jlong count = 0;
+
+    lock_decode_session_registry();
+    for (DecodeSessionRegistryEntry *entry = g_decode_session_registry;
+         entry != NULL;
+         entry = entry->next)
+    {
+        count += 1;
+    }
+
+    unlock_decode_session_registry();
+    return count;
 }
 
 /*
@@ -3093,12 +3158,6 @@ static int prepare_decode_input_stream_global(JNIEnv *env, DecodeContext *contex
         return 0;
     }
 
-    if ((*env)->GetJavaVM(env, &context->jvm) != JNI_OK)
-    {
-        throw_decode_exception(env, "Failed to access JVM for stream decoder callbacks.");
-        return 0;
-    }
-
     jobject global_stream = (*env)->NewGlobalRef(env, input_stream);
     if (global_stream == NULL)
     {
@@ -3141,12 +3200,6 @@ static int prepare_decode_seekable_channel(JNIEnv *env, DecodeContext *context, 
         return 0;
     }
 
-    if ((*env)->GetJavaVM(env, &context->jvm) != JNI_OK)
-    {
-        throw_decode_exception(env, "Failed to access JVM for channel decoder callbacks.");
-        return 0;
-    }
-
     context->seekable_channel = (*env)->NewGlobalRef(env, channel);
     if (context->seekable_channel == NULL)
     {
@@ -3156,13 +3209,13 @@ static int prepare_decode_seekable_channel(JNIEnv *env, DecodeContext *context, 
     context->channel_base_offset = (*env)->CallLongMethod(env, channel, context->channel_position);
     if ((*env)->ExceptionCheck(env))
     {
-        clear_decode_seekable_channel(context);
+        clear_decode_seekable_channel(env, context);
         return 0;
     }
 
     if (context->channel_base_offset < 0)
     {
-        clear_decode_seekable_channel(context);
+        clear_decode_seekable_channel(env, context);
         throw_decode_exception(env, "SeekableByteChannel returned a negative position.");
         return 0;
     }
@@ -3375,7 +3428,17 @@ static FLAC__StreamDecoderReadStatus decode_read_callback(const FLAC__StreamDeco
                                                           size_t *bytes, void *client_data)
 {
     DecodeContext *context = (DecodeContext *)client_data;
-    if (context != NULL && context->seekable_channel != NULL)
+    if (context == NULL || context->env == NULL)
+    {
+        if (bytes != NULL)
+        {
+            *bytes = 0u;
+        }
+
+        return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+    }
+
+    if (context->seekable_channel != NULL)
     {
         return decode_channel_read_callback(decoder, buffer, bytes, client_data);
     }
@@ -4191,7 +4254,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
     if (!prepare_decode_context(env, &context, consumer) ||
         !prepare_decode_seekable_channel(env, &context, channel))
     {
-        clear_decode_seekable_channel(&context);
+        clear_decode_seekable_channel(env, &context);
         return;
     }
 
@@ -4200,7 +4263,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
     FLAC__StreamDecoder *decoder = g_flac_api.stream_decoder_new();
     if (decoder == NULL)
     {
-        clear_decode_seekable_channel(&context);
+        clear_decode_seekable_channel(env, &context);
         throw_decode_exception(env, "Failed to allocate FLAC channel decoder.");
         return;
     }
@@ -4209,7 +4272,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
         !configure_decoder_md5_checking(env, decoder, check_md5))
     {
         g_flac_api.stream_decoder_delete(decoder);
-        clear_decode_seekable_channel(&context);
+        clear_decode_seekable_channel(env, &context);
         return;
     }
 
@@ -4220,7 +4283,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
     {
         g_flac_api.stream_decoder_delete(decoder);
-        clear_decode_seekable_channel(&context);
+        clear_decode_seekable_channel(env, &context);
         throw_decode_exception(env, "Failed to initialize FLAC channel decoder.");
         return;
     }
@@ -4249,7 +4312,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
-            clear_decode_seekable_channel(&context);
+            clear_decode_seekable_channel(env, &context);
             return;
         }
 
@@ -4257,7 +4320,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
-            clear_decode_seekable_channel(&context);
+            clear_decode_seekable_channel(env, &context);
             throw_range_after_stream_exception(env);
             return;
         }
@@ -4276,7 +4339,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
             }
 
             g_flac_api.stream_decoder_delete(decoder);
-            clear_decode_seekable_channel(&context);
+            clear_decode_seekable_channel(env, &context);
             return;
         }
 
@@ -4303,7 +4366,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
-            clear_decode_seekable_channel(&context);
+            clear_decode_seekable_channel(env, &context);
             return;
         }
     }
@@ -4361,7 +4424,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
      * Reusable channel sessions keep their reference in DecodeSession instead.
      */
     g_flac_api.stream_decoder_delete(decoder);
-    clear_decode_seekable_channel(&context);
+    clear_decode_seekable_channel(env, &context);
 }
 
 /*
@@ -4508,7 +4571,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     session->decoder = g_flac_api.stream_decoder_new();
     if (session->decoder == NULL)
     {
-        free(session);
+        destroy_decode_session(env, session);
         free(utf8_path);
         throw_decode_exception(env, "Failed to allocate FLAC decoder.");
         return 0;
@@ -4531,8 +4594,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
 
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
     {
-        g_flac_api.stream_decoder_delete(session->decoder);
-        free(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to initialize FLAC decoder.");
         return 0;
     }
@@ -4552,9 +4614,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
                  session->context.saw_error ? " (decoder error callback: " : "",
                  session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
                  session->context.saw_error ? ")" : "");
-        g_flac_api.stream_decoder_finish(session->decoder);
-        g_flac_api.stream_decoder_delete(session->decoder);
-        free(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, buffer);
         return 0;
     }
@@ -4567,7 +4627,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     jlong handle = register_decode_session(session);
     if (handle == 0)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to register FLAC decoder session.");
         return 0;
     }
@@ -4611,7 +4671,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     session->decoder = g_flac_api.stream_decoder_new();
     if (session->decoder == NULL)
     {
-        free(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to allocate FLAC decoder.");
         return 0;
     }
@@ -4625,7 +4685,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
      */
     if (!prepare_decode_seekable_channel(env, &session->context, channel))
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         return 0;
     }
 
@@ -4636,7 +4696,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
 
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to initialize FLAC channel decoder.");
         return 0;
     }
@@ -4651,14 +4711,14 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
                  session->context.saw_error ? " (decoder error callback: " : "",
                  session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
                  session->context.saw_error ? ")" : "");
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, buffer);
         return 0;
     }
 
     if ((*env)->ExceptionCheck(env) || !metadata_success)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         return 0;
     }
 
@@ -4670,7 +4730,7 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     jlong handle = register_decode_session(session);
     if (handle == 0)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to register FLAC channel decoder session.");
         return 0;
     }
@@ -4697,7 +4757,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
     session->decoder = g_flac_api.stream_decoder_new();
     if (session->decoder == NULL)
     {
-        free(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to allocate FLAC pull decoder.");
         return NULL;
     }
@@ -4718,7 +4778,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
     {
         if (!prepare_decode_input_stream_global(env, &session->context, input_stream))
         {
-            destroy_decode_session(session);
+            destroy_decode_session(env, session);
             return NULL;
         }
 
@@ -4730,7 +4790,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
     {
         if (!prepare_decode_seekable_channel(env, &session->context, channel))
         {
-            destroy_decode_session(session);
+            destroy_decode_session(env, session);
             return NULL;
         }
 
@@ -4742,7 +4802,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
 
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to initialize FLAC pull decoder.");
         return NULL;
     }
@@ -4762,20 +4822,20 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
                  session->context.saw_error ? " (decoder error callback: " : "",
                  session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
                  session->context.saw_error ? ")" : "");
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, buffer);
         return NULL;
     }
 
     if ((*env)->ExceptionCheck(env) || !metadata_success)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         return NULL;
     }
 
     if (!session->context.saw_stream_info)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "FLAC pull decoder did not receive STREAMINFO.");
         return NULL;
     }
@@ -4783,7 +4843,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
     jlong handle = register_decode_session(session);
     if (handle == 0)
     {
-        destroy_decode_session(session);
+        destroy_decode_session(env, session);
         throw_decode_exception(env, "Failed to register FLAC pull decoder session.");
         return NULL;
     }
@@ -4792,7 +4852,7 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
     if (result == NULL)
     {
         DecodeSession *registered_session = remove_decode_session(handle);
-        destroy_decode_session(registered_session);
+        destroy_decode_session(env, registered_session);
         return NULL;
     }
 
@@ -4912,7 +4972,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      */
     if (session->context.pull_mode)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_state_exception(env, "A pull decoder handle cannot be used for callback-driven decoding.");
         return;
     }
@@ -4923,21 +4983,21 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      */
     if (first_sample < 0)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_argument_exception(env, "First sample must be non-negative.");
         return;
     }
 
     if (consumer == NULL)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_argument_exception(env, "Decoder consumer must not be null.");
         return;
     }
 
     if (!prepare_decode_context(env, &session->context, consumer))
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -4969,7 +5029,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
          */
         session->context.consumer = NULL;
         throw_decode_exception(env, buffer);
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -4989,7 +5049,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
          */
         session->context.consumer = NULL;
         throw_decode_exception(env, buffer);
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -5004,7 +5064,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      * untouched, while the native context stops retaining a stale local ref.
      */
     session->context.consumer = NULL;
-    release_decode_session_reference(session);
+    release_decode_session_reference(env, session);
 }
 
 /*
@@ -5028,7 +5088,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
 
     if (session->context.pull_mode)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_state_exception(env, "A pull decoder handle cannot be used for callback-driven decoding.");
         return;
     }
@@ -5039,20 +5099,20 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      */
     if (!validate_decode_request(env, first_sample, JFLAC_LIMITED_RANGE, max_frames))
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
     if (consumer == NULL)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_argument_exception(env, "Decoder consumer must not be null.");
         return;
     }
 
     if (!prepare_decode_context(env, &session->context, consumer))
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -5073,7 +5133,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
     {
         session->context.consumer = NULL;
         throw_range_after_stream_exception(env);
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -5091,7 +5151,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
          * decoder open preserves the session for the caller's next range.
          */
         session->context.consumer = NULL;
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -5113,7 +5173,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
                  session->context.saw_error ? ")" : "");
         session->context.consumer = NULL;
         throw_decode_exception(env, buffer);
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -5128,7 +5188,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
                  session->context.saw_error ? ")" : "");
         session->context.consumer = NULL;
         throw_decode_exception(env, buffer);
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return;
     }
 
@@ -5143,7 +5203,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      * the call has returned, regardless of whether onComplete succeeded.
      */
     session->context.consumer = NULL;
-    release_decode_session_reference(session);
+    release_decode_session_reference(env, session);
 }
 
 /*
@@ -5173,27 +5233,27 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
 
     if (max_frames < 0)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_argument_exception(env, "Max frames must be non-negative.");
         return 0;
     }
 
     if (samples == NULL)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_argument_exception(env, "PCM sample buffer must not be null.");
         return 0;
     }
 
     if (max_frames == 0)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return 0;
     }
 
     if (!session->context.pull_mode || !session->context.saw_stream_info)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_state_exception(env, "The native FLAC decoder handle is not a pull decoder.");
         return 0;
     }
@@ -5204,7 +5264,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
     if (channels == 0u || required_samples > (uint64_t)INT_MAX ||
         (uint64_t)sample_capacity < required_samples)
     {
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         throw_illegal_argument_exception(env, "Interleaved sample buffer must fit maxFrames * channels.");
         return 0;
     }
@@ -5221,7 +5281,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
     if (!drain_decode_pull_pending(env, context))
     {
         context->pull_output = NULL;
-        release_decode_session_reference(session);
+        release_decode_session_reference(env, session);
         return 0;
     }
 
@@ -5231,7 +5291,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
         if ((*env)->ExceptionCheck(env))
         {
             context->pull_output = NULL;
-            release_decode_session_reference(session);
+            release_decode_session_reference(env, session);
             return 0;
         }
 
@@ -5244,7 +5304,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
                      context->saw_error ? decoder_error_status_name(context->last_error_status) : "",
                      context->saw_error ? ")" : "");
             context->pull_output = NULL;
-            release_decode_session_reference(session);
+            release_decode_session_reference(env, session);
             throw_decode_exception(env, buffer);
             return 0;
         }
@@ -5263,7 +5323,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
             snprintf(buffer, sizeof(buffer), "FLAC pull decoder aborted%s%s.", state_text != NULL ? ": " : "",
                      state_text != NULL ? state_text : "");
             context->pull_output = NULL;
-            release_decode_session_reference(session);
+            release_decode_session_reference(env, session);
             throw_decode_exception(env, buffer);
             return 0;
         }
@@ -5272,7 +5332,7 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
     jint written_frames = (jint)context->pull_written_frames;
     int end_of_stream = context->pull_end_of_stream;
     context->pull_output = NULL;
-    release_decode_session_reference(session);
+    release_decode_session_reference(env, session);
 
     if (written_frames > 0)
     {
@@ -5290,16 +5350,23 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_releaseDecoder(JNIEnv *env, jclass clazz,
                                                                                     jlong handle)
 {
-    (void)env;
     (void)clazz;
     DecodeSession *session = remove_decode_session(handle);
-    destroy_decode_session(session);
+    destroy_decode_session(env, session);
 }
 
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_releasePullDecoder(JNIEnv *env, jclass clazz,
                                                                                         jlong handle)
 {
     Java_org_zzvsjs_jflac_internal_NativeBindings_releaseDecoder(env, clazz, handle);
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_zzvsjs_jflac_internal_NativeBindings_activeDecoderSessionCount(JNIEnv *env, jclass clazz)
+{
+    (void)env;
+    (void)clazz;
+    return active_decode_session_count();
 }
 
 typedef struct EncodeContext
@@ -5387,7 +5454,7 @@ static void destroy_metadata_blocks(EncodeContext *context)
  * and heap context. It is used by both normal finish and failure/abandon paths,
  * so every field must be safe to clean up after partial initialisation.
  */
-static void destroy_encode_context(EncodeContext *context)
+static void destroy_encode_context(JNIEnv *env, EncodeContext *context)
 {
     if (context == NULL)
     {
@@ -5402,27 +5469,15 @@ static void destroy_encode_context(EncodeContext *context)
 
     destroy_metadata_blocks(context);
 
-    if (context->output_stream != NULL && context->jvm != NULL)
+    if (env != NULL && context->output_stream != NULL)
     {
-        JNIEnv *env = NULL;
-        if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK &&
-            env != NULL)
-        {
-            (*env)->DeleteGlobalRef(env, context->output_stream);
-        }
-
+        (*env)->DeleteGlobalRef(env, context->output_stream);
         context->output_stream = NULL;
     }
 
-    if (context->output_channel != NULL && context->jvm != NULL)
+    if (env != NULL && context->output_channel != NULL)
     {
-        JNIEnv *env = NULL;
-        if ((*context->jvm)->GetEnv(context->jvm, (void **)&env, JNI_VERSION_1_8) == JNI_OK &&
-            env != NULL)
-        {
-            (*env)->DeleteGlobalRef(env, context->output_channel);
-        }
-
+        (*env)->DeleteGlobalRef(env, context->output_channel);
         context->output_channel = NULL;
     }
 
@@ -5535,7 +5590,7 @@ static EncodeContext *acquire_encode_context(JNIEnv *env, jlong handle)
     return context;
 }
 
-static void release_encode_context_reference(EncodeContext *context)
+static void release_encode_context_reference(JNIEnv *env, EncodeContext *context)
 {
     int should_destroy = 0;
 
@@ -5556,7 +5611,7 @@ static void release_encode_context_reference(EncodeContext *context)
 
     if (should_destroy)
     {
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
     }
 }
 
@@ -5607,7 +5662,7 @@ static EncodeContext *remove_encode_context(jlong handle)
  * still performed outside the registry lock so callback/global-reference
  * cleanup never runs while shared registry state is locked.
  */
-static void destroy_all_encode_contexts(void)
+static void destroy_all_encode_contexts(JNIEnv *env)
 {
     lock_encode_context_registry();
     EncodeContextRegistryEntry *entry = g_encode_context_registry;
@@ -5618,16 +5673,44 @@ static void destroy_all_encode_contexts(void)
         EncodeContextRegistryEntry *next = entry->next;
         EncodeContext *context = entry->context;
         free(entry);
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         entry = next;
     }
 }
 
 /*
+ * Returns the number of Java-visible encoder handles currently owned by the
+ * registry. It is a package-private diagnostic used by lifecycle regression
+ * tests and does not alter encoder state.
+ */
+static jlong active_encode_context_count(void)
+{
+    jlong count = 0;
+
+    lock_encode_context_registry();
+    for (EncodeContextRegistryEntry *entry = g_encode_context_registry;
+         entry != NULL;
+         entry = entry->next)
+    {
+        count += 1;
+    }
+
+    unlock_encode_context_registry();
+    return count;
+}
+
+static void destroy_registry_locks(void)
+{
+    jflac_mutex_destroy(&g_decode_session_registry_lock);
+    jflac_mutex_destroy(&g_encode_context_registry_lock);
+    jflac_mutex_destroy(&g_flac_init_once.mutex);
+}
+
+/*
  * Builds one Vorbis comment metadata block from flattened KEY=value strings.
- * libFLAC allocates native_entry.entry; append_comment(..., false) transfers
- * ownership of that entry into the block on success, so native code must only
- * free native_entry.entry on append failure.
+ * Every flattened entry remains owned by this JNI library. libFLAC receives
+ * copy=true so its metadata block stores data allocated by its own runtime,
+ * which is required when the two Windows DLLs use separate static CRT heaps.
  */
 static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object, jobjectArray comment_entries,
                                              FLAC__bool force_create, FLAC__StreamMetadata **result)
@@ -5700,69 +5783,69 @@ static FLAC__bool build_vorbis_comment_block(JNIEnv *env, jstring vendor_object,
             return false;
         }
 
-        const char *separator = strchr(utf8_entry, '=');
-        size_t name_length = separator != NULL ? (size_t)(separator - utf8_entry) : strlen(utf8_entry);
-        size_t value_length = separator != NULL ? strlen(separator + 1) : 0u;
-        char *name = (char *)malloc(name_length + 1u);
-        char *value = (char *)malloc(value_length + 1u);
+        size_t entry_length = strlen(utf8_entry);
+        char *normalised_entry = NULL;
+        const char *entry_to_append = utf8_entry;
         FLAC__StreamMetadata_VorbisComment_Entry native_entry;
         memset(&native_entry, 0, sizeof(native_entry));
 
         /*
-         * Split KEY=value manually because libFLAC wants name and value as
-         * separate NUL-terminated strings. Missing '=' produces an empty value,
-         * which is then validated by libFLAC's own comment-entry builder.
+         * The public API historically accepts a missing '=' as an empty value.
+         * Preserve that contract by presenting KEY= to libFLAC. The flattened
+         * buffer remains JNI-owned regardless of which representation is used.
          */
-        if (name == NULL || value == NULL)
+        if (strchr(utf8_entry, '=') == NULL)
+        {
+            if (entry_length > (size_t)UINT32_MAX - 1u ||
+                entry_length > SIZE_MAX - 2u)
+            {
+                free(utf8_entry);
+                (*env)->PopLocalFrame(env, NULL);
+                g_flac_api.metadata_object_delete(block);
+                return false;
+            }
+
+            normalised_entry = (char *)malloc(entry_length + 2u);
+            if (normalised_entry == NULL)
+            {
+                free(utf8_entry);
+                (*env)->PopLocalFrame(env, NULL);
+                g_flac_api.metadata_object_delete(block);
+                return false;
+            }
+
+            memcpy(normalised_entry, utf8_entry, entry_length);
+            normalised_entry[entry_length] = '=';
+            normalised_entry[entry_length + 1u] = '\0';
+            entry_to_append = normalised_entry;
+            entry_length += 1u;
+        }
+        else if (entry_length > (size_t)UINT32_MAX)
         {
             free(utf8_entry);
-            free(name);
-            free(value);
             (*env)->PopLocalFrame(env, NULL);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
 
-        memcpy(name, utf8_entry, name_length);
-        name[name_length] = '\0';
-        if (separator != NULL)
-        {
-            memcpy(value, separator + 1, value_length);
-        }
-
-        value[value_length] = '\0';
-
-        if (!g_flac_api.metadata_object_vorbiscomment_entry_from_name_value_pair(
-                &native_entry, name, value))
-        {
-            free(utf8_entry);
-            free(name);
-            free(value);
-            (*env)->PopLocalFrame(env, NULL);
-            g_flac_api.metadata_object_delete(block);
-            return false;
-        }
+        native_entry.length = (FLAC__uint32)entry_length;
+        native_entry.entry = (FLAC__byte *)entry_to_append;
 
         /*
-         * copy=false avoids a second allocation inside libFLAC. On success the
-         * Vorbis-comment block owns native_entry.entry; on failure ownership
-         * never transfers, so this function frees the entry itself.
+         * copy=true keeps heap ownership within each DLL: libFLAC stores its
+         * own copy, while this shim always frees only its temporary buffers.
          */
-        if (!g_flac_api.metadata_object_vorbiscomment_append_comment(block, native_entry, false))
+        FLAC__bool append_success =
+            g_flac_api.metadata_object_vorbiscomment_append_comment(block, native_entry, true);
+        free(normalised_entry);
+        free(utf8_entry);
+        (*env)->PopLocalFrame(env, NULL);
+
+        if (!append_success)
         {
-            free(native_entry.entry);
-            free(utf8_entry);
-            free(name);
-            free(value);
-            (*env)->PopLocalFrame(env, NULL);
             g_flac_api.metadata_object_delete(block);
             return false;
         }
-
-        free(utf8_entry);
-        free(name);
-        free(value);
-        (*env)->PopLocalFrame(env, NULL);
     }
 
     *result = block;
@@ -6146,9 +6229,9 @@ static FLAC__bool build_padding_block(JNIEnv *env, jobject padding_object, FLAC_
 
 /*
  * Builds one opaque libFLAC metadata block from the public raw-block model.
- * Unknown metadata owns its raw data pointer directly, so after assigning
- * block->data.unknown.data the block destructor becomes responsible for the
- * allocated buffer.
+ * The source structure borrows a JVM byte-array view only for the duration of
+ * metadata_object_clone(). libFLAC therefore allocates and later frees the
+ * stored payload within its own DLL, even when Windows uses static CRT heaps.
  */
 static FLAC__bool build_unknown_metadata_block(JNIEnv *env, jobject unknown_object, FLAC__StreamMetadata **result)
 {
@@ -6213,38 +6296,33 @@ static FLAC__bool build_unknown_metadata_block(JNIEnv *env, jobject unknown_obje
         return false;
     }
 
-    FLAC__StreamMetadata *block = g_flac_api.metadata_object_new((FLAC__MetadataType)type);
+    jbyte *borrowed_data = NULL;
+    if (data_length > 0)
+    {
+        borrowed_data = (*env)->GetByteArrayElements(env, data_object, NULL);
+        if (borrowed_data == NULL)
+        {
+            return false;
+        }
+    }
+
+    FLAC__StreamMetadata source;
+    memset(&source, 0, sizeof(source));
+    source.type = (FLAC__MetadataType)type;
+    source.length = (uint32_t)data_length;
+    source.data.unknown.data = (FLAC__byte *)borrowed_data;
+
+    FLAC__StreamMetadata *block = g_flac_api.metadata_object_clone(&source);
+    if (borrowed_data != NULL)
+    {
+        (*env)->ReleaseByteArrayElements(env, data_object, borrowed_data, JNI_ABORT);
+    }
+
     if (block == NULL)
     {
         return false;
     }
 
-    FLAC__byte *data = NULL;
-    if (data_length > 0)
-    {
-        data = (FLAC__byte *)malloc((size_t)data_length);
-        if (data == NULL)
-        {
-            g_flac_api.metadata_object_delete(block);
-            return false;
-        }
-
-        (*env)->GetByteArrayRegion(env, data_object, 0, data_length, (jbyte *)data);
-        if ((*env)->ExceptionCheck(env))
-        {
-            free(data);
-            g_flac_api.metadata_object_delete(block);
-            return false;
-        }
-    }
-
-    block->length = (uint32_t)data_length;
-    /*
-     * Unlike APPLICATION and PICTURE, libFLAC exposes unknown block storage
-     * directly. From this assignment onwards, metadata_object_delete(block) is
-     * responsible for freeing data.
-     */
-    block->data.unknown.data = data;
     *result = block;
     return true;
 }
@@ -7781,7 +7859,12 @@ static FLAC__StreamEncoderWriteStatus encode_write_callback(const FLAC__StreamEn
                                                             void *client_data)
 {
     EncodeContext *context = (EncodeContext *)client_data;
-    if (context != NULL && context->output_channel != NULL)
+    if (context == NULL)
+    {
+        return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR;
+    }
+
+    if (context->output_channel != NULL)
     {
         return encode_channel_write_callback(encoder, buffer, bytes, samples, current_frame, client_data);
     }
@@ -8079,14 +8162,14 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
      */
     if (output_stream != NULL && !prepare_encode_output_stream(env, context, output_stream))
     {
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         free(utf8_path);
         return 0;
     }
 
     if (output_channel != NULL && !prepare_encode_output_channel(env, context, output_channel))
     {
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         free(utf8_path);
         return 0;
     }
@@ -8094,7 +8177,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     context->encoder = g_flac_api.stream_encoder_new();
     if (context->encoder == NULL)
     {
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         free(utf8_path);
         throw_encode_exception(env, "Failed to allocate FLAC encoder.");
         return 0;
@@ -8111,7 +8194,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
             g_flac_api.stream_encoder_set_num_threads(context->encoder, (uint32_t)num_threads);
         if (thread_status != FLAC__STREAM_ENCODER_SET_NUM_THREADS_OK)
         {
-            destroy_encode_context(context);
+            destroy_encode_context(env, context);
             free(utf8_path);
             switch (thread_status)
             {
@@ -8154,7 +8237,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "Failed to configure FLAC encoder: %s.",
                  encoder_state_or_unknown(context->encoder));
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         free(utf8_path);
         throw_encode_exception(env, buffer);
         return 0;
@@ -8174,7 +8257,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
                                     padding_blocks, unknown_blocks, context);
     if (!metadata_success)
     {
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         free(utf8_path);
         if (!(*env)->ExceptionCheck(env))
         {
@@ -8190,7 +8273,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "Failed to attach FLAC metadata blocks: %s.",
                  encoder_state_or_unknown(context->encoder));
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         free(utf8_path);
         throw_encode_exception(env, buffer);
         return 0;
@@ -8236,7 +8319,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
         snprintf(buffer, sizeof(buffer), "Failed to initialize FLAC encoder output%s%s.",
                  encoder_state_or_unknown(context->encoder) != NULL ? ": " : "",
                  encoder_state_or_unknown(context->encoder));
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         if (!(*env)->ExceptionCheck(env))
         {
             throw_encode_exception(env, buffer);
@@ -8248,7 +8331,7 @@ static jlong open_encoder_internal(JNIEnv *env, char *utf8_path, jobject output_
     jlong handle = register_encode_context(context);
     if (handle == 0)
     {
-        destroy_encode_context(context);
+        destroy_encode_context(env, context);
         throw_encode_exception(env, "Failed to register FLAC encoder handle.");
         return 0;
     }
@@ -8340,20 +8423,20 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeEncode
 
     if (frames < 0)
     {
-        release_encode_context_reference(context);
+        release_encode_context_reference(env, context);
         throw_illegal_argument_exception(env, "Frame count must be non-negative.");
         return;
     }
 
     if (frames == 0)
     {
-        release_encode_context_reference(context);
+        release_encode_context_reference(env, context);
         return;
     }
 
     if (samples == NULL)
     {
-        release_encode_context_reference(context);
+        release_encode_context_reference(env, context);
         throw_illegal_argument_exception(env, "PCM sample buffer must not be null.");
         return;
     }
@@ -8361,7 +8444,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeEncode
     jsize sample_count = (*env)->GetArrayLength(env, samples);
     if ((uint64_t)sample_count != ((uint64_t)frames * (uint64_t)context->channels))
     {
-        release_encode_context_reference(context);
+        release_encode_context_reference(env, context);
         throw_illegal_argument_exception(env, "Sample array length must equal frames * channels.");
         return;
     }
@@ -8369,7 +8452,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeEncode
     jint *elements = (*env)->GetIntArrayElements(env, samples, NULL);
     if (elements == NULL)
     {
-        release_encode_context_reference(context);
+        release_encode_context_reference(env, context);
         throw_encode_exception(env, "Failed to access PCM samples for encoding.");
         return;
     }
@@ -8384,12 +8467,12 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_writeEncode
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC encoding failed while processing PCM: %s.",
                  encoder_state_or_unknown(context->encoder));
-        release_encode_context_reference(context);
+        release_encode_context_reference(env, context);
         throw_encode_exception(env, buffer);
         return;
     }
 
-    release_encode_context_reference(context);
+    release_encode_context_reference(env, context);
 }
 
 /*
@@ -8422,7 +8505,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_finishEncod
         (void)(*env)->ExceptionCheck(env);
     }
 
-    release_encode_context_reference(context);
+    release_encode_context_reference(env, context);
     if ((*env)->ExceptionCheck(env))
     {
         return;
@@ -8442,8 +8525,15 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_finishEncod
 JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_releaseEncoder(JNIEnv *env, jclass clazz,
                                                                                     jlong handle)
 {
-    (void)env;
     (void)clazz;
     EncodeContext *context = remove_encode_context(handle);
-    destroy_encode_context(context);
+    destroy_encode_context(env, context);
+}
+
+JNIEXPORT jlong JNICALL
+Java_org_zzvsjs_jflac_internal_NativeBindings_activeEncoderContextCount(JNIEnv *env, jclass clazz)
+{
+    (void)env;
+    (void)clazz;
+    return active_encode_context_count();
 }

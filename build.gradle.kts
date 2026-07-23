@@ -142,7 +142,10 @@ val flacSourceSha256 = "f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd886304
 val flacArchive = layout.buildDirectory.file("downloads/flac-$flacVersion.tar.xz")
 val flacSourceParentDir = layout.buildDirectory.dir("flac-source")
 val flacSourceDir = flacSourceParentDir.map { it.dir("flac-$flacVersion") }
-val flacVendorPatch = layout.projectDirectory.file("native/patches/flac-1.5.0-preserve-vorbis-vendor.patch")
+val flacVendorPatches = listOf(
+    layout.projectDirectory.file("native/patches/flac-1.5.0-preserve-vorbis-vendor.patch"),
+    layout.projectDirectory.file("native/patches/flac-1.5.0-close-decoder-file-after-init-failure.patch")
+)
 val flacBuildDir = layout.buildDirectory.dir("flac-native")
 val flacLibrary = flacBuildDir.map { it.file(activeNativeTarget.flacBuildRelativePath) }
 val flacImportLib = flacBuildDir.map { it.file("src/libFLAC/FLAC.lib") }
@@ -439,7 +442,7 @@ val extractFlacSource by tasks.registering(Exec::class) {
     description = "Extracts and patches the FLAC $flacVersion source archive."
     dependsOn(downloadFlacSource)
     inputs.file(flacArchive)
-    inputs.file(flacVendorPatch)
+    inputs.files(flacVendorPatches)
     outputs.dir(flacSourceDir)
 
     doFirst {
@@ -464,27 +467,30 @@ val extractFlacSource by tasks.registering(Exec::class) {
     doLast {
         val sourcePrefix = flacSourceDir.get().asFile.relativeTo(projectDir).invariantSeparatorsPath
         /*
-         * The versioned patch is the single source of truth for both the
-         * downstream behaviour and the matching public FLAC header text.
-         * --check makes an upstream layout change fail before any source is
-         * modified, rather than silently applying only part of the contract.
+         * Keep the versioned patches in an explicit order because a later
+         * patch may depend on source changed by an earlier one. Checking each
+         * patch immediately before applying it also makes an upstream layout
+         * change fail rather than silently applying only part of a patch.
          */
-        exec {
-            commandLine(
-                "git",
-                "apply",
-                "--check",
-                "--directory=$sourcePrefix",
-                flacVendorPatch.asFile.absolutePath
-            )
-        }
-        exec {
-            commandLine(
-                "git",
-                "apply",
-                "--directory=$sourcePrefix",
-                flacVendorPatch.asFile.absolutePath
-            )
+        flacVendorPatches.forEach { patch ->
+            exec {
+                commandLine(
+                    "git",
+                    "apply",
+                    "--check",
+                    "--directory=$sourcePrefix",
+                    patch.asFile.absolutePath
+                )
+            }
+
+            exec {
+                commandLine(
+                    "git",
+                    "apply",
+                    "--directory=$sourcePrefix",
+                    patch.asFile.absolutePath
+                )
+            }
         }
     }
 }

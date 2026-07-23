@@ -2,19 +2,12 @@ package org.zzvsjs.jflac.examples.playback;
 
 import java.util.Locale;
 
-/** One parsed line from the interactive playback console. */
+/**
+ * One parsed line from the interactive playback console.
+ */
 record ConsolePlaybackCommand(Type type, long timeMicros, String argument) {
     enum Type {
-        TOGGLE_PAUSE,
-        PAUSE,
-        RESUME,
-        SEEK_ABSOLUTE,
-        SEEK_RELATIVE,
-        STATUS,
-        OPEN,
-        LIST,
-        HELP,
-        QUIT
+        TOGGLE_PAUSE, PAUSE, RESUME, SEEK_ABSOLUTE, SEEK_RELATIVE, STATUS, OPEN, LIST, HELP, QUIT
     }
 
     static ConsolePlaybackCommand parse(String rawLine) {
@@ -37,23 +30,18 @@ record ConsolePlaybackCommand(Type type, long timeMicros, String argument) {
             case "p", "toggle" -> new ConsolePlaybackCommand(Type.TOGGLE_PAUSE, 0L, null);
             case "pause" -> new ConsolePlaybackCommand(Type.PAUSE, 0L, null);
             case "resume", "play" -> new ConsolePlaybackCommand(Type.RESUME, 0L, null);
-            case "seek", "s" -> new ConsolePlaybackCommand(
-                    Type.SEEK_ABSOLUTE,
+            case "seek", "s" -> new ConsolePlaybackCommand(Type.SEEK_ABSOLUTE,
                     PlaybackArguments.parseTimeMicros(requireRemainder(verb, remainder)),
-                    null
-            );
+                    null);
             case "status", "i", "info" -> new ConsolePlaybackCommand(Type.STATUS, 0L, null);
-            case "open", "o" -> new ConsolePlaybackCommand(
-                    Type.OPEN,
+            case "open", "o" -> new ConsolePlaybackCommand(Type.OPEN,
                     0L,
-                    remainder.isEmpty() ? null : PlaybackArguments.stripOuterQuotes(remainder)
-            );
+                    remainder.isEmpty() ? null : PlaybackArguments.stripOuterQuotes(remainder));
             case "list", "l" -> new ConsolePlaybackCommand(Type.LIST, 0L, null);
             case "help", "h", "?" -> new ConsolePlaybackCommand(Type.HELP, 0L, null);
             case "quit", "q", "exit" -> new ConsolePlaybackCommand(Type.QUIT, 0L, null);
             default -> throw new IllegalArgumentException(
-                    "Unknown command '" + verb + "'. Enter 'help' to list commands."
-            );
+                    "Unknown command '" + verb + "'. Enter 'help' to list commands.");
         };
     }
 

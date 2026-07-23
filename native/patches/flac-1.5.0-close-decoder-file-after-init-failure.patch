@@ -1,0 +1,21 @@
+diff --git a/src/libFLAC/stream_decoder.c b/src/libFLAC/stream_decoder.c
+--- a/src/libFLAC/stream_decoder.c
++++ b/src/libFLAC/stream_decoder.c
+@@ -620,8 +620,16 @@ FLAC_API FLAC__bool FLAC__stream_decoder_finish(FLAC__StreamDecoder *decoder)
+ 	FLAC__ASSERT(0 != decoder->private_);
+ 	FLAC__ASSERT(0 != decoder->protected_);
+ 
+-	if(decoder->protected_->state == FLAC__STREAM_DECODER_UNINITIALIZED)
++	if(decoder->protected_->state == FLAC__STREAM_DECODER_UNINITIALIZED) {
++		/* A failed file initialisation can leave the FILE assigned before
++		 * decoder state advances.  Close that owned file even though there
++		 * are no decoder buffers or codec state to finish.
++		 */
++		if(0 != decoder->private_->file && decoder->private_->file != stdin)
++			fclose(decoder->private_->file);
++		decoder->private_->file = 0;
+ 		return true;
++	}
+ 
+ 	/* see the comment in FLAC__stream_decoder_reset() as to why we
+ 	 * always call FLAC__MD5Final()

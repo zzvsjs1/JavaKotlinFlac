@@ -1,7 +1,13 @@
 package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeAccess
+import org.zzvsjs.jflac.internal.NativeHandleCleanup
+import org.zzvsjs.jflac.internal.NativeHandleReleaser
+import org.zzvsjs.jflac.internal.registerNativeHandleCleanup
+import org.zzvsjs.jflac.internal.releaseClaimedNativeHandle
+import org.zzvsjs.jflac.internal.releaseClaimedNativeHandleAfterFailure
 import java.io.InputStream
+import java.lang.ref.Reference
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
@@ -71,7 +77,19 @@ class FlacDecoder @JvmOverloads constructor(
             throw FlacDecodeException("Native decoder initialization returned an invalid handle without throwing an exception.")
         }
 
-        return NativeFlacDecodingSession(handle, streamInfo)
+        try {
+            return NativeFlacDecodingSession(handle, streamInfo)
+        } catch (t: Throwable) {
+            try {
+                NativeAccess.releaseDecoder(handle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== t) {
+                    t.addSuppressed(releaseFailure)
+                }
+            }
+
+            throw t
+        }
     }
 
     /**
@@ -90,7 +108,19 @@ class FlacDecoder @JvmOverloads constructor(
             throw FlacDecodeException("Native channel decoder initialization returned an invalid handle without throwing an exception.")
         }
 
-        return NativeFlacDecodingSession(handle, streamInfo)
+        try {
+            return NativeFlacDecodingSession(handle, streamInfo)
+        } catch (t: Throwable) {
+            try {
+                NativeAccess.releaseDecoder(handle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== t) {
+                    t.addSuppressed(releaseFailure)
+                }
+            }
+
+            throw t
+        }
     }
 
     /**
@@ -104,11 +134,12 @@ class FlacDecoder @JvmOverloads constructor(
         requireWholeStreamOptionsDisabled("pull decoder sessions")
         val inspected = inspectNativeFlacPath(path)
         FlacNativeLoader.load()
-        val result = NativeAccess.openPullDecoderFile(
+        return NativeAccess.openPullDecoderFile(
             inspected.path.absolutePathString(),
             inspected.container.nativeCode
-        )
-        return NativeFlacPullDecodingSession(result.first, result.second)
+        ) { handle, streamInfo ->
+            NativeFlacPullDecodingSession(handle, streamInfo)
+        }
     }
 
     /**
@@ -122,8 +153,9 @@ class FlacDecoder @JvmOverloads constructor(
         requireWholeStreamOptionsDisabled("pull decoder sessions")
         FlacNativeLoader.load()
         val inspected = inspectNativeFlacStream(input)
-        val result = NativeAccess.openPullDecoderStream(inspected.input, inspected.container.nativeCode)
-        return NativeFlacPullDecodingSession(result.first, result.second)
+        return NativeAccess.openPullDecoderStream(inspected.input, inspected.container.nativeCode) { handle, streamInfo ->
+            NativeFlacPullDecodingSession(handle, streamInfo)
+        }
     }
 
     /**
@@ -136,8 +168,9 @@ class FlacDecoder @JvmOverloads constructor(
         requireWholeStreamOptionsDisabled("pull decoder sessions")
         FlacNativeLoader.load()
         val container = inspectNativeFlacChannel(input)
-        val result = NativeAccess.openPullDecoderChannel(input, container.nativeCode)
-        return NativeFlacPullDecodingSession(result.first, result.second)
+        return NativeAccess.openPullDecoderChannel(input, container.nativeCode) { handle, streamInfo ->
+            NativeFlacPullDecodingSession(handle, streamInfo)
+        }
     }
 
     /**
@@ -862,14 +895,27 @@ class FlacDecoder @JvmOverloads constructor(
 /**
  * JVM-owned wrapper around one reusable native decoder handle.
  */
+private object DecoderHandleReleaser : NativeHandleReleaser {
+    override fun release(handle: Long) {
+        NativeAccess.releaseDecoder(handle)
+    }
+}
+
+private object PullDecoderHandleReleaser : NativeHandleReleaser {
+    override fun release(handle: Long) {
+        NativeAccess.releasePullDecoder(handle)
+    }
+}
+
 private class NativeFlacDecodingSession(
     initialHandle: Long,
     override val streamInfo: FlacStreamInfo
 ) : FlacDecodingSession {
     private val lock = Any()
-    private var handle: Long = initialHandle
     private var state: SessionState = SessionState.ACTIVE
     private var closeRequested: Boolean = false
+    private val cleanup = NativeHandleCleanup(initialHandle, DecoderHandleReleaser)
+    private val cleanable = registerNativeHandleCleanup(this, cleanup)
 
     override fun decodeInterleaved(
         firstSample: Long,
@@ -970,25 +1016,28 @@ private class NativeFlacDecodingSession(
     }
 
     override fun close() {
-        val currentHandle = synchronized(lock) {
-            when (state) {
-                SessionState.ACTIVE -> {
-                    val activeHandle = handle
-                    handle = 0L
-                    state = SessionState.CLOSED
-                    activeHandle
+        try {
+            val currentHandle = synchronized(lock) {
+                when (state) {
+                    SessionState.ACTIVE -> {
+                        state = SessionState.CLOSED
+                        cleanup.claimHandle()
+                    }
+                    SessionState.DECODING -> {
+                        closeRequested = true
+                        0L
+                    }
+                    SessionState.CLOSED,
+                    SessionState.FAILED -> cleanup.claimHandle()
                 }
-                SessionState.DECODING -> {
-                    closeRequested = true
-                    0L
-                }
-                SessionState.CLOSED,
-                SessionState.FAILED -> 0L
             }
-        }
 
-        if (currentHandle != 0L) {
-            NativeAccess.releaseDecoder(currentHandle)
+            if (currentHandle != 0L) {
+                releaseClaimedNativeHandle(cleanup, currentHandle, DecoderHandleReleaser)
+                cleanable.clean()
+            }
+        } finally {
+            Reference.reachabilityFence(this)
         }
     }
 
@@ -1007,23 +1056,28 @@ private class NativeFlacDecodingSession(
 
             succeeded = true
         } catch (t: Throwable) {
-            releaseAfterFailure()
+            releaseAfterFailure(t)
             throw t
         } finally {
-            if (succeeded) {
-                finishDecode()
+            try {
+                if (succeeded) {
+                    finishDecode()
+                }
+            } finally {
+                Reference.reachabilityFence(this)
             }
         }
     }
 
     private fun beginDecode(): Long {
         return synchronized(lock) {
-            if (state != SessionState.ACTIVE || handle == 0L) {
+            val currentHandle = cleanup.currentHandle()
+            if (state != SessionState.ACTIVE || currentHandle == 0L) {
                 throw IllegalStateException("The FLAC decoding session is no longer active.")
             }
 
             state = SessionState.DECODING
-            handle
+            currentHandle
         }
     }
 
@@ -1032,11 +1086,9 @@ private class NativeFlacDecodingSession(
             if (state != SessionState.DECODING) {
                 0L
             } else if (closeRequested) {
-                val activeHandle = handle
-                handle = 0L
                 closeRequested = false
                 state = SessionState.CLOSED
-                activeHandle
+                cleanup.claimHandle()
             } else {
                 state = SessionState.ACTIVE
                 0L
@@ -1044,26 +1096,37 @@ private class NativeFlacDecodingSession(
         }
 
         if (currentHandle != 0L) {
-            NativeAccess.releaseDecoder(currentHandle)
+            releaseClaimedNativeHandle(cleanup, currentHandle, DecoderHandleReleaser)
+            cleanable.clean()
         }
     }
 
-    private fun releaseAfterFailure() {
+    private fun releaseAfterFailure(failure: Throwable) {
         val currentHandle = synchronized(lock) {
-            if (state == SessionState.CLOSED || state == SessionState.FAILED || handle == 0L) {
+            if (
+                state == SessionState.CLOSED ||
+                state == SessionState.FAILED ||
+                cleanup.currentHandle() == 0L
+            ) {
                 closeRequested = false
                 0L
             } else {
-                val activeHandle = handle
-                handle = 0L
                 closeRequested = false
                 state = SessionState.FAILED
-                activeHandle
+                cleanup.claimHandle()
             }
         }
 
         if (currentHandle != 0L) {
-            NativeAccess.releaseDecoder(currentHandle)
+            val released = releaseClaimedNativeHandleAfterFailure(
+                cleanup,
+                currentHandle,
+                failure,
+                DecoderHandleReleaser
+            )
+            if (released) {
+                cleanable.clean()
+            }
         }
     }
 
@@ -1077,7 +1140,6 @@ private class NativeFlacDecodingSession(
 
 /**
  * JVM lifecycle wrapper for one native pull decoder handle.
- *
  * The native side owns libFLAC state and any long-lived stream/channel global
  * references. This wrapper serialises reads and close so Java never asks the
  * native decoder to advance while another thread is releasing the same handle.
@@ -1087,59 +1149,74 @@ private class NativeFlacPullDecodingSession(
     override val streamInfo: FlacStreamInfo
 ) : FlacPullDecodingSession {
     private val lock = Any()
-    private var handle: Long = initialHandle
+    private var active = true
+    private val cleanup = NativeHandleCleanup(initialHandle, PullDecoderHandleReleaser)
+    private val cleanable = registerNativeHandleCleanup(this, cleanup)
 
     override fun readInterleaved(interleavedSamples: IntArray, maxFrames: Int): Int {
-        return synchronized(lock) {
-            val currentHandle = handle
-            check(currentHandle != 0L) { "The FLAC pull decoding session is no longer active." }
-
-            require(maxFrames >= 0) { "Max frames must be non-negative." }
-
-            val requiredSamples = maxFrames.toLong() * streamInfo.channels.toLong()
-            require(requiredSamples <= Int.MAX_VALUE.toLong()) {
-                "Interleaved sample buffer must fit maxFrames * channels."
-            }
-
-            require(interleavedSamples.size >= requiredSamples.toInt()) {
-                "Interleaved sample buffer must fit maxFrames * channels."
-            }
-
-            if (maxFrames == 0) {
-                return@synchronized 0
-            }
-
-            try {
-                NativeAccess.readPullDecoderInterleaved(currentHandle, interleavedSamples, maxFrames)
-            } catch (t: Throwable) {
-                /*
-                 * A native/source failure can leave libFLAC in an aborted or
-                 * otherwise unreusable decoder state. Treat that the same way
-                 * reusable callback decode does: remove the Java-visible handle
-                 * immediately so later reads fail at the session boundary, and
-                 * release the native owner while preserving the original error.
-                 */
-                handle = 0L
-                try {
-                    NativeAccess.releasePullDecoder(currentHandle)
-                } catch (releaseFailure: Throwable) {
-                    t.addSuppressed(releaseFailure)
+        try {
+            return synchronized(lock) {
+                val currentHandle = cleanup.currentHandle()
+                check(active && currentHandle != 0L) {
+                    "The FLAC pull decoding session is no longer active."
                 }
 
-                throw t
+                require(maxFrames >= 0) { "Max frames must be non-negative." }
+
+                val requiredSamples = maxFrames.toLong() * streamInfo.channels.toLong()
+                require(requiredSamples <= Int.MAX_VALUE.toLong()) {
+                    "Interleaved sample buffer must fit maxFrames * channels."
+                }
+
+                require(interleavedSamples.size >= requiredSamples.toInt()) {
+                    "Interleaved sample buffer must fit maxFrames * channels."
+                }
+
+                if (maxFrames == 0) {
+                    return@synchronized 0
+                }
+
+                try {
+                    NativeAccess.readPullDecoderInterleaved(currentHandle, interleavedSamples, maxFrames)
+                } catch (t: Throwable) {
+                    /*
+                     * A native/source failure can leave libFLAC in an aborted
+                     * or otherwise unreusable decoder state. Transfer ownership
+                     * out of the Cleaner before reporting the original failure.
+                     */
+                    active = false
+                    val claimedHandle = cleanup.claimHandle()
+                    val released = releaseClaimedNativeHandleAfterFailure(
+                        cleanup,
+                        claimedHandle,
+                        t,
+                        PullDecoderHandleReleaser
+                    )
+                    if (released) {
+                        cleanable.clean()
+                    }
+
+                    throw t
+                }
             }
+        } finally {
+            Reference.reachabilityFence(this)
         }
     }
 
     override fun close() {
-        val currentHandle = synchronized(lock) {
-            val activeHandle = handle
-            handle = 0L
-            activeHandle
-        }
+        try {
+            val currentHandle = synchronized(lock) {
+                active = false
+                cleanup.claimHandle()
+            }
 
-        if (currentHandle != 0L) {
-            NativeAccess.releasePullDecoder(currentHandle)
+            if (currentHandle != 0L) {
+                releaseClaimedNativeHandle(cleanup, currentHandle, PullDecoderHandleReleaser)
+                cleanable.clean()
+            }
+        } finally {
+            Reference.reachabilityFence(this)
         }
     }
 }

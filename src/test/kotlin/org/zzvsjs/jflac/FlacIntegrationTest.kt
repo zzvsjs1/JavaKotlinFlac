@@ -3,11 +3,14 @@ package org.zzvsjs.jflac.internal
 import org.zzvsjs.jflac.*
 import org.junit.AfterClass
 import org.junit.BeforeClass
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.lang.ref.WeakReference
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.name
 import kotlin.test.Test
@@ -861,6 +864,115 @@ class FlacIntegrationTest {
     }
 
     @Test
+    fun nativeRegistryCountsTrackExplicitHandleOwnership() {
+        FlacNativeLoader.load()
+
+        val decoderBaseline = NativeBindings.activeDecoderSessionCount()
+        val decoderSession = FlacDecoder().open(sampleFile)
+        try {
+            assertEquals(decoderBaseline + 1L, NativeBindings.activeDecoderSessionCount())
+        } finally {
+            decoderSession.close()
+        }
+
+        assertEquals(decoderBaseline, NativeBindings.activeDecoderSessionCount())
+
+        val encoderBaseline = NativeBindings.activeEncoderContextCount()
+        val output = Files.createTempFile("jflac-native-registry-count", ".flac")
+        val format = FlacAudioFormat(
+            sampleRate = 44_100,
+            channels = 1,
+            bitsPerSample = 16
+        )
+
+        try {
+            val encoderSession = FlacEncoder().open(output, format)
+            try {
+                assertEquals(encoderBaseline + 1L, NativeBindings.activeEncoderContextCount())
+            } finally {
+                encoderSession.finish()
+            }
+
+            assertEquals(encoderBaseline, NativeBindings.activeEncoderContextCount())
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun pullDecoderFactoriesReleaseHandlesWhenSessionConstructionFails() {
+        FlacNativeLoader.load()
+
+        var fileHandle = 0L
+        assertFailsWith<IllegalStateException> {
+            NativeAccess.openPullDecoderFile(
+                sampleFile.toString(),
+                NativeFlacContainer.NATIVE.nativeCode
+            ) { handle, _ ->
+                fileHandle = handle
+                throw IllegalStateException("simulated file-session construction failure")
+            }
+        }
+        assertPullDecoderHandleIsStale(fileHandle)
+
+        var streamHandle = 0L
+        ByteArrayInputStream(Files.readAllBytes(sampleFile)).use { input ->
+            assertFailsWith<IllegalStateException> {
+                NativeAccess.openPullDecoderStream(
+                    input,
+                    NativeFlacContainer.NATIVE.nativeCode
+                ) { handle, _ ->
+                    streamHandle = handle
+                    throw IllegalStateException("simulated stream-session construction failure")
+                }
+            }
+        }
+        assertPullDecoderHandleIsStale(streamHandle)
+
+        var channelHandle = 0L
+        Files.newByteChannel(sampleFile).use { channel ->
+            assertFailsWith<IllegalStateException> {
+                NativeAccess.openPullDecoderChannel(
+                    channel,
+                    NativeFlacContainer.NATIVE.nativeCode
+                ) { handle, _ ->
+                    channelHandle = handle
+                    throw IllegalStateException("simulated channel-session construction failure")
+                }
+            }
+        }
+        assertPullDecoderHandleIsStale(channelHandle)
+    }
+
+    @Test
+    fun cleanerEventuallyReleasesAbandonedSessionsAndGlobalReferences() {
+        FlacNativeLoader.load()
+
+        val decoderBaseline = NativeBindings.activeDecoderSessionCount()
+        val decoderReference = abandonReusableDecoder()
+        awaitCleaner("Abandoned reusable decoder was not released.") {
+            decoderReference.get() == null &&
+                NativeBindings.activeDecoderSessionCount() == decoderBaseline
+        }
+
+        val pullBaseline = NativeBindings.activeDecoderSessionCount()
+        val pullReferences = abandonPullDecoder(Files.readAllBytes(sampleFile))
+        awaitCleaner("Abandoned pull decoder or its InputStream global reference was not released.") {
+            pullReferences.session.get() == null &&
+                pullReferences.callbackTarget.get() == null &&
+                NativeBindings.activeDecoderSessionCount() == pullBaseline
+        }
+
+        val encoderBaseline = NativeBindings.activeEncoderContextCount()
+        val encoderReferences = abandonStreamEncoder()
+        awaitCleaner("Abandoned encoder or its OutputStream global reference was not released.") {
+            encoderReferences.session.get() == null &&
+                encoderReferences.callbackTarget.get() == null &&
+                NativeBindings.activeEncoderContextCount() == encoderBaseline
+        }
+    }
+
+    @Test
     fun metadataReaderRejectsMultipleVorbisCommentBlocks() {
         val fixture = Files.createTempFile("jflac-duplicate-vorbis-fixture", ".flac")
         try {
@@ -1056,6 +1168,135 @@ class FlacIntegrationTest {
     }
 
     @Test
+    fun nativeSessionReleaseDuringChannelDecodeDefersDestruction() {
+        FlacNativeLoader.load()
+        val baseline = NativeBindings.activeDecoderSessionCount()
+
+        Files.newByteChannel(sampleFile).use { channel ->
+            val handle = NativeBindings.openDecoderChannel(channel, NativeFlacContainer.NATIVE.nativeCode)
+            val callbackEntered = CountDownLatch(1)
+            val releaseCallback = CountDownLatch(1)
+            val workerFailure = AtomicReference<Throwable?>()
+            val worker = Thread {
+                try {
+                    NativeBindings.decodeDecoderFrom(
+                        handle,
+                        0,
+                        object : PcmConsumer {
+                            override fun onStreamInfo(info: FlacStreamInfo) = Unit
+
+                            override fun onPcmInterleaved(samples: IntArray, frames: Int) {
+                                callbackEntered.countDown()
+                                check(releaseCallback.await(5, TimeUnit.SECONDS)) {
+                                    "Timed out waiting to release the decoder callback."
+                                }
+                            }
+
+                            override fun onComplete() = Unit
+                        }
+                    )
+                } catch (t: Throwable) {
+                    workerFailure.set(t)
+                }
+            }
+
+            try {
+                assertEquals(baseline + 1L, NativeBindings.activeDecoderSessionCount())
+                worker.start()
+                assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+
+                NativeBindings.releaseDecoder(handle)
+                assertEquals(baseline, NativeBindings.activeDecoderSessionCount())
+            } finally {
+                releaseCallback.countDown()
+                worker.join(5_000)
+                NativeBindings.releaseDecoder(handle)
+            }
+
+            assertTrue(!worker.isAlive)
+            workerFailure.get()?.let { throw it }
+            assertEquals(baseline, NativeBindings.activeDecoderSessionCount())
+            assertFailsWith<IllegalStateException> {
+                NativeBindings.decodeDecoderFrom(handle, 0, CollectingConsumer())
+            }
+        }
+    }
+
+    @Test
+    fun nativeEncoderReleaseDuringOutputCallbackDefersDestruction() {
+        FlacNativeLoader.load()
+        val frames = 4_096
+        val baseline = NativeBindings.activeEncoderContextCount()
+        val blockNextWrite = AtomicBoolean(false)
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val output = object : ByteArrayOutputStream() {
+            override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                if (blockNextWrite.compareAndSet(true, false)) {
+                    callbackEntered.countDown()
+                    check(releaseCallback.await(5, TimeUnit.SECONDS)) {
+                        "Timed out waiting to release the encoder callback."
+                    }
+                }
+
+                super.write(buffer, offset, length)
+            }
+        }
+        val request = NativeEncodingRequest(
+            44_100,
+            1,
+            16,
+            frames.toLong(),
+            5,
+            true,
+            true,
+            256,
+            NativeFlacContainer.NATIVE.nativeCode,
+            null,
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            emptyArray(),
+            intArrayOf(),
+            emptyArray(),
+            1
+        )
+        val handle = NativeBindings.openEncoderStream(output, request)
+        val workerFailure = AtomicReference<Throwable?>()
+        val worker = Thread {
+            try {
+                NativeBindings.writeEncoderInterleaved(handle, IntArray(frames), frames)
+            } catch (t: Throwable) {
+                workerFailure.set(t)
+            }
+        }
+
+        try {
+            assertEquals(baseline + 1L, NativeBindings.activeEncoderContextCount())
+            blockNextWrite.set(true)
+            worker.start()
+            assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+
+            NativeBindings.releaseEncoder(handle)
+            assertEquals(baseline, NativeBindings.activeEncoderContextCount())
+        } finally {
+            releaseCallback.countDown()
+            worker.join(5_000)
+            NativeBindings.releaseEncoder(handle)
+        }
+
+        assertTrue(!worker.isAlive)
+        workerFailure.get()?.let { throw it }
+        assertEquals(baseline, NativeBindings.activeEncoderContextCount())
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.writeEncoderInterleaved(handle, intArrayOf(0), 1)
+        }
+    }
+
+    @Test
     fun missingFileThrowsStableException() {
         val missing = sampleFile.resolveSibling("missing.flac")
         assertFailsWith<FlacDecodeException> {
@@ -1160,6 +1401,62 @@ class FlacIntegrationTest {
 
         assertFailsWith<IllegalArgumentException> {
             NativeBindings.decodeFile(sampleFile.toString(), NativeFlacContainer.NATIVE.nativeCode, false, false, null)
+        }
+    }
+
+    private data class AbandonedSessionReferences(
+        val session: WeakReference<*>,
+        val callbackTarget: WeakReference<*>
+    )
+
+    private fun abandonReusableDecoder(): WeakReference<FlacDecodingSession> {
+        val session = FlacDecoder().open(sampleFile)
+        return WeakReference(session)
+    }
+
+    private fun abandonPullDecoder(bytes: ByteArray): AbandonedSessionReferences {
+        val input = ByteArrayInputStream(bytes)
+        val session = FlacDecoder().openPull(input)
+        return AbandonedSessionReferences(
+            session = WeakReference(session),
+            callbackTarget = WeakReference(input)
+        )
+    }
+
+    private fun abandonStreamEncoder(): AbandonedSessionReferences {
+        val output = ByteArrayOutputStream()
+        val session = FlacEncoder().open(
+            output = output,
+            format = FlacAudioFormat(
+                sampleRate = 44_100,
+                channels = 1,
+                bitsPerSample = 16
+            )
+        )
+        return AbandonedSessionReferences(
+            session = WeakReference(session),
+            callbackTarget = WeakReference(output)
+        )
+    }
+
+    private fun awaitCleaner(message: String, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (System.nanoTime() < deadline) {
+            System.gc()
+            if (condition()) {
+                return
+            }
+
+            Thread.sleep(25)
+        }
+
+        assertTrue(condition(), message)
+    }
+
+    private fun assertPullDecoderHandleIsStale(handle: Long) {
+        assertTrue(handle > 0L, "The test factory must observe a registered native handle.")
+        assertFailsWith<IllegalStateException> {
+            NativeBindings.readPullDecoderInterleaved(handle, IntArray(8), 1)
         }
     }
 

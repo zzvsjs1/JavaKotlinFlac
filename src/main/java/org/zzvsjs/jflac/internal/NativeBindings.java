@@ -120,6 +120,12 @@ final class NativeBindings {
     public static native void releasePullDecoder(long handle);
 
     /*
+     * Package-private lifecycle diagnostics keep deterministic ownership tests
+     * inside the internal package without exposing registry details publicly.
+     */
+    static native long activeDecoderSessionCount();
+
+    /*
      * Encoder open methods return an opaque native handle. The Java/Kotlin
      * session must later call finishEncoder() for successful output or
      * releaseEncoder() to abandon a failed encoder. OutputStream and channel
@@ -143,6 +149,8 @@ final class NativeBindings {
     public static native void finishEncoder(long handle);
 
     public static native void releaseEncoder(long handle);
+
+    static native long activeEncoderContextCount();
 
     public static native boolean isSampleRateValid(int sampleRate);
 

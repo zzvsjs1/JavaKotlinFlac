@@ -100,16 +100,34 @@ internal object NativeAccess {
         NativeBindings.openDecoderChannel(input, container)
 
     @JvmSynthetic
-    fun openPullDecoderFile(path: String, container: Int): Pair<Long, FlacStreamInfo> =
-        NativeBindings.openPullDecoderFile(path, container).toPair()
+    fun <T> openPullDecoderFile(
+        path: String,
+        container: Int,
+        factory: (Long, FlacStreamInfo) -> T
+    ): T {
+        val result = NativeBindings.openPullDecoderFile(path, container)
+        return result.createSession(factory)
+    }
 
     @JvmSynthetic
-    fun openPullDecoderStream(input: InputStream, container: Int): Pair<Long, FlacStreamInfo> =
-        NativeBindings.openPullDecoderStream(input, container).toPair()
+    fun <T> openPullDecoderStream(
+        input: InputStream,
+        container: Int,
+        factory: (Long, FlacStreamInfo) -> T
+    ): T {
+        val result = NativeBindings.openPullDecoderStream(input, container)
+        return result.createSession(factory)
+    }
 
     @JvmSynthetic
-    fun openPullDecoderChannel(input: SeekableByteChannel, container: Int): Pair<Long, FlacStreamInfo> =
-        NativeBindings.openPullDecoderChannel(input, container).toPair()
+    fun <T> openPullDecoderChannel(
+        input: SeekableByteChannel,
+        container: Int,
+        factory: (Long, FlacStreamInfo) -> T
+    ): T {
+        val result = NativeBindings.openPullDecoderChannel(input, container)
+        return result.createSession(factory)
+    }
 
     @JvmSynthetic
     fun decodeDecoderFrom(handle: Long, firstSample: Long, consumer: PcmConsumer) =
@@ -193,7 +211,24 @@ internal object NativeAccess {
     @JvmSynthetic
     fun pictureViolation(picture: FlacPicture): String? = NativeBindings.pictureViolation(picture)
 
-    private fun NativePullDecoderOpenResult.toPair(): Pair<Long, FlacStreamInfo> = handle to streamInfo
+    private fun <T> NativePullDecoderOpenResult.createSession(
+        factory: (Long, FlacStreamInfo) -> T
+    ): T {
+        val openedHandle = handle
+        try {
+            return factory(openedHandle, streamInfo)
+        } catch (t: Throwable) {
+            try {
+                NativeBindings.releasePullDecoder(openedHandle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== t) {
+                    t.addSuppressed(releaseFailure)
+                }
+            }
+
+            throw t
+        }
+    }
 
     private fun encodingRequest(
         format: FlacAudioFormat,

@@ -151,7 +151,9 @@ class FlacEncoderIntegrationTest {
         val metadata = FlacEncodingMetadata(
             comments = mapOf(
                 "TITLE" to listOf("Round trip"),
-                "ARTIST" to listOf("First", "Second")
+                "ARTIST" to listOf("First", "Second"),
+                "UNICODE" to listOf("Grüße 世界"),
+                "EMPTY" to listOf("")
             )
         )
         val output = Files.createTempFile("jflac-comment-encode", ".flac")
@@ -168,6 +170,8 @@ class FlacEncoderIntegrationTest {
 
             assertEquals(listOf("Round trip"), decodedMetadata.vorbisComment?.comments?.get("TITLE"))
             assertEquals(listOf("First", "Second"), decodedMetadata.vorbisComment?.comments?.get("ARTIST"))
+            assertEquals(listOf("Grüße 世界"), decodedMetadata.vorbisComment?.comments?.get("UNICODE"))
+            assertEquals(listOf(""), decodedMetadata.vorbisComment?.comments?.get("EMPTY"))
         } finally {
             Files.deleteIfExists(output)
         }
@@ -354,7 +358,8 @@ class FlacEncoderIntegrationTest {
                 metadata = FlacEncodingMetadata(
                     paddingBlocks = listOf(FlacPaddingBlock(length = 19)),
                     unknownBlocks = listOf(
-                        FlacUnknownMetadataBlock(type = 42, data = unknownData)
+                        FlacUnknownMetadataBlock(type = 42, data = unknownData),
+                        FlacUnknownMetadataBlock(type = 43, data = byteArrayOf())
                     )
                 )
             )
@@ -362,8 +367,9 @@ class FlacEncoderIntegrationTest {
             val metadata = FlacMetadataReader().read(output)
 
             assertEquals(19, metadata.paddingBlocks.single().length)
-            assertEquals(42, metadata.unknownBlocks.single().type)
-            assertContentEquals(unknownData, metadata.unknownBlocks.single().data)
+            assertEquals(listOf(42, 43), metadata.unknownBlocks.map(FlacUnknownMetadataBlock::type))
+            assertContentEquals(unknownData, metadata.unknownBlocks[0].data)
+            assertContentEquals(byteArrayOf(), metadata.unknownBlocks[1].data)
         } finally {
             Files.deleteIfExists(output)
         }

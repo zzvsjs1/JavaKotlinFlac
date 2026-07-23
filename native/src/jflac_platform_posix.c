@@ -22,6 +22,14 @@ void jflac_mutex_unlock(JflacMutex *mutex)
     (void)pthread_mutex_unlock(&mutex->native);
 }
 
+void jflac_mutex_destroy(JflacMutex *mutex)
+{
+    if (mutex != NULL)
+    {
+        (void)pthread_mutex_destroy(&mutex->native);
+    }
+}
+
 void jflac_call_once(JflacOnce *once, JflacOnceInitialiser initialiser)
 {
     jflac_mutex_lock(&once->mutex);
@@ -36,8 +44,23 @@ void jflac_call_once(JflacOnce *once, JflacOnceInitialiser initialiser)
 
 int jflac_open_sibling_library(const char *library_filename, JflacModule *module, char *error, size_t error_size)
 {
-    module->handle = NULL;
-    module->owns_handle = 0;
+    if (module == NULL)
+    {
+        snprintf(error, error_size, "The destination module must not be null.");
+        return 0;
+    }
+
+    if (module->handle != NULL || module->owns_handle)
+    {
+        snprintf(error, error_size, "The destination module already contains a library handle.");
+        return 0;
+    }
+
+    if (library_filename == NULL)
+    {
+        snprintf(error, error_size, "The bundled library filename must not be null.");
+        return 0;
+    }
 
     Dl_info module_info;
     if (dladdr((const void *)&g_jflac_module_anchor, &module_info) == 0 || module_info.dli_fname == NULL)
@@ -81,21 +104,29 @@ int jflac_open_sibling_library(const char *library_filename, JflacModule *module
     return 1;
 }
 
-void jflac_close_library(JflacModule *module)
+int jflac_close_library(JflacModule *module)
 {
     if (module == NULL)
     {
-        return;
+        return 1;
     }
 
     if (module->handle != NULL && module->owns_handle)
     {
-        /* There is no useful recovery if the loader rejects an unload here. */
-        (void)dlclose(module->handle);
+        if (dlclose(module->handle) != 0)
+        {
+            /*
+             * Keep the owned handle visible when the loader rejects the
+             * unload. Clearing it here would lose the only retryable
+             * reference and conceal a loader-reference leak.
+             */
+            return 0;
+        }
     }
 
     module->handle = NULL;
     module->owns_handle = 0;
+    return 1;
 }
 
 int jflac_resolve_symbol(const JflacModule *module, const char *symbol_name, void *target, size_t target_size,

@@ -3,21 +3,14 @@ package org.zzvsjs.jflac.examples.playback;
 import javax.sound.sampled.AudioFormat;
 import java.nio.file.Path;
 
-/** Immutable data rendered by either a real terminal UI or a test view. */
-record PlaybackViewState(
-        boolean sessionOpen,
-        Path input,
-        PlaybackSession.State state,
-        long positionMicros,
-        long durationMicros,
-        AudioFormat sourceFormat,
-        AudioFormat playbackFormat,
-        boolean pauseRequested,
-        Throwable failure
-) {
+/**
+ * Immutable data rendered by either a real terminal UI or a test view.
+ */
+record PlaybackViewState(boolean sessionOpen, Path input, PlaybackSession.State state, long positionMicros,
+                         long durationMicros, AudioFormat sourceFormat, AudioFormat playbackFormat,
+                         boolean pauseRequested, Throwable failure) {
     static PlaybackViewState idle(Path selectedInput) {
-        return new PlaybackViewState(
-                false,
+        return new PlaybackViewState(false,
                 selectedInput,
                 PlaybackSession.State.CLOSED,
                 0L,
@@ -25,14 +18,11 @@ record PlaybackViewState(
                 null,
                 null,
                 false,
-                null
-        );
+                null);
     }
 
     boolean canControl() {
-        return sessionOpen
-                && state != PlaybackSession.State.NEW
-                && !state.isTerminal();
+        return sessionOpen && state != PlaybackSession.State.NEW && !state.isTerminal();
     }
 
     boolean canSeek() {

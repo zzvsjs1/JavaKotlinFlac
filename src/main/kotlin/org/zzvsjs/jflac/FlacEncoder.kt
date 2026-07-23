@@ -1,7 +1,13 @@
 package org.zzvsjs.jflac
 
 import org.zzvsjs.jflac.internal.NativeAccess
+import org.zzvsjs.jflac.internal.NativeHandleCleanup
+import org.zzvsjs.jflac.internal.NativeHandleReleaser
+import org.zzvsjs.jflac.internal.registerNativeHandleCleanup
+import org.zzvsjs.jflac.internal.releaseClaimedNativeHandle
+import org.zzvsjs.jflac.internal.releaseClaimedNativeHandleAfterFailure
 import java.io.OutputStream
+import java.lang.ref.Reference
 import java.nio.channels.SeekableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
@@ -101,7 +107,19 @@ class FlacEncoder {
             )
         }
 
-        return NativeFlacEncodingSession(handle, format)
+        try {
+            return NativeFlacEncodingSession(handle, format)
+        } catch (t: Throwable) {
+            try {
+                NativeAccess.releaseEncoder(handle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== t) {
+                    t.addSuppressed(releaseFailure)
+                }
+            }
+
+            throw t
+        }
     }
 
     /**
@@ -141,7 +159,19 @@ class FlacEncoder {
             )
         }
 
-        return NativeFlacEncodingSession(handle, format)
+        try {
+            return NativeFlacEncodingSession(handle, format)
+        } catch (t: Throwable) {
+            try {
+                NativeAccess.releaseEncoder(handle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== t) {
+                    t.addSuppressed(releaseFailure)
+                }
+            }
+
+            throw t
+        }
     }
 
     /**
@@ -179,7 +209,19 @@ class FlacEncoder {
             )
         }
 
-        return NativeFlacEncodingSession(handle, format)
+        try {
+            return NativeFlacEncodingSession(handle, format)
+        } catch (t: Throwable) {
+            try {
+                NativeAccess.releaseEncoder(handle)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== t) {
+                    t.addSuppressed(releaseFailure)
+                }
+            }
+
+            throw t
+        }
     }
 
     /**
@@ -253,6 +295,12 @@ class FlacEncoder {
  * The session becomes terminal after either a successful finish or a native
  * failure. Further writes are rejected to keep lifecycle bugs obvious.
  */
+private object EncoderHandleReleaser : NativeHandleReleaser {
+    override fun release(handle: Long) {
+        NativeAccess.releaseEncoder(handle)
+    }
+}
+
 private class NativeFlacEncodingSession(
     initialHandle: Long,
     private val format: FlacAudioFormat
@@ -263,77 +311,119 @@ private class NativeFlacEncodingSession(
      * clear the only Java copy of a handle before an in-flight write returns.
      */
     private val lock = Any()
-    private var handle: Long = initialHandle
     private var state: SessionState = SessionState.ACTIVE
+    private val cleanup = NativeHandleCleanup(initialHandle, EncoderHandleReleaser)
+    private val cleanable = registerNativeHandleCleanup(this, cleanup)
 
     override fun writeInterleaved(samples: IntArray, frames: Int) {
-        synchronized(lock) {
-            ensureActiveForWrite()
-            validateInterleavedPcmChunk(samples, frames, format)
-            if (frames == 0) {
-                return
-            }
+        try {
+            synchronized(lock) {
+                ensureActiveForWrite()
+                validateInterleavedPcmChunk(samples, frames, format)
+                if (frames == 0) {
+                    return@synchronized
+                }
 
-            val currentHandle = handle
-            state = SessionState.WRITING
-            try {
-                NativeAccess.writeEncoderInterleaved(currentHandle, samples, frames)
-            } catch (t: Throwable) {
-                failAndRelease(currentHandle, t)
-            }
+                val currentHandle = cleanup.currentHandle()
+                state = SessionState.WRITING
+                try {
+                    NativeAccess.writeEncoderInterleaved(currentHandle, samples, frames)
+                } catch (t: Throwable) {
+                    failAndRelease(t)
+                }
 
-            state = SessionState.ACTIVE
+                state = SessionState.ACTIVE
+            }
+        } finally {
+            Reference.reachabilityFence(this)
         }
     }
 
     override fun finish() {
-        synchronized(lock) {
-            when (state) {
-                SessionState.FINISHED,
-                SessionState.FAILED,
-                SessionState.FINISHING -> return
-                SessionState.WRITING -> throw IllegalStateException(
-                    "The FLAC encoding session cannot finish from inside an active write."
-                )
-                SessionState.ACTIVE -> state = SessionState.FINISHING
-            }
+        try {
+            synchronized(lock) {
+                when (state) {
+                    SessionState.FINISHED,
+                    SessionState.FINISHING -> return@synchronized
+                    SessionState.FAILED -> {
+                        /*
+                         * A previous abandon attempt may have restored the
+                         * handle after its native release failed. A repeated
+                         * close retries only that abandon path; it must never
+                         * try to finalise failed output.
+                         */
+                        val failedHandle = cleanup.claimHandle()
+                        if (failedHandle != 0L) {
+                            releaseClaimedNativeHandle(
+                                cleanup,
+                                failedHandle,
+                                EncoderHandleReleaser
+                            )
+                            cleanable.clean()
+                        }
 
-            val currentHandle = handle
-            try {
-                NativeAccess.finishEncoder(currentHandle)
-            } catch (t: Throwable) {
-                /*
-                 * Native finalisation normally consumes the handle even when
-                 * it fails. A failure before acquisition does not, so release
-                 * the same handle as a safe, idempotent fallback.
-                 */
-                failAndRelease(currentHandle, t)
-            }
+                        return@synchronized
+                    }
+                    SessionState.WRITING -> throw IllegalStateException(
+                        "The FLAC encoding session cannot finish from inside an active write."
+                    )
+                    SessionState.ACTIVE -> state = SessionState.FINISHING
+                }
 
-            handle = 0L
-            state = SessionState.FINISHED
+                val currentHandle = cleanup.claimHandle()
+                check(currentHandle != 0L) {
+                    "The FLAC encoding session lost ownership of its native handle."
+                }
+
+                try {
+                    NativeAccess.finishEncoder(currentHandle)
+                } catch (t: Throwable) {
+                    /*
+                     * Native finalisation normally consumes the handle even
+                     * when it fails. A failure before acquisition does not, so
+                     * abandon the same handle as an idempotent fallback.
+                     */
+                    state = SessionState.FAILED
+                    val released = releaseClaimedNativeHandleAfterFailure(
+                        cleanup,
+                        currentHandle,
+                        t,
+                        EncoderHandleReleaser
+                    )
+                    if (released) {
+                        cleanable.clean()
+                    }
+
+                    throw t
+                }
+
+                state = SessionState.FINISHED
+                cleanable.clean()
+            }
+        } finally {
+            Reference.reachabilityFence(this)
         }
     }
 
     private fun ensureActiveForWrite() {
-        if (state != SessionState.ACTIVE || handle == 0L) {
+        if (state != SessionState.ACTIVE || cleanup.currentHandle() == 0L) {
             throw IllegalStateException("The FLAC encoding session is no longer active.")
         }
     }
 
     /** Marks the session terminal and preserves the primary JNI failure. */
-    private fun failAndRelease(currentHandle: Long, failure: Throwable): Nothing {
-        handle = 0L
+    private fun failAndRelease(failure: Throwable): Nothing {
+        val currentHandle = cleanup.claimHandle()
         state = SessionState.FAILED
 
-        if (currentHandle != 0L) {
-            try {
-                NativeAccess.releaseEncoder(currentHandle)
-            } catch (releaseFailure: Throwable) {
-                if (releaseFailure !== failure) {
-                    failure.addSuppressed(releaseFailure)
-                }
-            }
+        val released = releaseClaimedNativeHandleAfterFailure(
+            cleanup,
+            currentHandle,
+            failure,
+            EncoderHandleReleaser
+        )
+        if (released) {
+            cleanable.clean()
         }
 
         throw failure

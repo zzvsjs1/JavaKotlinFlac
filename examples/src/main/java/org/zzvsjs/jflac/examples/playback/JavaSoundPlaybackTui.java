@@ -219,9 +219,7 @@ final class JavaSoundPlaybackTui {
             }
         }
 
-        if (shortcut != PlaybackShortcut.NONE) {
-            deliverEvent.set(false);
-        }
+        deliverEvent.set(false);
     }
 
     private void chooseFile() {

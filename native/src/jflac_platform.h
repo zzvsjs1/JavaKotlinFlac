@@ -60,17 +60,26 @@ typedef struct JflacModule
 
 void jflac_mutex_lock(JflacMutex *mutex);
 void jflac_mutex_unlock(JflacMutex *mutex);
+void jflac_mutex_destroy(JflacMutex *mutex);
 void jflac_call_once(JflacOnce *once, JflacOnceInitialiser initialiser);
 
-/* Opens one dynamic library by its absolute path beside the loaded JNI shim. */
+/*
+ * Opens one dynamic library by its absolute path beside the loaded JNI shim.
+ * The destination must be a non-null, empty module so an existing loader
+ * reference can never be overwritten.
+ */
 int jflac_open_sibling_library(const char *library_filename, JflacModule *module, char *error, size_t error_size);
 
 /*
  * Releases an owned loader reference and clears the module. The ownership
  * flag prevents any deliberately borrowed platform handle from being
  * unloaded, and makes this safe for partially initialised cleanup paths.
+ *
+ * Returns non-zero when no owned loader reference remains. If the platform
+ * loader rejects an unload, returns zero and leaves the module unchanged so
+ * the caller retains the only reference and may transfer or retry ownership.
  */
-void jflac_close_library(JflacModule *module);
+int jflac_close_library(JflacModule *module);
 
 /* Copies a function or data symbol address into the caller's typed pointer slot. */
 int jflac_resolve_symbol(const JflacModule *module, const char *symbol_name, void *target, size_t target_size,

@@ -16,6 +16,15 @@ void jflac_mutex_unlock(JflacMutex *mutex)
     ReleaseSRWLockExclusive(&mutex->native);
 }
 
+void jflac_mutex_destroy(JflacMutex *mutex)
+{
+    /*
+     * SRW locks do not own a separately releasable Windows resource. Keep a
+     * matching platform hook so JNI unload can release POSIX mutex resources.
+     */
+    (void)mutex;
+}
+
 void jflac_call_once(JflacOnce *once, JflacOnceInitialiser initialiser)
 {
     jflac_mutex_lock(&once->mutex);
@@ -94,8 +103,23 @@ static wchar_t *loaded_module_path(HMODULE module, char *error, size_t error_siz
 
 int jflac_open_sibling_library(const char *library_filename, JflacModule *module, char *error, size_t error_size)
 {
-    module->handle = NULL;
-    module->owns_handle = 0;
+    if (module == NULL)
+    {
+        snprintf(error, error_size, "The destination module must not be null.");
+        return 0;
+    }
+
+    if (module->handle != NULL || module->owns_handle)
+    {
+        snprintf(error, error_size, "The destination module already contains a library handle.");
+        return 0;
+    }
+
+    if (library_filename == NULL)
+    {
+        snprintf(error, error_size, "The bundled library filename must not be null.");
+        return 0;
+    }
 
     HMODULE shim_module = NULL;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -166,21 +190,30 @@ int jflac_open_sibling_library(const char *library_filename, JflacModule *module
     return 1;
 }
 
-void jflac_close_library(JflacModule *module)
+int jflac_close_library(JflacModule *module)
 {
     if (module == NULL)
     {
-        return;
+        return 1;
     }
 
     if (module->handle != NULL && module->owns_handle)
     {
         /* Only an owned LoadLibraryW reference may be passed to FreeLibrary. */
-        (void)FreeLibrary((HMODULE)module->handle);
+        if (!FreeLibrary((HMODULE)module->handle))
+        {
+            /*
+             * Keep the owned handle visible when the loader rejects the
+             * unload. Clearing it here would lose the only retryable
+             * reference and conceal a loader-reference leak.
+             */
+            return 0;
+        }
     }
 
     module->handle = NULL;
     module->owns_handle = 0;
+    return 1;
 }
 
 int jflac_resolve_symbol(const JflacModule *module, const char *symbol_name, void *target, size_t target_size,
