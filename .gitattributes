@@ -1,0 +1,7 @@
+# FLAC release archives use LF line endings, so patches must retain LF
+# context on Windows as well as Linux and macOS.
+*.patch text eol=lf
+
+# Keep each Gradle launcher in the line-ending form expected by its shell.
+/gradlew text eol=lf
+/gradlew.bat text eol=crlf
