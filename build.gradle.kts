@@ -158,6 +158,8 @@ val oggArchive = layout.buildDirectory.file("downloads/libogg-$oggVersion.tar.xz
 val oggSourceParentDir = layout.buildDirectory.dir("ogg-source")
 val oggSourceDir = oggSourceParentDir.map { it.dir("libogg-$oggVersion") }
 val oggBuildDir = layout.buildDirectory.dir("ogg-native")
+val oggBuildIncludeDir = oggBuildDir.map { it.dir("include") }
+val oggGeneratedConfigHeader = oggBuildIncludeDir.map { it.file("ogg/config_types.h") }
 val oggStaticLibrary = oggBuildDir.map { it.file(activeNativeTarget.oggStaticRelativePath) }
 val javaHomeDir = file(System.getProperty("java.home"))
 val jniIncludeDir = javaHomeDir.resolve("include")
@@ -543,6 +545,7 @@ val buildOggNative by tasks.registering(Exec::class) {
     inputs.property("msvcRuntimeLibrary", msvcRuntimeLibrary)
     inputs.property("nativePlatform", nativePlatformId)
     outputs.file(oggStaticLibrary)
+    outputs.file(oggGeneratedConfigHeader)
     onlyIf { nativeTarget != null }
 
     doFirst {
@@ -604,6 +607,7 @@ val buildFlacNative by tasks.registering(Exec::class) {
     dependsOn(extractFlacSource, buildOggNative)
     inputs.dir(flacSourceDir)
     inputs.dir(oggSourceDir.map { it.dir("include") })
+    inputs.file(oggGeneratedConfigHeader)
     inputs.file(oggStaticLibrary)
     inputs.property("msvcRuntimeLibrary", msvcRuntimeLibrary)
     inputs.property("nativePlatform", nativePlatformId)
@@ -637,7 +641,11 @@ val buildFlacNative by tasks.registering(Exec::class) {
                         "-DBUILD_SHARED_LIBS=ON",
                         "-DWITH_OGG=ON",
                         "-DENABLE_MULTITHREADING=ON",
-                        "-DOGG_INCLUDE_DIR=\"${oggSourceDir.get().dir("include").asFile.cmdPath()}\"",
+                        /*
+                         * libogg keeps its public source headers in the source tree, but
+                         * CMake generates config_types.h in the build tree. libFLAC needs both.
+                         */
+                        "-DOGG_INCLUDE_DIR=\"${oggSourceDir.get().dir("include").asFile.cmdPath()};${oggBuildIncludeDir.get().asFile.cmdPath()}\"",
                         "-DOGG_LIBRARY=\"${oggStaticLibrary.get().asFile.cmdPath()}\"",
                         "-DBUILD_CXXLIBS=OFF",
                         "-DBUILD_PROGRAMS=OFF",
@@ -662,7 +670,7 @@ val buildFlacNative by tasks.registering(Exec::class) {
                 "-DBUILD_SHARED_LIBS=ON",
                 "-DWITH_OGG=ON",
                 "-DENABLE_MULTITHREADING=ON",
-                "-DOGG_INCLUDE_DIR=${oggSourceDir.get().dir("include").asFile.absolutePath}",
+                "-DOGG_INCLUDE_DIR=${oggSourceDir.get().dir("include").asFile.absolutePath};${oggBuildIncludeDir.get().asFile.absolutePath}",
                 "-DOGG_LIBRARY=${oggStaticLibrary.get().asFile.absolutePath}",
                 "-DBUILD_CXXLIBS=OFF",
                 "-DBUILD_PROGRAMS=OFF",
