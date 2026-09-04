@@ -2442,12 +2442,14 @@ typedef struct DecodeContext
     jlong channel_base_offset;
 
     /*
-     * libFLAC reports detailed decoder errors through the error callback, but
-     * the failing API call often only returns false. These fields remember the
-     * last callback status so Java receives an actionable exception message.
+     * libFLAC reports stream errors through the error callback. Some of those
+     * errors are deliberately non-fatal to libFLAC, so process_* can return
+     * true after reporting corruption such as a frame CRC mismatch. These
+     * fields make every reported stream error visible to Java and retain the
+     * first status so later resynchronisation errors do not hide the cause.
      */
     int saw_error;
-    FLAC__StreamDecoderErrorStatus last_error_status;
+    FLAC__StreamDecoderErrorStatus first_error_status;
 
     /*
      * Reusable sessions read metadata when the native decoder is opened. During
@@ -3054,7 +3056,8 @@ static FLAC__bool process_decode_stream(FLAC__StreamDecoder *decoder, DecodeCont
             for (;;)
             {
                 FLAC__bool link_success = g_flac_api.stream_decoder_process_until_end_of_link(decoder);
-                if (!link_success || (*context->env)->ExceptionCheck(context->env))
+                if (!link_success || context->saw_error ||
+                    (*context->env)->ExceptionCheck(context->env))
                 {
                     return false;
                 }
@@ -3075,7 +3078,13 @@ static FLAC__bool process_decode_stream(FLAC__StreamDecoder *decoder, DecodeCont
                     return false;
                 }
 
-                if (!g_flac_api.stream_decoder_finish_link(decoder))
+                FLAC__bool finish_link_success = g_flac_api.stream_decoder_finish_link(decoder);
+                if (context->saw_error)
+                {
+                    return false;
+                }
+
+                if (!finish_link_success)
                 {
                     context->chained_link_md5_failed = 1;
                     return false;
@@ -3083,7 +3092,8 @@ static FLAC__bool process_decode_stream(FLAC__StreamDecoder *decoder, DecodeCont
             }
         }
 
-        return g_flac_api.stream_decoder_process_until_end_of_stream(decoder);
+        FLAC__bool success = g_flac_api.stream_decoder_process_until_end_of_stream(decoder);
+        return success && !context->saw_error;
     }
 
     /*
@@ -3101,7 +3111,7 @@ static FLAC__bool process_decode_stream(FLAC__StreamDecoder *decoder, DecodeCont
         }
 
         FLAC__bool success = g_flac_api.stream_decoder_process_single(decoder);
-        if (!success)
+        if (!success || context->saw_error)
         {
             return false;
         }
@@ -3706,6 +3716,17 @@ static FLAC__StreamDecoderWriteStatus decode_write_callback(const FLAC__StreamDe
         return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
     }
 
+    /*
+     * Once libFLAC has reported stream corruption, do not forward later PCM
+     * from the same process call. This is especially important for recovery
+     * paths that synthesise silence for a missing frame: Java must observe an
+     * exception, not a successful-looking chunk that was absent from the file.
+     */
+    if (context->saw_error)
+    {
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+
     if (context->pull_mode)
     {
         return decode_pull_write_callback(env, context, frame, buffer);
@@ -3881,8 +3902,9 @@ static void decode_metadata_callback(const FLAC__StreamDecoder *decoder, const F
 
 /*
  * libFLAC error callback. The callback cannot throw directly as the final
- * error because libFLAC returns through a later API call, so it records status
- * for the caller to include in the eventual Java exception.
+ * error because libFLAC can continue processing after non-fatal stream
+ * corruption. It records status so the surrounding operation can fail after
+ * libFLAC unwinds and include the status in the Java exception.
  */
 static void decode_error_callback(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status,
                                   void *client_data)
@@ -3890,12 +3912,18 @@ static void decode_error_callback(const FLAC__StreamDecoder *decoder, FLAC__Stre
     (void)decoder;
     DecodeContext *context = (DecodeContext *)client_data;
     /*
-     * Do not throw directly from libFLAC's error callback. The surrounding
-     * process_* call will return false, and the entry point can then build one
-     * Java exception that includes both the decoder state and callback status.
+     * Do not throw directly from libFLAC's error callback. In particular, a
+     * frame CRC mismatch can still let process_single() return true, while
+     * recovery from missing frames can pass synthetic silence to the write
+     * callback. Entry points therefore inspect saw_error independently of the
+     * process_* boolean result.
      */
+    if (!context->saw_error)
+    {
+        context->first_error_status = status;
+    }
+
     context->saw_error = 1;
-    context->last_error_status = status;
 }
 
 /*
@@ -4025,19 +4053,19 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
          * before any seek is attempted.
          */
         FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(decoder);
-        if (!(*env)->ExceptionCheck(env) && !metadata_success)
+        if (!(*env)->ExceptionCheck(env) && (!metadata_success || context.saw_error))
         {
             const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
             char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
             snprintf(buffer, sizeof(buffer), "FLAC decoding failed while reading metadata%s%s%s%s%s.",
                      state != NULL ? ": " : "", state != NULL ? state : "",
                      context.saw_error ? " (decoder error callback: " : "",
-                     context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                     context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                      context.saw_error ? ")" : "");
             throw_decode_exception(env, buffer);
         }
 
-        if ((*env)->ExceptionCheck(env) || !metadata_success)
+        if ((*env)->ExceptionCheck(env) || !metadata_success || context.saw_error)
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
@@ -4072,18 +4100,18 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
 
         FLAC__bool seek_success =
             first_sample == 0 ? true : g_flac_api.stream_decoder_seek_absolute(decoder, (FLAC__uint64)first_sample);
-        if (!(*env)->ExceptionCheck(env) && !seek_success)
+        if (!(*env)->ExceptionCheck(env) && (!seek_success || context.saw_error))
         {
             const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
             char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
             snprintf(buffer, sizeof(buffer), "FLAC decoding failed while seeking%s%s%s%s%s.", state != NULL ? ": " : "",
                      state != NULL ? state : "", context.saw_error ? " (decoder error callback: " : "",
-                     context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                     context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                      context.saw_error ? ")" : "");
             throw_decode_exception(env, buffer);
         }
 
-        if ((*env)->ExceptionCheck(env) || !seek_success)
+        if ((*env)->ExceptionCheck(env) || !seek_success || context.saw_error)
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
@@ -4114,7 +4142,7 @@ static void decode_file_internal(JNIEnv *env, jstring path, jint container, jboo
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC decoding failed%s%s%s%s%s.", state != NULL ? ": " : "",
                  state != NULL ? state : "", context.saw_error ? " (decoder error callback: " : "",
-                 context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                 context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                  context.saw_error ? ")" : "");
         throw_decode_exception(env, buffer);
     }
@@ -4226,7 +4254,7 @@ static void decode_stream_internal(JNIEnv *env, jobject input_stream, jint conta
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC stream decoding failed%s%s%s%s%s.", state != NULL ? ": " : "",
                  state != NULL ? state : "", context.saw_error ? " (decoder error callback: " : "",
-                 context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                 context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                  context.saw_error ? ")" : "");
         throw_decode_exception(env, buffer);
     }
@@ -4347,19 +4375,19 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
          * Java exception and skips the synthetic native error.
          */
         FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(decoder);
-        if (!(*env)->ExceptionCheck(env) && !metadata_success)
+        if (!(*env)->ExceptionCheck(env) && (!metadata_success || context.saw_error))
         {
             const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
             char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
             snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed while reading metadata%s%s%s%s%s.",
                      state != NULL ? ": " : "", state != NULL ? state : "",
                      context.saw_error ? " (decoder error callback: " : "",
-                     context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                     context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                      context.saw_error ? ")" : "");
             throw_decode_exception(env, buffer);
         }
 
-        if ((*env)->ExceptionCheck(env) || !metadata_success)
+        if ((*env)->ExceptionCheck(env) || !metadata_success || context.saw_error)
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
@@ -4401,19 +4429,19 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
          */
         FLAC__bool seek_success =
             first_sample == 0 ? true : g_flac_api.stream_decoder_seek_absolute(decoder, (FLAC__uint64)first_sample);
-        if (!(*env)->ExceptionCheck(env) && !seek_success)
+        if (!(*env)->ExceptionCheck(env) && (!seek_success || context.saw_error))
         {
             const char *state = g_flac_api.stream_decoder_get_resolved_state_string(decoder);
             char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
             snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed while seeking%s%s%s%s%s.",
                      state != NULL ? ": " : "", state != NULL ? state : "",
                      context.saw_error ? " (decoder error callback: " : "",
-                     context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                     context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                      context.saw_error ? ")" : "");
             throw_decode_exception(env, buffer);
         }
 
-        if ((*env)->ExceptionCheck(env) || !seek_success)
+        if ((*env)->ExceptionCheck(env) || !seek_success || context.saw_error)
         {
             g_flac_api.stream_decoder_finish(decoder);
             g_flac_api.stream_decoder_delete(decoder);
@@ -4440,7 +4468,7 @@ static void decode_channel_internal(JNIEnv *env, jobject channel, jint container
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC channel decoding failed%s%s%s%s%s.", state != NULL ? ": " : "",
                  state != NULL ? state : "", context.saw_error ? " (decoder error callback: " : "",
-                 context.saw_error ? decoder_error_status_name(context.last_error_status) : "",
+                 context.saw_error ? decoder_error_status_name(context.first_error_status) : "",
                  context.saw_error ? ")" : "");
         throw_decode_exception(env, buffer);
     }
@@ -4660,14 +4688,14 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
      * metadata-ready state and later decode calls start by seeking.
      */
     FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(session->decoder);
-    if (!metadata_success)
+    if (!metadata_success || session->context.saw_error)
     {
         const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC decoder session failed while reading metadata%s%s%s%s%s.",
                  state != NULL ? ": " : "", state != NULL ? state : "",
                  session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         destroy_decode_session(env, session);
         throw_decode_exception(env, buffer);
@@ -4757,21 +4785,22 @@ JNIEXPORT jlong JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_openDecode
     }
 
     FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(session->decoder);
-    if (!(*env)->ExceptionCheck(env) && !metadata_success)
+    if (!(*env)->ExceptionCheck(env) &&
+        (!metadata_success || session->context.saw_error))
     {
         const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC channel decoder session failed while reading metadata%s%s%s%s%s.",
                  state != NULL ? ": " : "", state != NULL ? state : "",
                  session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         destroy_decode_session(env, session);
         throw_decode_exception(env, buffer);
         return 0;
     }
 
-    if ((*env)->ExceptionCheck(env) || !metadata_success)
+    if ((*env)->ExceptionCheck(env) || !metadata_success || session->context.saw_error)
     {
         destroy_decode_session(env, session);
         return 0;
@@ -4868,21 +4897,22 @@ static jobject open_pull_decoder_internal(JNIEnv *env, char *utf8_path, jobject 
      * directly to decoder progress without a background thread.
      */
     FLAC__bool metadata_success = g_flac_api.stream_decoder_process_until_end_of_metadata(session->decoder);
-    if (!(*env)->ExceptionCheck(env) && !metadata_success)
+    if (!(*env)->ExceptionCheck(env) &&
+        (!metadata_success || session->context.saw_error))
     {
         const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC pull decoder failed while reading metadata%s%s%s%s%s.",
                  state != NULL ? ": " : "", state != NULL ? state : "",
                  session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         destroy_decode_session(env, session);
         throw_decode_exception(env, buffer);
         return NULL;
     }
 
-    if ((*env)->ExceptionCheck(env) || !metadata_success)
+    if ((*env)->ExceptionCheck(env) || !metadata_success || session->context.saw_error)
     {
         destroy_decode_session(env, session);
         return NULL;
@@ -5072,14 +5102,15 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      * next decode repositions that same decoder with seek_absolute().
      */
     FLAC__bool seek_success = g_flac_api.stream_decoder_seek_absolute(session->decoder, (FLAC__uint64)first_sample);
-    if (!(*env)->ExceptionCheck(env) && !seek_success)
+    if (!(*env)->ExceptionCheck(env) &&
+        (!seek_success || session->context.saw_error))
     {
         const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC decoder session failed while seeking%s%s%s%s%s.",
                  state != NULL ? ": " : "", state != NULL ? state : "",
                  session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         /*
          * consumer is a local reference owned by this JNI call. Clear it before
@@ -5093,13 +5124,14 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
     }
 
     FLAC__bool success = g_flac_api.stream_decoder_process_until_end_of_stream(session->decoder);
-    if (!(*env)->ExceptionCheck(env) && !success)
+    if (!(*env)->ExceptionCheck(env) &&
+        (!success || session->context.saw_error))
     {
         const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC decoder session failed%s%s%s%s%s.", state != NULL ? ": " : "",
                  state != NULL ? state : "", session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         /*
          * Clear the local consumer reference on all early exits. The Kotlin
@@ -5221,14 +5253,15 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
      * that cropped callback succeeds.
      */
     FLAC__bool seek_success = g_flac_api.stream_decoder_seek_absolute(session->decoder, (FLAC__uint64)first_sample);
-    if (!(*env)->ExceptionCheck(env) && !seek_success)
+    if (!(*env)->ExceptionCheck(env) &&
+        (!seek_success || session->context.saw_error))
     {
         const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC decoder session failed while seeking%s%s%s%s%s.",
                  state != NULL ? ": " : "", state != NULL ? state : "",
                  session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         session->context.consumer = NULL;
         throw_decode_exception(env, buffer);
@@ -5243,7 +5276,7 @@ JNIEXPORT void JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_decodeDecod
         char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
         snprintf(buffer, sizeof(buffer), "FLAC decoder session failed%s%s%s%s%s.", state != NULL ? ": " : "",
                  state != NULL ? state : "", session->context.saw_error ? " (decoder error callback: " : "",
-                 session->context.saw_error ? decoder_error_status_name(session->context.last_error_status) : "",
+                 session->context.saw_error ? decoder_error_status_name(session->context.first_error_status) : "",
                  session->context.saw_error ? ")" : "");
         session->context.consumer = NULL;
         throw_decode_exception(env, buffer);
@@ -5354,13 +5387,13 @@ JNIEXPORT jint JNICALL Java_org_zzvsjs_jflac_internal_NativeBindings_readPullDec
             return 0;
         }
 
-        if (!success)
+        if (!success || context->saw_error)
         {
             const char *state = g_flac_api.stream_decoder_get_resolved_state_string(session->decoder);
             char buffer[JFLAC_MESSAGE_BUFFER_SIZE];
             snprintf(buffer, sizeof(buffer), "FLAC pull decoder failed%s%s%s%s%s.", state != NULL ? ": " : "",
                      state != NULL ? state : "", context->saw_error ? " (decoder error callback: " : "",
-                     context->saw_error ? decoder_error_status_name(context->last_error_status) : "",
+                     context->saw_error ? decoder_error_status_name(context->first_error_status) : "",
                      context->saw_error ? ")" : "");
             context->pull_output = NULL;
             release_decode_session_reference(env, session);

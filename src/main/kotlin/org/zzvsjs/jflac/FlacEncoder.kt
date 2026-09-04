@@ -35,6 +35,10 @@ private const val FLAC_METADATA_MAX_BLOCK_LENGTH = 0xFF_FFFF
 /* PICTURE has eight 32-bit scalar fields around its MIME, description and image bytes. */
 private const val FLAC_PICTURE_FIXED_FIELD_BYTES = 32
 
+/* FLAC STREAMINFO stores frame block sizes in an unsigned 16-bit field. */
+private const val FLAC_MIN_BLOCK_SIZE = 16
+private const val FLAC_MAX_BLOCK_SIZE = 65_535
+
 /**
  * FLAC encoder backed by libFLAC.
  *
@@ -91,7 +95,7 @@ class FlacEncoder {
     ): FlacEncodingSession {
         val normalizedOutput = validateNativeFlacOutputPath(output)
         validateFlacAudioFormat(format)
-        validateFlacEncodingOptions(options)
+        validateFlacEncodingOptions(options, format)
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
@@ -143,7 +147,7 @@ class FlacEncoder {
         options: FlacEncodingOptions = FlacEncodingOptions()
     ): FlacEncodingSession {
         validateFlacAudioFormat(format)
-        validateFlacEncodingOptions(options)
+        validateFlacEncodingOptions(options, format)
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
@@ -193,7 +197,7 @@ class FlacEncoder {
         options: FlacEncodingOptions = FlacEncodingOptions()
     ): FlacEncodingSession {
         validateFlacAudioFormat(format)
-        validateFlacEncodingOptions(options)
+        validateFlacEncodingOptions(options, format)
         validateFlacEncodingMetadata(metadata)
 
         FlacNativeLoader.load()
@@ -445,7 +449,9 @@ private class NativeFlacEncodingSession(
  * callers get stable argument errors before the JNI boundary is crossed.
  */
 internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
-    require(format.sampleRate > 0) { "Sample rate must be positive." }
+    require(format.sampleRate > 0 && FlacFormat.isSampleRateValid(format.sampleRate)) {
+        "Sample rate must be between 1 and 1048575 Hz."
+    }
 
     require(format.channels in 1..8) { "Channel count must be between 1 and 8." }
 
@@ -459,18 +465,38 @@ internal fun validateFlacAudioFormat(format: FlacAudioFormat) {
 /**
  * Validates user-facing encoder options before JNI is entered.
  *
- * V1 intentionally exposes a small option subset, so the validation rules stay
- * easy to understand and mirror the wrapper contract closely.
+ * Block-size and streamable-subset checks depend on the audio sample rate, so
+ * this validator accepts the already validated [format] alongside [options].
+ * Using [FlacFormat] here keeps every encoder transport aligned with the exact
+ * libFLAC rules exposed by the public validation API.
  */
-internal fun validateFlacEncodingOptions(options: FlacEncodingOptions) {
+internal fun validateFlacEncodingOptions(options: FlacEncodingOptions, format: FlacAudioFormat) {
     require(options.compressionLevel in 0..8) { "Compression level must be between 0 and 8." }
 
-    require(options.blockSize == null || options.blockSize > 0) { "Block size must be positive when provided." }
+    options.blockSize?.let { blockSize ->
+        require(blockSize in FLAC_MIN_BLOCK_SIZE..FLAC_MAX_BLOCK_SIZE) {
+            "Block size must be between $FLAC_MIN_BLOCK_SIZE and $FLAC_MAX_BLOCK_SIZE samples."
+        }
+    }
 
     require(options.numThreads in 1..128) { "Encoder thread count must be between 1 and 128." }
 
     require(options.container == FlacEncodingContainer.OGG || options.oggSerialNumber == null) {
         "Ogg serial number can only be set for Ogg FLAC encoding."
+    }
+
+    if (!options.streamableSubset) {
+        return
+    }
+
+    require(FlacFormat.isSampleRateSubset(format.sampleRate)) {
+        "Sample rate ${format.sampleRate} Hz is not permitted by the FLAC streamable subset."
+    }
+
+    options.blockSize?.let { blockSize ->
+        require(FlacFormat.isBlockSizeSubset(blockSize, format.sampleRate)) {
+            "Block size $blockSize is not permitted by the FLAC streamable subset at ${format.sampleRate} Hz."
+        }
     }
 }
 

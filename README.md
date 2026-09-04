@@ -55,6 +55,33 @@ root and under `build/native`.
 .\gradlew.bat buildNative
 ```
 
+### Extended verification
+
+The ordinary `test` and `build` tasks exclude external-tool, long-file, and
+fuzz workloads so local feedback remains bounded. Run their dedicated tasks
+when changing codec boundaries, native callbacks, or seek behaviour.
+
+The long-file suite creates more decoded PCM than its 96 MiB test heap can
+hold, streams the whole file, checks retained heap after collection, and then
+performs 128 deterministic random seeks. It gates both elapsed time and the
+logical bytes read through the seekable channel:
+
+```powershell
+.\gradlew.bat longFilePerformanceTest
+```
+
+On Linux x86_64 with Clang, the sanitizer aggregate runs the JVM integration
+tests against ASan/UBSan-instrumented libFLAC and JNI libraries, then gives the
+decoder and metadata libFuzzer targets a bounded deterministic smoke budget:
+
+```bash
+bash ./gradlew nativeSanitizerSmoke --no-daemon --stacktrace
+```
+
+See `native/fuzz/README.md` for corpus layout, individual fuzz tasks, limits,
+and longer local fuzzing commands. The CI workflow runs both extended suites
+on Linux; they are not part of the published runtime.
+
 The cross-platform workflow builds the four native resource trees separately.
 Its aggregate job supplies them through `jflac.nativeBundleDirectory`, verifies
 that all eight shared-library entries are present without duplicates, and

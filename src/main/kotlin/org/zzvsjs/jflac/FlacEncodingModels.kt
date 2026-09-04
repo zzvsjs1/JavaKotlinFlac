@@ -10,8 +10,8 @@ package org.zzvsjs.jflac
  * sample array with 2,000 values contains 1,000 frames because every frame has
  * one left sample and one right sample.
  *
- * @property sampleRate sample rate in hertz. It must be positive and should
- *   pass [FlacFormat.isSampleRateValid] when accepting user input.
+ * @property sampleRate sample rate in hertz. It must be positive and pass
+ *   [FlacFormat.isSampleRateValid].
  * @property channels channel count, currently limited to `1..8` by the wrapper
  *   and libFLAC stream constraints.
  * @property bitsPerSample signed PCM bit depth. Values must fit the declared
@@ -47,9 +47,8 @@ enum class FlacEncodingContainer(internal val nativeCode: Int) {
  *   usually spend more CPU to reduce file size.
  * @property verify enables libFLAC's encode verification pass.
  * @property streamableSubset keeps output inside FLAC's streamable subset.
- * @property blockSize optional frame block size. Non-null values must be
- *   positive and should pass [FlacFormat.isBlockSizeSubset] when
- *   [streamableSubset] is true.
+ * @property blockSize optional frame block size in `16..65535`. It must pass
+ *   [FlacFormat.isBlockSizeSubset] when [streamableSubset] is true.
  * @property container selects native FLAC or Ogg FLAC. File extensions are not
  *   inspected by the encoder.
  * @property oggSerialNumber optional Ogg stream serial number. It is only valid

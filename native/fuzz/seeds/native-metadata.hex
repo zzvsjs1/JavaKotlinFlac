@@ -1,0 +1,13 @@
+# Valid native FLAC metadata: STREAMINFO followed by an empty Vorbis comment.
+# It deliberately has no audio frames so metadata-only paths stay inexpensive.
+66 4c 61 43
+00 00 00 22
+00 10 00 10
+00 00 00
+00 00 00
+01 f4 00 f0 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+84 00 00 08
+00 00 00 00
+00 00 00 00

@@ -1,0 +1,5 @@
+# Native FLAC marker followed by a final metadata block whose declared length
+# is intentionally larger than the remaining input.
+66 4c 61 43
+84 ff ff ff
+00
