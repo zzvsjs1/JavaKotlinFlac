@@ -270,6 +270,10 @@ final class JavaSoundPlaybackTui {
     }
 
     private void seekToMicros(long targetMicros) {
+        if (!controller.viewState().canSeek()) {
+            return;
+        }
+
         runAction(
                 () -> controller.seekToMicros(targetMicros),
                 "Seeking to " + PlaybackArguments.formatTime(targetMicros) + ".",
@@ -278,6 +282,10 @@ final class JavaSoundPlaybackTui {
     }
 
     private void seekByMicros(long deltaMicros) {
+        if (!controller.viewState().canSeek()) {
+            return;
+        }
+
         runAction(
                 () -> controller.seekByMicros(deltaMicros),
                 deltaMicros < 0L ? "Seeking backwards." : "Seeking forwards.",
@@ -382,9 +390,9 @@ final class JavaSoundPlaybackTui {
         );
 
         seekBar.setTimeline(view.positionMicros(), view.durationMicros(), view.canSeek());
-        boolean canControl = view.canControl();
-        backwardsButton.setEnabled(canControl);
-        forwardsButton.setEnabled(canControl);
+        boolean canSeek = view.canSeek();
+        backwardsButton.setEnabled(canSeek);
+        forwardsButton.setEnabled(canSeek);
         stopButton.setEnabled(view.sessionOpen());
         playPauseButton.setEnabled(view.input() != null);
         playPauseButton.setLabel(view.playPauseLabel());

@@ -20,8 +20,7 @@ void jflac_fuzz_transport_init(JflacFuzzTransport *transport, const uint8_t *dat
 
 size_t jflac_fuzz_transport_read(JflacFuzzTransport *transport, void *destination, size_t requested_bytes)
 {
-    if (transport == NULL || destination == NULL || requested_bytes == 0u ||
-        transport->position >= transport->size)
+    if (transport == NULL || destination == NULL || requested_bytes == 0u || transport->position >= transport->size)
     {
         return 0u;
     }
@@ -38,11 +37,8 @@ size_t jflac_fuzz_transport_read(JflacFuzzTransport *transport, void *destinatio
     return copy_size;
 }
 
-size_t jflac_fuzz_transport_read_records(
-    JflacFuzzTransport *transport,
-    void *destination,
-    size_t record_size,
-    size_t requested_records)
+size_t jflac_fuzz_transport_read_records(JflacFuzzTransport *transport, void *destination, size_t record_size,
+                                         size_t requested_records)
 {
     if (transport == NULL || destination == NULL || record_size == 0u || requested_records == 0u ||
         transport->position >= transport->size)

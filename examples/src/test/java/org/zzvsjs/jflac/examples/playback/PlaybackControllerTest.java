@@ -77,6 +77,33 @@ public final class PlaybackControllerTest {
     }
 
     @Test
+    public void unknownDurationRejectsBothSeeksButRetainsPauseAndStop() throws Exception {
+        assertUnavailableSeekPolicy(-1L);
+    }
+
+    @Test
+    public void zeroDurationRejectsBothSeeksButRetainsPauseAndStop() throws Exception {
+        assertUnavailableSeekPolicy(0L);
+    }
+
+    private static void assertUnavailableSeekPolicy(long durationMicros) throws Exception {
+        FakeFactory factory = new FakeFactory();
+        try (PlaybackController controller = new PlaybackController(factory)) {
+            controller.open(Path.of("music.flac"), 0L, false);
+            FakeSession session = factory.sessions.get(0);
+            session.durationMicros = durationMicros;
+
+            assertFalse(controller.viewState().canSeek());
+            assertThrows(IllegalStateException.class, () -> controller.seekToMicros(1_000_000L));
+            assertThrows(IllegalStateException.class, () -> controller.seekByMicros(1_000_000L));
+            assertTrue(session.absoluteSeeks.isEmpty());
+            assertTrue(session.relativeSeeks.isEmpty());
+            assertEquals(PlaybackSession.State.PAUSED, controller.togglePlayPause().state());
+            assertFalse(controller.stop().sessionOpen());
+            assertTrue(session.closed);
+        }
+    }
+    @Test
     public void endedTrackIsReopenedWhenPlayIsRequested() throws Exception {
         FakeFactory factory = new FakeFactory();
         try (PlaybackController controller = new PlaybackController(factory)) {
@@ -152,6 +179,7 @@ public final class PlaybackControllerTest {
 
         private State state = State.NEW;
         private long positionMicros;
+        private long durationMicros = 120_000_000L;
         private long startedAtMicros;
         private boolean startedPaused;
         private int toggleCount;
@@ -221,7 +249,7 @@ public final class PlaybackControllerTest {
 
         @Override
         public Snapshot snapshot() {
-            return new Snapshot(input, state, positionMicros, 120_000_000L, null);
+            return new Snapshot(input, state, positionMicros, durationMicros, null);
         }
 
         @Override

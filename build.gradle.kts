@@ -4,6 +4,8 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.gradle.api.publish.maven.tasks.PublishToMavenLocal
 import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
 import org.gradle.jvm.tasks.Jar
+import org.gradle.api.file.Directory
+import org.gradle.api.provider.Provider
 import java.io.ByteArrayOutputStream
 import java.net.URI
 import java.security.MessageDigest
@@ -165,6 +167,9 @@ val oggSourceSha256 = "5c8253428e181840cd20d41f3ca16557a9cc04bad4a3d04cce8480867
 val oggArchive = layout.buildDirectory.file("downloads/libogg-$oggVersion.tar.xz")
 val oggSourceParentDir = layout.buildDirectory.dir("ogg-source")
 val oggSourceDir = oggSourceParentDir.map { it.dir("libogg-$oggVersion") }
+val oggVendorPatches = listOf(
+    layout.projectDirectory.file("native/patches/libogg-1.3.6-avoid-null-sync-buffer-offset.patch")
+)
 val oggBuildDir = layout.buildDirectory.dir("ogg-native")
 val oggBuildIncludeDir = oggBuildDir.map { it.dir("include") }
 val oggGeneratedConfigHeader = oggBuildIncludeDir.map { it.file("ogg/config_types.h") }
@@ -173,6 +178,10 @@ val nativeSanitizerOggBuildDir = layout.buildDirectory.dir("ogg-native-sanitizer
 val nativeSanitizerOggIncludeDir = nativeSanitizerOggBuildDir.map { it.dir("include") }
 val nativeSanitizerOggConfigHeader = nativeSanitizerOggIncludeDir.map { it.file("ogg/config_types.h") }
 val nativeSanitizerOggLibrary = nativeSanitizerOggBuildDir.map { it.file("lib/libogg.a") }
+val nativeFuzzOggBuildDir = layout.buildDirectory.dir("ogg-native-fuzz")
+val nativeFuzzOggIncludeDir = nativeFuzzOggBuildDir.map { it.dir("include") }
+val nativeFuzzOggConfigHeader = nativeFuzzOggIncludeDir.map { it.file("ogg/config_types.h") }
+val nativeFuzzOggLibrary = nativeFuzzOggBuildDir.map { it.file("lib/libogg.a") }
 val nativeSanitizerFlacBuildDir = layout.buildDirectory.dir("flac-native-sanitizer")
 val nativeSanitizerFlacLibrary = nativeSanitizerFlacBuildDir.map { it.file("lib/libFLAC.a") }
 val nativeSanitizerSharedFlacBuildDir = layout.buildDirectory.dir("flac-native-sanitizer-shared")
@@ -192,11 +201,14 @@ val nativeFuzzCorpusDir = layout.buildDirectory.dir("native-fuzz-corpus")
 val decoderFuzzCorpusDir = nativeFuzzCorpusDir.map { it.dir("decoder") }
 val metadataFuzzCorpusDir = nativeFuzzCorpusDir.map { it.dir("metadata") }
 val nativeFuzzArtifactDir = layout.buildDirectory.dir("native-fuzz-artifacts")
-val nativeSanitizerCompileFlags = listOf(
-    "-fsanitize=address,undefined",
+val nativeInstrumentationCompileOptions = listOf(
     "-fno-omit-frame-pointer",
     "-fno-sanitize-recover=all"
-).joinToString(" ")
+)
+val nativeSanitizerCompileFlags =
+    (listOf("-fsanitize=address,undefined") + nativeInstrumentationCompileOptions).joinToString(" ")
+val nativeFuzzCompileFlags =
+    (listOf("-fsanitize=fuzzer-no-link,address,undefined") + nativeInstrumentationCompileOptions).joinToString(" ")
 val nativeSanitizerLinkFlags = listOf(
     "-fsanitize=address,undefined",
     "-fno-sanitize-recover=all"
@@ -229,6 +241,44 @@ val nativeFuzzSeedExpectations = mapOf(
 val javaHomeDir = file(System.getProperty("java.home"))
 val jniIncludeDir = javaHomeDir.resolve("include")
 val jniPlatformIncludeDir = jniIncludeDir.resolve(activeNativeTarget.jniIncludeDirectory)
+
+val verifyNativeFormat by tasks.registering {
+    group = "verification"
+    description = "Checks tracked native C/H files with the pinned clang-format version without changing files."
+    inputs.file(".clang-format")
+    inputs.file(".clang-format-version")
+    inputs.files(fileTree("native") { include("**/*.c", "**/*.h") })
+
+    doLast {
+        val requiredVersion = file(".clang-format-version").readText().trim()
+        val formatter = providers.gradleProperty("jflac.clangFormatExecutable")
+            .orElse(providers.environmentVariable("JFLAC_CLANG_FORMAT"))
+            .getOrElse("clang-format")
+        val versionOutput = ByteArrayOutputStream()
+        exec {
+            commandLine(formatter, "--version")
+            standardOutput = versionOutput
+        }
+        val actualVersion = Regex("""clang-format version (\d+\.\d+\.\d+)\b""")
+            .find(versionOutput.toString())?.groupValues?.get(1)
+        check(actualVersion == requiredVersion) {
+            "Native formatting requires clang-format $requiredVersion; found '${versionOutput.toString().trim()}'. " +
+                "Set -Pjflac.clangFormatExecutable=<path> or JFLAC_CLANG_FORMAT."
+        }
+
+        val trackedFilesOutput = ByteArrayOutputStream()
+        exec {
+            commandLine("git", "ls-files", "-z", "--", "native")
+            standardOutput = trackedFilesOutput
+        }
+        val sources = trackedFilesOutput.toString(Charsets.UTF_8.name()).split('\u0000')
+            .filter { it.endsWith(".c") || it.endsWith(".h") }
+        check(sources.isNotEmpty()) { "No tracked native C/H files were found for formatting verification." }
+        exec {
+            commandLine(listOf(formatter, "--dry-run", "--Werror", "--style=file") + sources)
+        }
+    }
+}
 
 val msvcRuntimeLibrary = "MultiThreaded"
 val msvcRuntimeCmakeOptions = listOf(
@@ -590,9 +640,10 @@ val downloadOggSource by tasks.registering {
 
 val extractOggSource by tasks.registering(Exec::class) {
     group = "build setup"
-    description = "Extracts the libogg $oggVersion source archive."
+    description = "Extracts and patches the libogg $oggVersion source archive."
     dependsOn(downloadOggSource)
     inputs.file(oggArchive)
+    inputs.files(oggVendorPatches)
     outputs.dir(oggSourceDir)
 
     doFirst {
@@ -601,6 +652,25 @@ val extractOggSource by tasks.registering(Exec::class) {
         sourceRoot.deleteRecursively()
         sourceParent.mkdirs()
         commandLine("tar", "-xf", oggArchive.get().asFile.absolutePath, "-C", sourceParent.absolutePath)
+    }
+
+    doLast {
+        val sourcePrefix = oggSourceDir.get().asFile.relativeTo(projectDir).invariantSeparatorsPath
+        // Apply the ordered patches to the single source tree consumed by
+        // regular, sanitizer-only and fuzz-only dependency builds alike.
+        oggVendorPatches.forEach { patch ->
+            exec {
+                commandLine(
+                    "git", "apply", "--check", "--directory=$sourcePrefix", patch.asFile.absolutePath
+                )
+            }
+
+            exec {
+                commandLine(
+                    "git", "apply", "--directory=$sourcePrefix", patch.asFile.absolutePath
+                )
+            }
+        }
     }
 }
 
@@ -668,21 +738,21 @@ val buildOggNative by tasks.registering(Exec::class) {
     }
 }
 
-val buildOggNativeSanitized by tasks.registering(Exec::class) {
+fun registerInstrumentedOgg(taskName: String, outputDirectory: Provider<Directory>, compileFlags: String) = tasks.register(taskName, Exec::class) {
     group = "verification"
-    description = "Builds a Clang ASan/UBSan static libogg for the native fuzz and sanitizer suites."
+    description = "Builds isolated instrumented static libogg with $compileFlags."
     dependsOn(extractOggSource)
     inputs.dir(oggSourceDir)
-    inputs.property("sanitizerFlags", nativeSanitizerCompileFlags)
-    outputs.file(nativeSanitizerOggLibrary)
-    outputs.file(nativeSanitizerOggConfigHeader)
+    inputs.property("sanitizerFlags", compileFlags)
+    outputs.file(outputDirectory.map { it.file("lib/libogg.a") })
+    outputs.file(outputDirectory.map { it.file("include/ogg/config_types.h") })
     onlyIf { nativeSanitizerSupported }
 
     doFirst {
-        val buildDirectory = nativeSanitizerOggBuildDir.get().asFile
+        val buildDirectory = outputDirectory.get().asFile
         buildDirectory.mkdirs()
-        nativeSanitizerOggBuildDir.get().file("CMakeCache.txt").asFile.delete()
-        nativeSanitizerOggBuildDir.get().dir("CMakeFiles").asFile.deleteRecursively()
+        outputDirectory.get().file("CMakeCache.txt").asFile.delete()
+        outputDirectory.get().dir("CMakeFiles").asFile.deleteRecursively()
 
         exec {
             commandLine(
@@ -691,12 +761,12 @@ val buildOggNativeSanitized by tasks.registering(Exec::class) {
                 "-B", buildDirectory.absolutePath,
                 "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
                 "-DCMAKE_C_COMPILER=clang",
-                "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O1 -g $nativeSanitizerCompileFlags",
+                "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O1 -g $compileFlags",
                 "-DCMAKE_EXE_LINKER_FLAGS=$nativeSanitizerLinkFlags",
                 "-DCMAKE_SHARED_LINKER_FLAGS=$nativeSanitizerLinkFlags",
                 "-DBUILD_SHARED_LIBS=OFF",
                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-                "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${nativeSanitizerOggBuildDir.get().dir("lib").asFile.absolutePath}",
+                "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${outputDirectory.get().dir("lib").asFile.absolutePath}",
                 "-DINSTALL_DOCS=OFF",
                 "-DINSTALL_PKG_CONFIG_MODULE=OFF",
                 "-DINSTALL_CMAKE_PACKAGE_MODULE=OFF"
@@ -710,15 +780,22 @@ val buildOggNativeSanitized by tasks.registering(Exec::class) {
     }
 }
 
+// Fuzz coverage requires libFuzzer runtime symbols, so the JVM dependency must
+// keep its own sanitizer-only archive and generated configuration headers.
+val buildOggNativeSanitized =
+    registerInstrumentedOgg("buildOggNativeSanitized", nativeSanitizerOggBuildDir, nativeSanitizerCompileFlags)
+val buildOggNativeFuzz =
+    registerInstrumentedOgg("buildOggNativeFuzz", nativeFuzzOggBuildDir, nativeFuzzCompileFlags)
+
 val buildFlacNativeSanitized by tasks.registering(Exec::class) {
     group = "verification"
-    description = "Builds a Clang ASan/UBSan static libFLAC for the native fuzz targets."
-    dependsOn(extractFlacSource, buildOggNativeSanitized)
+    description = "Builds a Clang coverage/ASan/UBSan static libFLAC for the native fuzz targets."
+    dependsOn(extractFlacSource, buildOggNativeFuzz)
     inputs.dir(flacSourceDir)
     inputs.dir(oggSourceDir.map { it.dir("include") })
-    inputs.file(nativeSanitizerOggConfigHeader)
-    inputs.file(nativeSanitizerOggLibrary)
-    inputs.property("sanitizerFlags", nativeSanitizerCompileFlags)
+    inputs.file(nativeFuzzOggConfigHeader)
+    inputs.file(nativeFuzzOggLibrary)
+    inputs.property("sanitizerFlags", nativeFuzzCompileFlags)
     outputs.file(nativeSanitizerFlacLibrary)
     onlyIf { nativeSanitizerSupported }
 
@@ -735,7 +812,7 @@ val buildFlacNativeSanitized by tasks.registering(Exec::class) {
                 "-B", buildDirectory.absolutePath,
                 "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
                 "-DCMAKE_C_COMPILER=clang",
-                "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O1 -g $nativeSanitizerCompileFlags",
+                "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O1 -g $nativeFuzzCompileFlags",
                 "-DCMAKE_EXE_LINKER_FLAGS=$nativeSanitizerLinkFlags",
                 "-DCMAKE_SHARED_LINKER_FLAGS=$nativeSanitizerLinkFlags",
                 "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${nativeSanitizerFlacBuildDir.get().dir("lib").asFile.absolutePath}",
@@ -744,8 +821,8 @@ val buildFlacNativeSanitized by tasks.registering(Exec::class) {
                 "-DWITH_OGG=ON",
                 "-DWITH_ASM=OFF",
                 "-DENABLE_MULTITHREADING=ON",
-                "-DOGG_INCLUDE_DIR=${oggSourceDir.get().dir("include").asFile.absolutePath};${nativeSanitizerOggIncludeDir.get().asFile.absolutePath}",
-                "-DOGG_LIBRARY=${nativeSanitizerOggLibrary.get().asFile.absolutePath}",
+                "-DOGG_INCLUDE_DIR=${oggSourceDir.get().dir("include").asFile.absolutePath};${nativeFuzzOggIncludeDir.get().asFile.absolutePath}",
+                "-DOGG_LIBRARY=${nativeFuzzOggLibrary.get().asFile.absolutePath}",
                 "-DBUILD_CXXLIBS=OFF",
                 "-DBUILD_PROGRAMS=OFF",
                 "-DBUILD_EXAMPLES=OFF",
@@ -1107,8 +1184,8 @@ val buildNativeFuzzers by tasks.registering(Exec::class) {
     inputs.dir(generatedJniHeadersDir)
     inputs.dir(flacSourceDir.map { it.dir("include") })
     inputs.file(nativeSanitizerFlacLibrary)
-    inputs.file(nativeSanitizerOggLibrary)
-    inputs.property("sanitizerFlags", nativeSanitizerCompileFlags)
+    inputs.file(nativeFuzzOggLibrary)
+    inputs.property("sanitizerFlags", nativeFuzzCompileFlags)
     inputs.property("expectedFlacVersion", flacVersion)
     outputs.files(nativeSanitizerLibrary, decoderFuzzExecutable, metadataFuzzExecutable)
     onlyIf { nativeSanitizerSupported }
@@ -1141,7 +1218,7 @@ val buildNativeFuzzers by tasks.registering(Exec::class) {
                 "-DJFLAC_FLAC_INCLUDE_DIR=${flacSourceDir.get().dir("include").asFile.absolutePath}",
                 "-DJFLAC_GENERATED_JNI_INCLUDE_DIR=${generatedJniHeadersDir.get().asFile.absolutePath}",
                 "-DJFLAC_FLAC_STATIC_LIBRARY=${nativeSanitizerFlacLibrary.get().asFile.absolutePath}",
-                "-DJFLAC_OGG_STATIC_LIBRARY=${nativeSanitizerOggLibrary.get().asFile.absolutePath}",
+                "-DJFLAC_OGG_STATIC_LIBRARY=${nativeFuzzOggLibrary.get().asFile.absolutePath}",
                 "-DJFLAC_EXPECTED_FLAC_VERSION=$flacVersion",
                 "-DJFLAC_EXPECTED_FLAC_API_VERSION_CURRENT=$flacApiVersionCurrent",
                 "-DJFLAC_EXPECTED_FLAC_API_VERSION_REVISION=$flacApiVersionRevision",

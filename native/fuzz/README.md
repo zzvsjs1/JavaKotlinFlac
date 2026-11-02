@@ -4,6 +4,29 @@ The native fuzz targets use Clang's libFuzzer together with AddressSanitizer
 and UndefinedBehaviourSanitizer. The Gradle entry points support Linux x86_64
 and are not packaged in the library.
 
+The fuzz-only static dependencies use
+`-fsanitize=fuzzer-no-link,address,undefined`: libFLAC is written to
+`build/flac-native-sanitizer/lib/libFLAC.a`, and libogg to
+`build/ogg-native-fuzz/lib/libogg.a`. The shared libFLAC used by JVM sanitizer
+tests instead links `build/ogg-native-sanitizer/lib/libogg.a`, which carries
+ASan/UBSan instrumentation only. This keeps libFuzzer coverage runtime symbols
+out of the shared JVM runtime.
+
+All three libogg builds consume the same checksum-verified source with the
+ordered patches in `native/patches`. The empty-sync buffer patch avoids null
+pointer arithmetic when page scanning starts before the first input buffer is
+allocated; sanitizer checks remain enabled.
+
+Fuzzer configuration inspects the actual static libFLAC and libogg archives
+with `nm -u` and rejects dependencies without `__sanitizer_cov_` references.
+The same read-only check can inspect existing archives directly:
+
+```bash
+cmake -DJFLAC_FLAC_STATIC_LIBRARY=/path/to/libFLAC.a \
+  -DJFLAC_OGG_STATIC_LIBRARY=/path/to/libogg.a \
+  -P native/cmake/VerifyFuzzCoverage.cmake
+```
+
 `nativeSanitizerJvmTest` runs the normal non-external JVM suite with
 ASan/UBSan-instrumented libFLAC and JNI libraries on an isolated classpath.
 Leak detection is disabled only for this JVM worker because process-wide JVM
@@ -63,3 +86,24 @@ build/native-sanitizer/fuzz/jflac-metadata-fuzz build/native-fuzz-corpus/metadat
 libFuzzer writes a reproducer when it finds a hard failure. Re-run that file as
 the only positional input to obtain the sanitizer stack trace before reducing
 or adding it to the seed corpus.
+
+## Native formatting
+
+The repository's `.clang-format-version` pins the formatter used locally and
+by the dedicated CI gate. Install that exact version of `clang-format`, then
+run the read-only check (JDK 21 or newer is required):
+
+```bash
+python -m pip install "clang-format==$(tr -d '\r\n' < .clang-format-version)"
+bash ./gradlew verifyNativeFormat --no-daemon
+```
+
+On Windows PowerShell, use an installed formatter with the pinned version:
+
+```powershell
+.\gradlew.bat verifyNativeFormat --no-daemon '-Pjflac.clangFormatExecutable=C:/path/to/clang-format.exe'
+```
+
+`JFLAC_CLANG_FORMAT` can also select the executable. The task checks tracked
+native C/H files using `.clang-format`; it never rewrites them. Ordinary
+builds do not require a formatter.

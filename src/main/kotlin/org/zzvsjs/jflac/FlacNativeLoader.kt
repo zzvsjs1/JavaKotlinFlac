@@ -300,8 +300,20 @@ internal fun inspectNativeFlacChannel(channel: SeekableByteChannel): NativeFlacC
     val magic = ByteArray(4)
     val buffer = ByteBuffer.wrap(magic)
     return try {
-        val read = channel.read(buffer)
-        detectNativeFlacContainer(magic, read)
+        while (buffer.hasRemaining()) {
+            val read = channel.read(buffer)
+            if (read < 0) {
+                break
+            }
+
+            if (read == 0) {
+                throw FlacDecodeException(
+                    "FLAC channel made no progress while reading its header. Use a channel that provides blocking reads."
+                )
+            }
+        }
+
+        detectNativeFlacContainer(magic, buffer.position())
     } catch (e: IOException) {
         throw FlacDecodeException("Failed to inspect FLAC channel.", e)
     } finally {

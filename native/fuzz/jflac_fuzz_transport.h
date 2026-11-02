@@ -19,11 +19,8 @@ void jflac_fuzz_transport_init(JflacFuzzTransport *transport, const uint8_t *dat
 
 size_t jflac_fuzz_transport_read(JflacFuzzTransport *transport, void *destination, size_t requested_bytes);
 
-size_t jflac_fuzz_transport_read_records(
-    JflacFuzzTransport *transport,
-    void *destination,
-    size_t record_size,
-    size_t requested_records);
+size_t jflac_fuzz_transport_read_records(JflacFuzzTransport *transport, void *destination, size_t record_size,
+                                         size_t requested_records);
 
 int jflac_fuzz_transport_seek_absolute(JflacFuzzTransport *transport, uint64_t absolute_offset);
 

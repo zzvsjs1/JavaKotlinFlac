@@ -2,6 +2,7 @@ package org.zzvsjs.jflac.sound;
 
 import org.zzvsjs.jflac.FlacDecoder;
 import org.zzvsjs.jflac.FlacException;
+import org.zzvsjs.jflac.FlacFormat;
 import org.zzvsjs.jflac.FlacMetadata;
 import org.zzvsjs.jflac.FlacMetadataReader;
 import org.zzvsjs.jflac.FlacPullDecodingSession;
@@ -11,6 +12,7 @@ import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.UnsupportedAudioFileException;
 import javax.sound.sampled.spi.AudioFileReader;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -41,6 +43,8 @@ import java.util.Objects;
 public final class FlacAudioFileReader extends AudioFileReader {
     private static final String NOT_FLAC_CANDIDATE = "Input is not a FLAC or Ogg FLAC stream.";
     private static final int FLAC_HEADER_BYTES = 4;
+    private static final int NATIVE_STREAM_INFO_PREFIX_BYTES = 42;
+    private static final int FORMAT_PROBE_OGG_BYTE_LIMIT = 1 << 20;
     private static final int STREAM_DECODE_SETUP_MARK_LIMIT = 1 << 20;
     private static final byte[] FLAC_MAGIC = new byte[] { 'f', 'L', 'a', 'C' };
     private static final byte[] OGG_MAGIC = new byte[] { 'O', 'g', 'g', 'S' };
@@ -59,34 +63,79 @@ public final class FlacAudioFileReader extends AudioFileReader {
      * Probes stream headers without consuming data from the caller's perspective.
      * Java Sound specifies that this overload must leave the stream positioned so
      * another provider or a later decode attempt can read the same bytes. That is
-     * why this method requires mark/reset support and resets after both the cheap
-     * magic check and the native STREAMINFO read.
+     * why this method requires mark/reset support and restores the original
+     * position after header inspection.
+     *
+     * <p>Native FLAC probing reads only the 42-byte STREAMINFO prefix; subsequent
+     * metadata is validated during decoding or file-backed metadata reading.
+     * Ogg candidates are parsed by libFLAC within a 1 MiB read budget and are
+     * rejected as unsupported if STREAMINFO cannot be obtained within it.
+     * Neither path closes the caller's stream.</p>
      */
     @Override
     public AudioFileFormat getAudioFileFormat(InputStream stream) throws UnsupportedAudioFileException, IOException {
-        HeaderDetails header = verifyFormatStreamHeader(stream);
-        stream.mark(Integer.MAX_VALUE);
-        /*
-         * The caller stream owns the Java Sound restore mark. The core decoder
-         * also performs container inspection, and if it sees the same
-         * mark-capable object it will install its own short mark on top of ours.
-         * Wrapping the stream as non-markable forces the core pushback path, so
-         * core probing can replay its own header bytes without replacing the SPI
-         * mark that restores the caller-visible stream position.
-         */
-        InputStream decoderStream = new NonMarkingInputStream(stream);
-        try (FlacPullDecodingSession session = new FlacDecoder().openPull(decoderStream)) {
-            return FlacAudioFormats.fileFormat(session.getStreamInfo(), header.type(), header.container());
-        } catch (FlacException e) {
-            throw unsupported(e);
-        } finally {
-            stream.reset();
+        Objects.requireNonNull(stream, "stream");
+        if (!stream.markSupported()) {
+            throw new IOException("FLAC format probing requires an InputStream with mark/reset support.");
         }
+
+        stream.mark(NATIVE_STREAM_INFO_PREFIX_BYTES);
+        AudioFileFormat format;
+        try {
+            byte[] magic = stream.readNBytes(FLAC_HEADER_BYTES);
+            HeaderDetails header = classifyHeader(magic);
+            InputStream decoderStream;
+            if (header.type().equals(JflacAudioFileTypes.FLAC)) {
+                byte[] prefix = new byte[NATIVE_STREAM_INFO_PREFIX_BYTES];
+                System.arraycopy(magic, 0, prefix, 0, magic.length);
+                int remaining = prefix.length - magic.length;
+                if (stream.readNBytes(prefix, magic.length, remaining) != remaining
+                        || (prefix[4] & 0x7f) != 0 || prefix[5] != 0 || prefix[6] != 0 || prefix[7] != 34) {
+                    throw new UnsupportedAudioFileException("Invalid or truncated FLAC STREAMINFO header.");
+                }
+
+                // Parse the original fields through libFLAC without making it scan later metadata.
+                // Only the copy is marked as the last block; the caller's bytes remain unchanged.
+                prefix[4] |= (byte) 0x80;
+                decoderStream = new ByteArrayInputStream(prefix);
+            } else {
+                stream.reset();
+                stream.mark(FORMAT_PROBE_OGG_BYTE_LIMIT);
+                // This non-markable wrapper also prevents core inspection from replacing our restore mark.
+                decoderStream = new ProbeBudgetInputStream(stream, FORMAT_PROBE_OGG_BYTE_LIMIT);
+            }
+
+            try (FlacPullDecodingSession session = new FlacDecoder().openPull(decoderStream)) {
+                // Metadata parsing reports fields without necessarily checking audio-format legality.
+                int sampleRate = session.getStreamInfo().getSampleRate();
+                if (sampleRate <= 0 || !FlacFormat.isSampleRateValid(sampleRate)) {
+                    throw new UnsupportedAudioFileException("Invalid FLAC STREAMINFO sample rate.");
+                }
+
+                format = FlacAudioFormats.fileFormat(session.getStreamInfo(), header.type(), header.container());
+            }
+        } catch (ProbeBudgetExceededException e) {
+            UnsupportedAudioFileException failure = new UnsupportedAudioFileException(e.getMessage());
+            failure.initCause(e);
+            throwFailure(resetStreamOnFailure(stream, true, failure));
+            throw new AssertionError("unreachable");
+        } catch (FlacException e) {
+            throwFailure(resetStreamOnFailure(stream, true, unsupported(e)));
+            throw new AssertionError("unreachable");
+        } catch (UnsupportedAudioFileException | IOException | RuntimeException | Error e) {
+            throwFailure(resetStreamOnFailure(stream, true, e));
+            throw new AssertionError("unreachable");
+        }
+
+        stream.reset();
+        return format;
     }
 
     /**
      * Probes URL-backed sources through a buffered stream so the stream overload
      * gets mark/reset support for Java Sound's non-consuming format contract.
+     * The same STREAMINFO-only native validation and 1 MiB Ogg probe budget
+     * apply. The opened URL source is closed after probing.
      */
     @Override
     public AudioFileFormat getAudioFileFormat(URL url) throws UnsupportedAudioFileException, IOException {
@@ -294,19 +343,6 @@ public final class FlacAudioFileReader extends AudioFileReader {
         return new CheckedStream(new NonMarkingInputStream(stream), classifyHeader(header), true);
     }
 
-    private static HeaderDetails verifyFormatStreamHeader(InputStream stream)
-            throws IOException, UnsupportedAudioFileException {
-        Objects.requireNonNull(stream, "stream");
-        if (!stream.markSupported()) {
-            throw new IOException("FLAC format probing requires an InputStream with mark/reset support.");
-        }
-
-        stream.mark(FLAC_HEADER_BYTES);
-        byte[] header = stream.readNBytes(FLAC_HEADER_BYTES);
-        stream.reset();
-        return classifyHeader(header);
-    }
-
     private static HeaderDetails verifyFileHeader(File file) throws IOException, UnsupportedAudioFileException {
         Objects.requireNonNull(file, "file");
         try (InputStream stream = Files.newInputStream(file.toPath())) {
@@ -377,7 +413,9 @@ public final class FlacAudioFileReader extends AudioFileReader {
             return cleanupFailure;
         }
 
-        primary.addSuppressed(cleanupFailure);
+        if (primary != cleanupFailure) {
+            primary.addSuppressed(cleanupFailure);
+        }
         return primary;
     }
 
@@ -417,6 +455,54 @@ public final class FlacAudioFileReader extends AudioFileReader {
     private record CheckedStream(InputStream stream, HeaderDetails header, boolean resetOnFailure) {
         private CheckedStream(InputStream stream, HeaderDetails header) {
             this(stream, header, false);
+        }
+    }
+
+    private static final class ProbeBudgetExceededException extends IOException {
+        private ProbeBudgetExceededException() {
+            super("Ogg FLAC format probing exceeded its 1 MiB read budget.");
+        }
+    }
+
+    /** Caps every source read, including the final partial decoder request. */
+    private static final class ProbeBudgetInputStream extends InputStream {
+        private final InputStream delegate;
+        private int remaining;
+
+        private ProbeBudgetInputStream(InputStream delegate, int byteLimit) {
+            this.delegate = delegate;
+            this.remaining = byteLimit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining == 0) {
+                throw new ProbeBudgetExceededException();
+            }
+
+            int value = delegate.read();
+            if (value >= 0) {
+                remaining--;
+            }
+            return value;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            Objects.checkFromIndexSize(offset, length, buffer.length);
+            if (length == 0) {
+                return 0;
+            }
+
+            if (remaining == 0) {
+                throw new ProbeBudgetExceededException();
+            }
+
+            int count = delegate.read(buffer, offset, Math.min(length, remaining));
+            if (count > 0) {
+                remaining -= count;
+            }
+            return count;
         }
     }
 

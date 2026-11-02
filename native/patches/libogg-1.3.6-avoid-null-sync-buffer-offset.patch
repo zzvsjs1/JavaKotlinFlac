@@ -1,0 +1,13 @@
+diff --git a/src/framing.c b/src/framing.c
+--- a/src/framing.c
++++ b/src/framing.c
+@@ -646,6 +646,9 @@ long ogg_sync_pageseek(ogg_sync_state *oy,ogg_page *og){
+ 
+   if(ogg_sync_check(oy))return 0;
+ 
++  /* The sync buffer is allocated lazily; a fresh state needs more data. */
++  if(!oy->data)return 0;
++
+   page=oy->data+oy->returned;
+   bytes=oy->fill-oy->returned;
+ 

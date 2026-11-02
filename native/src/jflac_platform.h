@@ -16,10 +16,7 @@ typedef struct JflacMutex
 {
     SRWLOCK native;
 } JflacMutex;
-#define JFLAC_MUTEX_INITIALIZER                                                                                       \
-    {                                                                                                                  \
-        SRWLOCK_INIT                                                                                                   \
-    }
+#define JFLAC_MUTEX_INITIALIZER {SRWLOCK_INIT}
 #else
 #include <pthread.h>
 
@@ -27,10 +24,7 @@ typedef struct JflacMutex
 {
     pthread_mutex_t native;
 } JflacMutex;
-#define JFLAC_MUTEX_INITIALIZER                                                                                       \
-    {                                                                                                                  \
-        PTHREAD_MUTEX_INITIALIZER                                                                                      \
-    }
+#define JFLAC_MUTEX_INITIALIZER {PTHREAD_MUTEX_INITIALIZER}
 #endif
 
 /*
@@ -44,10 +38,7 @@ typedef struct JflacOnce
     int complete;
 } JflacOnce;
 
-#define JFLAC_ONCE_INITIALIZER                                                                                        \
-    {                                                                                                                  \
-        JFLAC_MUTEX_INITIALIZER, 0                                                                                     \
-    }
+#define JFLAC_ONCE_INITIALIZER {JFLAC_MUTEX_INITIALIZER, 0}
 
 typedef void (*JflacOnceInitialiser)(void);
 

@@ -136,6 +136,12 @@ if(JFLAC_BUILD_FUZZERS)
         message(FATAL_ERROR "JFLAC_OGG_STATIC_LIBRARY must name an existing sanitizer-instrumented libogg archive.")
     endif()
 
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyFuzzCoverage.cmake")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${JFLAC_FLAC_STATIC_LIBRARY}"
+        "${JFLAC_OGG_STATIC_LIBRARY}"
+    )
+
     foreach(fuzz_target IN ITEMS jflac-decoder-fuzz jflac-metadata-fuzz)
         string(REPLACE "jflac-" "jflac_" fuzz_source_stem "${fuzz_target}")
         string(REPLACE "-fuzz" "_fuzz.c" fuzz_source_name "${fuzz_source_stem}")

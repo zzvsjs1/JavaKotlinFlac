@@ -21,11 +21,8 @@ typedef struct DecoderFuzzContext
 /* Keeps callback memory reads observable after an iteration has completed. */
 static volatile uint64_t g_decoder_fuzz_sink;
 
-static FLAC__StreamDecoderReadStatus decoder_read_callback(
-    const FLAC__StreamDecoder *decoder,
-    FLAC__byte buffer[],
-    size_t *bytes,
-    void *client_data)
+static FLAC__StreamDecoderReadStatus decoder_read_callback(const FLAC__StreamDecoder *decoder, FLAC__byte buffer[],
+                                                           size_t *bytes, void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
@@ -41,27 +38,21 @@ static FLAC__StreamDecoderReadStatus decoder_read_callback(
 
     size_t read = jflac_fuzz_transport_read(&context->transport, buffer, *bytes);
     *bytes = read;
-    return read == 0u ? FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM
-                      : FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+    return read == 0u ? FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM : FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
 }
 
-static FLAC__StreamDecoderSeekStatus decoder_seek_callback(
-    const FLAC__StreamDecoder *decoder,
-    FLAC__uint64 absolute_byte_offset,
-    void *client_data)
+static FLAC__StreamDecoderSeekStatus decoder_seek_callback(const FLAC__StreamDecoder *decoder,
+                                                           FLAC__uint64 absolute_byte_offset, void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
-    return context != NULL &&
-                   jflac_fuzz_transport_seek_absolute(&context->transport, absolute_byte_offset) == 0
+    return context != NULL && jflac_fuzz_transport_seek_absolute(&context->transport, absolute_byte_offset) == 0
                ? FLAC__STREAM_DECODER_SEEK_STATUS_OK
                : FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
 }
 
-static FLAC__StreamDecoderTellStatus decoder_tell_callback(
-    const FLAC__StreamDecoder *decoder,
-    FLAC__uint64 *absolute_byte_offset,
-    void *client_data)
+static FLAC__StreamDecoderTellStatus decoder_tell_callback(const FLAC__StreamDecoder *decoder,
+                                                           FLAC__uint64 *absolute_byte_offset, void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
@@ -74,10 +65,8 @@ static FLAC__StreamDecoderTellStatus decoder_tell_callback(
     return FLAC__STREAM_DECODER_TELL_STATUS_OK;
 }
 
-static FLAC__StreamDecoderLengthStatus decoder_length_callback(
-    const FLAC__StreamDecoder *decoder,
-    FLAC__uint64 *stream_length,
-    void *client_data)
+static FLAC__StreamDecoderLengthStatus decoder_length_callback(const FLAC__StreamDecoder *decoder,
+                                                               FLAC__uint64 *stream_length, void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
@@ -97,16 +86,14 @@ static FLAC__bool decoder_eof_callback(const FLAC__StreamDecoder *decoder, void 
     return context == NULL || jflac_fuzz_transport_eof(&context->transport) ? true : false;
 }
 
-static FLAC__StreamDecoderWriteStatus decoder_write_callback(
-    const FLAC__StreamDecoder *decoder,
-    const FLAC__Frame *frame,
-    const FLAC__int32 *const buffer[],
-    void *client_data)
+static FLAC__StreamDecoderWriteStatus decoder_write_callback(const FLAC__StreamDecoder *decoder,
+                                                             const FLAC__Frame *frame,
+                                                             const FLAC__int32 *const buffer[], void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
-    if (context == NULL || frame == NULL || buffer == NULL ||
-        frame->header.channels == 0u || frame->header.channels > FLAC__MAX_CHANNELS)
+    if (context == NULL || frame == NULL || buffer == NULL || frame->header.channels == 0u ||
+        frame->header.channels > FLAC__MAX_CHANNELS)
     {
         return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
     }
@@ -135,10 +122,8 @@ static FLAC__StreamDecoderWriteStatus decoder_write_callback(
     return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 
-static void decoder_metadata_callback(
-    const FLAC__StreamDecoder *decoder,
-    const FLAC__StreamMetadata *metadata,
-    void *client_data)
+static void decoder_metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata,
+                                      void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
@@ -172,10 +157,8 @@ static void decoder_metadata_callback(
     }
 }
 
-static void decoder_error_callback(
-    const FLAC__StreamDecoder *decoder,
-    FLAC__StreamDecoderErrorStatus status,
-    void *client_data)
+static void decoder_error_callback(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status,
+                                   void *client_data)
 {
     (void)decoder;
     DecoderFuzzContext *context = (DecoderFuzzContext *)client_data;
@@ -226,30 +209,18 @@ static void run_decoder_variant(const uint8_t *data, size_t size, int use_ogg, i
     if (use_ogg)
     {
         init_status = FLAC__stream_decoder_init_ogg_stream(
-            decoder,
-            decoder_read_callback,
-            seekable ? decoder_seek_callback : NULL,
-            seekable ? decoder_tell_callback : NULL,
-            seekable ? decoder_length_callback : NULL,
-            seekable ? decoder_eof_callback : NULL,
-            decoder_write_callback,
-            decoder_metadata_callback,
-            decoder_error_callback,
-            &context);
+            decoder, decoder_read_callback, seekable ? decoder_seek_callback : NULL,
+            seekable ? decoder_tell_callback : NULL, seekable ? decoder_length_callback : NULL,
+            seekable ? decoder_eof_callback : NULL, decoder_write_callback, decoder_metadata_callback,
+            decoder_error_callback, &context);
     }
     else
     {
         init_status = FLAC__stream_decoder_init_stream(
-            decoder,
-            decoder_read_callback,
-            seekable ? decoder_seek_callback : NULL,
-            seekable ? decoder_tell_callback : NULL,
-            seekable ? decoder_length_callback : NULL,
-            seekable ? decoder_eof_callback : NULL,
-            decoder_write_callback,
-            decoder_metadata_callback,
-            decoder_error_callback,
-            &context);
+            decoder, decoder_read_callback, seekable ? decoder_seek_callback : NULL,
+            seekable ? decoder_tell_callback : NULL, seekable ? decoder_length_callback : NULL,
+            seekable ? decoder_eof_callback : NULL, decoder_write_callback, decoder_metadata_callback,
+            decoder_error_callback, &context);
     }
 
     if (init_status == FLAC__STREAM_DECODER_INIT_STATUS_OK)
@@ -261,9 +232,7 @@ static void run_decoder_variant(const uint8_t *data, size_t size, int use_ogg, i
             uint64_t total_samples = FLAC__stream_decoder_get_total_samples(decoder);
             if (total_samples > 0u)
             {
-                (void)FLAC__stream_decoder_seek_absolute(
-                    decoder,
-                    choose_seek_target(data, size, total_samples));
+                (void)FLAC__stream_decoder_seek_absolute(decoder, choose_seek_target(data, size, total_samples));
             }
         }
 

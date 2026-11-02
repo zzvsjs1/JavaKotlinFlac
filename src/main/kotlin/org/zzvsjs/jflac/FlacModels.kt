@@ -527,11 +527,7 @@ class BufferingPcmConsumer @JvmOverloads constructor(
             destinationIndex += chunk.size
         }
 
-        expectedDecodedFrameCount(currentInfo, firstFrameIndex, maxFrames)?.let { expectedFrames ->
-            check(expectedFrames == totalFrames) {
-                "Decoded frame count $totalFrames does not match expected frame count $expectedFrames."
-            }
-        }
+        validateDecodedFrameCount(currentInfo, firstFrameIndex, maxFrames, totalFrames)
 
         return FlacDecodedAudio(
             streamInfo = currentInfo,
@@ -552,13 +548,20 @@ internal fun validateDecodeRange(firstSample: Long, maxFrames: Long?) {
     }
 }
 
-internal fun expectedDecodedFrameCount(
+internal fun validateDecodedFrameCount(
     streamInfo: FlacStreamInfo,
     firstSample: Long,
-    maxFrames: Long?
-): Long? {
+    maxFrames: Long?,
+    totalFrames: Long
+) {
+    // The requested upper bound still applies when STREAMINFO has no exact total.
+    check(maxFrames == null || totalFrames <= maxFrames) {
+        "Decoded frame count $totalFrames exceeds maximum frame count $maxFrames."
+    }
+
     if (streamInfo.totalSamples <= 0L) {
-        return maxFrames
+        // An unknown total can reach EOF before the requested upper bound.
+        return
     }
 
     val availableFrames = streamInfo.totalSamples - firstSample
@@ -566,5 +569,8 @@ internal fun expectedDecodedFrameCount(
         "Decode range starts after STREAMINFO totalSamples."
     }
 
-    return maxFrames?.let { minOf(it, availableFrames) } ?: availableFrames
+    val expectedFrames = maxFrames?.let { minOf(it, availableFrames) } ?: availableFrames
+    check(expectedFrames == totalFrames) {
+        "Decoded frame count $totalFrames does not match expected frame count $expectedFrames."
+    }
 }

@@ -18,11 +18,7 @@ typedef struct MetadataFuzzContext
 
 static volatile uint64_t g_metadata_fuzz_sink;
 
-static size_t metadata_read_callback(
-    void *destination,
-    size_t record_size,
-    size_t record_count,
-    FLAC__IOHandle handle)
+static size_t metadata_read_callback(void *destination, size_t record_size, size_t record_count, FLAC__IOHandle handle)
 {
     MetadataFuzzContext *context = (MetadataFuzzContext *)handle;
     if (context == NULL || destination == NULL || record_size == 0u || record_count == 0u)
@@ -30,11 +26,7 @@ static size_t metadata_read_callback(
         return 0u;
     }
 
-    return jflac_fuzz_transport_read_records(
-        &context->transport,
-        destination,
-        record_size,
-        record_count);
+    return jflac_fuzz_transport_read_records(&context->transport, destination, record_size, record_count);
 }
 
 static int metadata_seek_callback(FLAC__IOHandle handle, FLAC__int64 offset, int whence)
@@ -131,9 +123,8 @@ static void run_metadata_variant(const uint8_t *data, size_t size, int use_ogg)
     callbacks.eof = metadata_eof_callback;
     callbacks.close = NULL;
 
-    FLAC__bool read_success = use_ogg
-                                  ? FLAC__metadata_chain_read_ogg_with_callbacks(chain, &context, callbacks)
-                                  : FLAC__metadata_chain_read_with_callbacks(chain, &context, callbacks);
+    FLAC__bool read_success = use_ogg ? FLAC__metadata_chain_read_ogg_with_callbacks(chain, &context, callbacks)
+                                      : FLAC__metadata_chain_read_with_callbacks(chain, &context, callbacks);
     if (read_success)
     {
         FLAC__Metadata_Iterator *iterator = FLAC__metadata_iterator_new();
@@ -152,8 +143,7 @@ static void run_metadata_variant(const uint8_t *data, size_t size, int use_ogg)
 
                 inspect_metadata_block(&context, metadata);
                 block_count += 1u;
-            } while (block_count < JFLAC_FUZZ_MAX_METADATA_BLOCKS &&
-                     FLAC__metadata_iterator_next(iterator));
+            } while (block_count < JFLAC_FUZZ_MAX_METADATA_BLOCKS && FLAC__metadata_iterator_next(iterator));
 
             context.checksum ^= (uint64_t)block_count << 24u;
             FLAC__metadata_iterator_delete(iterator);

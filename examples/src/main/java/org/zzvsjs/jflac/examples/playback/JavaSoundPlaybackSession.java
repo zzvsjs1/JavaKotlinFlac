@@ -35,6 +35,7 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
     private final long totalSourceFrames;
     private final long durationMicros;
     private final SourceDataLine line;
+    private final SourceOpener sourceOpener;
 
     private Thread worker;
     private State state = State.NEW;
@@ -47,6 +48,9 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
     private long lastKnownPositionMicros;
     private Throwable failure;
     private Throwable shutdownCleanupFailure;
+    // Worker-owned: reopening can fail before a PlaybackInput is returned.
+    // Retain its cleanup errors separately from expected seek/cancellation errors.
+    private Throwable sourceOpeningCleanupFailure;
     private volatile AudioInputStream cancellableSource;
 
     JavaSoundPlaybackSession(Path input) throws Exception {
@@ -60,6 +64,33 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
                 ? -1L
                 : framesToMicros(totalSourceFrames, sourceFormat.getSampleRate());
         this.line = PlaybackAudioOutput.openPlaybackLine(playbackFormat);
+        this.sourceOpener = () -> AudioSystem.getAudioInputStream(this.input.toFile());
+    }
+
+    // The worker retains ownership of streams and output; tests supply only the
+    // external source acquisition and an already-open audio device boundary.
+    JavaSoundPlaybackSession(
+            Path input,
+            AudioFormat sourceFormat,
+            AudioFormat playbackFormat,
+            long totalSourceFrames,
+            SourceDataLine line,
+            SourceOpener sourceOpener
+    ) {
+        this.input = Objects.requireNonNull(input, "input");
+        this.sourceFormat = Objects.requireNonNull(sourceFormat, "sourceFormat");
+        this.playbackFormat = Objects.requireNonNull(playbackFormat, "playbackFormat");
+        this.totalSourceFrames = totalSourceFrames;
+        this.durationMicros = totalSourceFrames < 0L
+                ? -1L
+                : framesToMicros(totalSourceFrames, sourceFormat.getSampleRate());
+        this.line = Objects.requireNonNull(line, "line");
+        this.sourceOpener = Objects.requireNonNull(sourceOpener, "sourceOpener");
+    }
+
+    @FunctionalInterface
+    interface SourceOpener {
+        AudioInputStream open() throws Exception;
     }
 
     @Override
@@ -200,6 +231,7 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
     private void runPlayback() {
         PlaybackInput openedInput = null;
         Throwable playbackFailure = null;
+        Throwable cleanupFailure = null;
         boolean naturalEndReached = false;
         try {
             openedInput = openLatestRequestedInput();
@@ -229,7 +261,14 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
                 if (seekPending) {
                     line.stop();
                     line.flush();
-                    openedInput.close();
+                    try {
+                        openedInput.close();
+                    } catch (IOException | RuntimeException | IOError | LinkageError error) {
+                        // Stop may arrive during this release. Keep its failure
+                        // even if the final repeated close succeeds.
+                        cleanupFailure = mergeFailure(cleanupFailure, error);
+                        throw error;
+                    }
                     cancellableSource = null;
                     openedInput = openLatestRequestedInput();
                     if (openedInput == null) {
@@ -320,32 +359,33 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
             playbackFailure = error;
         } finally {
             /*
-             * Keep input cleanup separate from an expected cancellation read
+             * Keep resource cleanup separate from an expected cancellation read
              * error. During requested shutdown the latter should not make Stop
-             * fail, but failure to release the decoder's native session must
+             * fail, but failure to release the decoder or output device must
              * still be returned to the caller of close().
              */
-            Throwable inputCleanupFailure = closePlaybackInput(openedInput, null);
-            playbackFailure = mergeFailure(playbackFailure, inputCleanupFailure);
+            cleanupFailure = mergeFailure(cleanupFailure, sourceOpeningCleanupFailure);
+            cleanupFailure = closePlaybackInput(openedInput, cleanupFailure);
             cancellableSource = null;
 
             try {
                 line.stop();
             } catch (RuntimeException | IOError | LinkageError stopFailure) {
-                playbackFailure = mergeFailure(playbackFailure, stopFailure);
+                cleanupFailure = mergeFailure(cleanupFailure, stopFailure);
             }
 
             try {
                 line.close();
             } catch (RuntimeException | IOError | LinkageError closeFailure) {
-                playbackFailure = mergeFailure(playbackFailure, closeFailure);
+                cleanupFailure = mergeFailure(cleanupFailure, closeFailure);
             }
 
+            playbackFailure = mergeFailure(playbackFailure, cleanupFailure);
             synchronized (monitor) {
                 if (closeRequested) {
                     shutdownCleanupFailure = mergeFailure(
                             shutdownCleanupFailure,
-                            inputCleanupFailure
+                            cleanupFailure
                     );
                 } else {
                     if (playbackFailure != null) {
@@ -412,14 +452,18 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
                 PlaybackInput opened = openPlaybackInput(request.sourceFrame(), request.revision());
                 resetSegment(opened.actualSourceFrame());
                 return opened;
-            } catch (SeekSupersededException ignored) {
+            } catch (SeekSupersededException superseded) {
+                if (superseded.getSuppressed().length > 0) {
+                    // Supersession is expected; failure to release its source is not.
+                    throw superseded;
+                }
                 // Loop and consume the newer pending request.
             }
         }
     }
 
     private PlaybackInput openPlaybackInput(long targetSourceFrame, long revision) throws Exception {
-        AudioInputStream source = AudioSystem.getAudioInputStream(input.toFile());
+        AudioInputStream source = sourceOpener.open();
         try {
             boolean closeWasRequested;
             synchronized (monitor) {
@@ -464,6 +508,7 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
             try {
                 source.close();
             } catch (Exception | IOError | LinkageError closeError) {
+                sourceOpeningCleanupFailure = mergeFailure(sourceOpeningCleanupFailure, closeError);
                 mergeFailure(error, closeError);
             }
 
@@ -846,7 +891,12 @@ final class JavaSoundPlaybackSession implements PlaybackSession {
             return next;
         }
 
-        if (first != next) {
+        if (next != null && first != next) {
+            for (Throwable suppressed : first.getSuppressed()) {
+                if (suppressed == next) {
+                    return first;
+                }
+            }
             first.addSuppressed(next);
         }
 

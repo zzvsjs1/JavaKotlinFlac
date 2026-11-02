@@ -1274,11 +1274,7 @@ private abstract class SummaryTrackingPcmConsumer(
 
         check(completed) { "Decoding has not completed yet." }
 
-        expectedDecodedFrameCount(currentInfo, firstFrameIndex, maxFrames)?.let { expectedFrames ->
-            check(expectedFrames == totalFrames) {
-                "Decoded frame count $totalFrames does not match expected frame count $expectedFrames."
-            }
-        }
+        validateDecodedFrameCount(currentInfo, firstFrameIndex, maxFrames, totalFrames)
 
         return FlacDecodeSummary(
             streamInfo = currentInfo,

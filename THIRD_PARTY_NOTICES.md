@@ -4,11 +4,18 @@ This project builds and bundles `FLAC.dll` from the official FLAC 1.5.0 source
 archive, with libogg 1.3.6 statically linked for Ogg FLAC support. The wrapper
 code is licensed separately under the project `LICENSE`.
 
-The bundled FLAC library contains a small downstream patch maintained in
-`native/patches`. It preserves a caller-supplied Vorbis comment vendor string
-when the ordered metadata encoding API is used and updates the corresponding
-public FLAC header documentation. Upstream libFLAC 1.5.0 normally replaces that
-vendor string with its own encoder identifier.
+The bundled FLAC library contains downstream patches maintained in
+`native/patches`. They preserve a caller-supplied Vorbis comment vendor string
+when the ordered metadata encoding API is used (with corresponding public
+header documentation) and close an owned decoder file after an initialisation
+failure. Upstream libFLAC 1.5.0 normally replaces that vendor string with its
+own encoder identifier.
+
+The statically linked libogg 1.3.6 also contains a downstream patch in
+`native/patches`. It returns the existing "need more data" result for a fresh
+sync state before forming a pointer into its lazily allocated buffer, avoiding
+undefined null-pointer arithmetic. The patch is applied to regular and
+instrumented dependency builds alike.
 
 The `examples` project uses Lanterna 3.1.5 for terminal widgets and JLine 4.3.1
 for native system-terminal access. They are unmodified runtime dependencies and

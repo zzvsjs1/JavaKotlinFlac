@@ -43,9 +43,10 @@ bash ./gradlew build
 ```
 
 The build downloads FLAC 1.5.0 and libogg 1.3.6, verifies both archive
-checksums, and applies jflac's ordered-metadata Vorbis vendor preservation
-patch. It then builds static libogg, shared libFLAC with Ogg FLAC support, and
-the platform JNI shim. Required exports and dynamic dependencies are checked
+checksums, and applies the ordered downstream patches in `native/patches`:
+FLAC vendor preservation and decoder file cleanup, and libogg empty-sync
+buffer safety. It then builds static libogg, shared libFLAC with Ogg FLAC
+support, and the platform JNI shim. Required exports and dynamic dependencies are checked
 before the host-specific native files are staged into the JAR resources.
 
 For clangd, `buildNative` also generates `compile_commands.json` at the project
@@ -219,6 +220,16 @@ CUESHEET blocks, PADDING blocks, unknown blocks, and the ordered `flac.blocks`
 list. Stream and URL format probes only expose STREAMINFO-derived properties
 because those sources are read sequentially and are not suitable for full
 metadata-chain inspection.
+
+Native FLAC stream and URL format probes inspect only the 42-byte STREAMINFO
+prefix, so even very large later metadata blocks do not enlarge the retained
+probe buffer. Subsequent metadata is validated during decoding or file-backed
+metadata reading. Ogg format probes use libFLAC's container validation with a
+strict 1 MiB read budget; candidates whose STREAMINFO cannot be obtained within
+that budget are reported as unsupported. Caller-supplied streams must support
+mark/reset, are restored on success and rejection, and remain caller-owned.
+URL probes close the source they open; their buffering may prefetch a bounded
+prefix beyond the bytes logically required by a native STREAMINFO probe.
 
 For Java Sound metadata preservation during encode, pass metadata through
 `AudioInputStream.getFormat().properties()`. The grouped property keys are

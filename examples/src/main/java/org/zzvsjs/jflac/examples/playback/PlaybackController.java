@@ -78,12 +78,12 @@ final class PlaybackController implements AutoCloseable {
     }
 
     PlaybackViewState seekToMicros(long targetMicros) {
-        requireControllableSession().seekToMicros(Math.max(0L, targetMicros));
+        requireSeekableSession().seekToMicros(Math.max(0L, targetMicros));
         return viewState();
     }
 
     PlaybackViewState seekByMicros(long deltaMicros) {
-        requireControllableSession().seekByMicros(deltaMicros);
+        requireSeekableSession().seekByMicros(deltaMicros);
         return viewState();
     }
 
@@ -113,10 +113,10 @@ final class PlaybackController implements AutoCloseable {
         );
     }
 
-    private PlaybackSession requireControllableSession() {
+    private PlaybackSession requireSeekableSession() {
         PlaybackViewState view = viewState();
-        if (!view.canControl()) {
-            throw new IllegalStateException("Playback is not currently controllable.");
+        if (!view.canSeek()) {
+            throw new IllegalStateException("Seeking is not currently available.");
         }
 
         return session;

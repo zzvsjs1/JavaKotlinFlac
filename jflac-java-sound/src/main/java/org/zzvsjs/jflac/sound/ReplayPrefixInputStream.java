@@ -5,7 +5,7 @@ import java.io.InputStream;
 import java.util.Objects;
 
 /*
- * Used by getAudioInputStream in a later task: Java Sound may pass a stream
+ * Used by getAudioInputStream: Java Sound may pass a stream
  * without mark/reset support, but native FLAC probing consumes the first header
  * bytes. The decoder must still see those bytes, so this stream replays a saved
  * prefix before delegating to the original source.
